@@ -820,6 +820,45 @@ Host: {}
 }
 
 #[tauri::command]
+async fn check_hosts_reachable(
+    hosts: Vec<host::Host>,
+    network: host::Network,
+    defaults: host::Defaults,
+) -> Vec<serde_json::Value> {
+    use tokio::net::TcpStream;
+    use std::time::Duration;
+
+    let mut tasks = vec![];
+
+    for host in hosts {
+        let port = host.port.unwrap_or(network.port.unwrap_or(defaults.port));
+        let timeout = Duration::from_secs(network.scan_timeout.unwrap_or(3));
+        let ip = host.ip.clone();
+        let hostname = host.hostname.clone();
+
+        let task = tokio::spawn(async move {
+            let address = format!("{}:{}", ip, port);
+            let reachable = match tokio::time::timeout(timeout, TcpStream::connect(&address)).await {
+                Ok(Ok(_)) => true,
+                _ => false,
+            };
+            serde_json::json!({
+                "ip": ip,
+                "hostname": hostname,
+                "reachable": reachable,
+            })
+        });
+        tasks.push(task);
+    }
+
+    let mut results = vec![];
+    for task in tasks {
+        if let Ok(r) = task.await { results.push(r); }
+    }
+    results
+}
+
+#[tauri::command]
 fn launch_broadcast(hosts: Vec<host::Host>, network: host::Network, defaults: Defaults, session_name: String) -> Result<(), String> {
     if hosts.is_empty() { return Err(String::from("No hosts selected")); }
     std::process::Command::new("tmux").args(["kill-session", "-t", &session_name]).output().ok();
@@ -864,6 +903,7 @@ pub fn run() {
             import_backup,
             save_health_status,
             ai_analyze,
+            check_hosts_reachable,
             launch_broadcast,
             recalibrate_network,
         ])

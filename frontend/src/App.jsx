@@ -891,26 +891,74 @@ function CommandOutputModal({ result, onClose }) {
 function BroadcastConfirmModal({ hosts, network, config, onConfirm, onClose }) {
   const username = network?.username || config?.defaults?.username || "root";
   const port = network?.port || config?.defaults?.port || 22;
+  const [checking, setChecking] = useState(true);
+  const [hostStatus, setHostStatus] = useState({});
+
+  useEffect(() => {
+    async function preflight() {
+      setChecking(true);
+      try {
+        const results = await invoke("check_hosts_reachable", {
+          hosts,
+          network,
+          defaults: config.defaults,
+        });
+        const status = {};
+        results.forEach(r => { status[r.ip] = r.reachable; });
+        setHostStatus(status);
+      } catch(e) { console.error(e); }
+      finally { setChecking(false); }
+    }
+    preflight();
+  }, []);
+
+  const reachableHosts = hosts.filter(h => hostStatus[h.ip] === true);
+  const unreachableHosts = hosts.filter(h => hostStatus[h.ip] === false);
+  const pendingHosts = hosts.filter(h => hostStatus[h.ip] === undefined);
 
   return (
     <div className="modal-overlay">
       <div className="modal">
         <h3>⚡ Broadcast to {hosts.length} host{hosts.length !== 1 ? "s" : ""}</h3>
+        {checking && <div className="health-loading">Checking host reachability...</div>}
         <div className="broadcast-confirm-list">
-          {hosts.map((h, i) => (
-            <div key={i} className="broadcast-confirm-item">
-              <span className={`status-dot ${h.active ? "up" : "down"}`} />
-              <span className="broadcast-confirm-host">{h.hostname || h.ip}</span>
-              <span className="broadcast-confirm-ip">{h.ip}</span>
-            </div>
-          ))}
+          {hosts.map((h, i) => {
+            const status = hostStatus[h.ip];
+            return (
+              <div key={i} className="broadcast-confirm-item">
+                {checking || status === undefined
+                  ? <span className="status-dot checking" />
+                  : <span className={`status-dot ${status ? "up" : "down"}`} />
+                }
+                <span className="broadcast-confirm-host">{h.hostname || h.ip}</span>
+                <span className="broadcast-confirm-ip">{h.ip}</span>
+                {!checking && status !== undefined && (
+                  <span style={{fontSize:"0.7rem", color: status ? "var(--green)" : "var(--red)"}}>
+                    {status ? "✓" : "✗"}
+                  </span>
+                )}
+              </div>
+            );
+          })}
         </div>
+        {!checking && unreachableHosts.length > 0 && (
+          <div className="health-issue warning" style={{fontSize:"0.78rem"}}>
+            ⚠ {unreachableHosts.length} host{unreachableHosts.length !== 1 ? "s" : ""} unreachable — broadcast will skip them
+          </div>
+        )}
         <div className="broadcast-confirm-meta">
           User: <strong>{username}</strong> · Port: <strong>{port}</strong>
+          {!checking && <span> · <strong style={{color: reachableHosts.length > 0 ? "var(--green)" : "var(--red)"}}>{reachableHosts.length}/{hosts.length}</strong> reachable</span>}
         </div>
         <div className="modal-actions">
           <button className="btn-cancel" onClick={onClose}>Cancel</button>
-          <button className="btn-broadcast" onClick={onConfirm}>⚡ Broadcast</button>
+          <button
+            className="btn-broadcast"
+            onClick={() => onConfirm(reachableHosts)}
+            disabled={checking || reachableHosts.length === 0}
+          >
+            ⚡ Broadcast{!checking ? ` (${reachableHosts.length})` : ""}
+          </button>
         </div>
       </div>
     </div>
@@ -1083,7 +1131,7 @@ function App() {
     setSelectedHosts(selectedHosts.size === filteredHosts.length ? new Set() : new Set(filteredHosts.map(h => h.ip)));
   }
 
-  async function handleBroadcast() {
+  async function handleBroadcast(reachableHosts) {
     if (selectedHosts.size === 0 || broadcasting) return;
     const network = networks[selectedNetwork];
     setBroadcasting(true);
@@ -1128,7 +1176,7 @@ function App() {
       {networkModal && <NetworkModal network={networkModal.network} index={networkModal.index} onSave={handleSaveNetwork} onClose={() => setNetworkModal(null)} onRecalibrate={handleRecalibrate} />}
       {healthModal && <HealthCheckModal host={healthModal} network={networks[selectedNetwork]} config={config} networks={networks} setNetworks={setNetworks} selectedNetworkIndex={selectedNetwork} onClose={() => setHealthModal(null)} />}
       {scpModal && <ScpModal host={scpModal} network={networks[selectedNetwork]} config={config} onClose={() => setScpModal(null)} />}
-      {showBroadcastConfirm && <BroadcastConfirmModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onConfirm={() => { setShowBroadcastConfirm(false); handleBroadcast(); }} onClose={() => setShowBroadcastConfirm(false)} />}
+      {showBroadcastConfirm && <BroadcastConfirmModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onConfirm={(reachableHosts) => { setShowBroadcastConfirm(false); handleBroadcast(reachableHosts); }} onClose={() => setShowBroadcastConfirm(false)} />}
       {showScpBroadcast && <ScpBroadcastModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowScpBroadcast(false)} />}
       {showRunCommand && <RunCommandModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowRunCommand(false)} />}
       {showSettings && <SettingsModal config={config} onSave={handleSaveSettings} onClose={() => setShowSettings(false)} />}

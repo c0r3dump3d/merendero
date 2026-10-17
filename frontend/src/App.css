@@ -1366,3 +1366,8 @@ html, body, #root {
 .broadcast-confirm-meta strong {
   color: var(--text2);
 }
+
+.status-dot.checking {
+  background: var(--text3);
+  animation: pulse 1s infinite;
+}
