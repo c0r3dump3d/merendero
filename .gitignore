@@ -1,0 +1,23 @@
+# Rust build
+target/
+src-tauri/target/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+package-lock.json
+frontend/package-lock.json
+
+# Config personal — NUNCA subir
+*.toml
+!src-tauri/tauri.conf.json
+!src-tauri/Cargo.toml
+!Cargo.toml
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/

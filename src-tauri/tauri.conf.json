@@ -1,0 +1,35 @@
+{
+  "productName": "merendero",
+  "version": "0.1.0",
+  "identifier": "com.merendero.app",
+  "build": {
+    "beforeDevCommand": "cd /home/andrew/merendero/frontend && npm run dev",
+    "beforeBuildCommand": "cd /home/andrew/merendero/frontend && npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "/home/andrew/merendero/frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Merendero",
+        "width": 1280,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/256x256.png",
+      "icons/512x512.png"
+    ]
+  }
+}

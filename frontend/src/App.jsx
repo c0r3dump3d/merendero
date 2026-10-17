@@ -1,0 +1,1215 @@
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import ReactMarkdown from "react-markdown";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import "./App.css";
+
+function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
+  const isEdit = network !== null;
+  const [form, setForm] = useState({
+    name: network?.name || "",
+    network: network?.network || "",
+    username: network?.username || "",
+    port: network?.port?.toString() || "",
+    scan_timeout: network?.scan_timeout?.toString() || "",
+    identity_file: network?.identity_file || "",
+  });
+  const [calibrating, setCalibrating] = useState(false);
+
+  async function handleRecalibrate() {
+    if (!onRecalibrate) return;
+    setCalibrating(true);
+    try {
+      const timeout = await onRecalibrate(index);
+      setForm(f => ({ ...f, scan_timeout: timeout.toString() }));
+    } catch(e) {
+      alert("Calibration failed: " + e);
+    } finally {
+      setCalibrating(false);
+    }
+  }
+
+  async function handleSubmit() {
+    if (!form.name || !form.network) { alert("Name and CIDR are required"); return; }
+    await onSave({
+      name: form.name, network: form.network,
+      username: form.username || null,
+      port: form.port ? parseInt(form.port) : null,
+      scan_timeout: form.scan_timeout ? parseInt(form.scan_timeout) : null,
+      identity_file: form.identity_file || null,
+      hosts: network?.hosts || []
+    }, index);
+    onClose();
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal">
+        <h3>{isEdit ? "Edit Network" : "Add Network"}</h3>
+        <div className="form-group"><label>Name</label><input name="name" value={form.name} onChange={handleChange} placeholder="PDC-PRO" /></div>
+        <div className="form-group"><label>Network CIDR</label><input name="network" value={form.network} onChange={handleChange} placeholder="192.168.1.0/24" /></div>
+        <div className="form-group"><label>Username (leave empty for default)</label><input name="username" value={form.username} onChange={handleChange} placeholder="root" /></div>
+        <div className="form-group"><label>Port (leave empty for default)</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
+        <div className="form-group">
+          <label>Identity file (SSH key)</label>
+          <input name="identity_file" value={form.identity_file} onChange={handleChange} placeholder="~/.ssh/id_rsa" />
+        </div>
+        <div className="form-group">
+          <label>Scan timeout (seconds) {form.scan_timeout ? "" : "— not calibrated"}</label>
+          <div className="form-row">
+            <input name="scan_timeout" value={form.scan_timeout} onChange={handleChange} placeholder="auto" type="number" min="1" max="30" />
+            {isEdit && (
+              <button className="btn-calibrate" onClick={handleRecalibrate} disabled={calibrating}>
+                {calibrating ? "Calibrating..." : "⟳ Calibrate"}
+              </button>
+            )}
+          </div>
+          {form.scan_timeout && <span className="timeout-info">RTT-based · editable</span>}
+        </div>
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={handleSubmit}>{isEdit ? "Save" : "Add"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HostModal({ host, networks, defaultNetworkIndex, onSave, onClose, onHealthCheck }) {
+  const isEdit = !!host;
+  const [form, setForm] = useState({
+    ip: host?.ip || "", hostname: host?.hostname || "", tag: host?.tag || "",
+    username: host?.username || "", port: host?.port?.toString() || "",
+    notes: host?.notes || "",
+    identity_file: host?.identity_file || "",
+    post_connect: host?.post_connect || "",
+    active: host?.active ?? true, networkIndex: defaultNetworkIndex ?? 0,
+  });
+  function handleChange(e) {
+    const val = e.target.type === "checkbox" ? e.target.checked : e.target.value;
+    setForm({ ...form, [e.target.name]: val });
+  }
+  async function handleSubmit() {
+    if (!form.ip) { alert("IP is required"); return; }
+    await onSave({
+      hostData: { ip: form.ip, hostname: form.hostname || null, tag: form.tag || null, username: form.username || null, port: form.port ? parseInt(form.port) : null, notes: form.notes || null, identity_file: form.identity_file || null, post_connect: form.post_connect || null, active: form.active },
+      networkIndex: parseInt(form.networkIndex),
+    });
+    onClose();
+  }
+  return (
+    <div className="modal-overlay">
+      <div className="modal">
+        <h3>{isEdit ? "Edit Host" : "Add Host"}</h3>
+        {!isEdit && (
+          <div className="form-group">
+            <label>Network</label>
+            <select name="networkIndex" value={form.networkIndex} onChange={handleChange} className="form-select">
+              {networks.map((net, i) => <option key={i} value={i}>{net.name} — {net.network}</option>)}
+            </select>
+          </div>
+        )}
+        <div className="form-group"><label>IP Address</label><input name="ip" value={form.ip} onChange={handleChange} placeholder="192.168.1.10" disabled={isEdit} /></div>
+        <div className="form-group"><label>Hostname / FQDN</label><input name="hostname" value={form.hostname} onChange={handleChange} placeholder="server01.example.com" /></div>
+        <div className="form-group"><label>Tag</label><input name="tag" value={form.tag} onChange={handleChange} placeholder="web, db, backup..." /></div>
+        <div className="form-group"><label>Username (leave empty for network/default)</label><input name="username" value={form.username} onChange={handleChange} placeholder="root" /></div>
+        <div className="form-group"><label>Port (leave empty for network/default)</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
+        <div className="form-group">
+          <label>Identity file (SSH key)</label>
+          <input name="identity_file" value={form.identity_file} onChange={handleChange} placeholder="~/.ssh/id_rsa" />
+        </div>
+        <div className="form-group">
+          <label>Post-connect command</label>
+          <input name="post_connect" value={form.post_connect} onChange={handleChange} placeholder="sudo su -" />
+        </div>
+        <div className="form-group">
+          <label>Notes</label>
+          <textarea name="notes" value={form.notes} onChange={handleChange} placeholder="Anything worth remembering about this host..." className="form-textarea" rows={3} />
+        </div>
+        <div className="form-group form-group-inline"><label>Active</label><input name="active" type="checkbox" checked={form.active} onChange={handleChange} /></div>
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          {isEdit && onHealthCheck && <button className="btn-check" onClick={() => onHealthCheck(host)}>⚕ Health</button>}
+          <button className="btn-primary" onClick={handleSubmit}>{isEdit ? "Save" : "Add"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TagModal({ count, onApply, onClose }) {
+  const [tag, setTag] = useState("");
+  async function handleSubmit() { await onApply(tag); onClose(); }
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-sm">
+        <h3>Tag {count} host{count !== 1 ? "s" : ""}</h3>
+        <div className="form-group">
+          <label>Tag (leave empty to remove)</label>
+          <input value={tag} onChange={e => setTag(e.target.value)} placeholder="web, db, backup..." autoFocus onKeyDown={e => e.key === "Enter" && handleSubmit()} />
+        </div>
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={handleSubmit}>Apply</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProgressBar({ progress, label }) {
+  if (!progress) return null;
+  const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+  return (
+    <div className="scan-progress">
+      <div className="scan-progress-bar"><div className="scan-progress-fill" style={{ width: `${pct}%` }} /></div>
+      <div className="scan-progress-info">
+        <span>{label} {progress.current}/{progress.total}</span>
+        {progress.found && progress.ip && <span className="scan-found">✓ {progress.ip} {progress.hostname ? `(${progress.hostname})` : ""}</span>}
+      </div>
+    </div>
+  );
+}
+
+function SettingsModal({ config, onSave, onClose }) {
+  const [form, setForm] = useState({
+    username: config?.defaults?.username || "root",
+    port: config?.defaults?.port?.toString() || "22",
+    dns_server: config?.defaults?.dns_server || "",
+    terminal: config?.defaults?.terminal || "",
+    identity_file: config?.defaults?.identity_file || "",
+    ai_provider: config?.ai?.provider || "claude",
+    ai_api_url: config?.ai?.api_url || "https://api.anthropic.com/v1/messages",
+    ai_api_key: config?.ai?.api_key || "",
+    ai_model: config?.ai?.model || "claude-haiku-4-5",
+  });
+
+  const [backupMsg, setBackupMsg] = useState(null);
+
+  function handleChange(e) { setForm({ ...form, [e.target.name]: e.target.value }); }
+
+  async function handleExport() {
+    try {
+      const backup = await invoke("export_backup");
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const date = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `merendero-backup-${date}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setBackupMsg({ type: "success", text: `Backup saved as merendero-backup-${date}.json in your Downloads folder` });
+    } catch(e) {
+      setBackupMsg({ type: "error", text: `Export failed: ${e}` });
+    }
+  }
+
+  async function handleImport(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      if (!data.version || !data.config) {
+        setBackupMsg({ type: "error", text: "Invalid backup file" });
+        return;
+      }
+      await invoke("import_backup", { data });
+      setBackupMsg({ type: "success", text: "Backup imported. Restart to apply changes." });
+    } catch(e) {
+      setBackupMsg({ type: "error", text: `Import failed: ${e}` });
+    }
+  }
+
+  function handleChange(e) { setForm({ ...form, [e.target.name]: e.target.value }); }
+
+  function handleProviderChange(e) {
+    const provider = e.target.value;
+    const urls = {
+      claude: "https://api.anthropic.com/v1/messages",
+      openai: "https://api.openai.com/v1/chat/completions",
+      ollama: "http://localhost:11434/api/chat",
+      custom: "",
+    };
+    const models = {
+      claude: "claude-haiku-4-5",
+      openai: "gpt-4o-mini",
+      ollama: "llama3",
+      custom: "",
+    };
+    setForm({ ...form, ai_provider: provider, ai_api_url: urls[provider] || "", ai_model: models[provider] || "" });
+  }
+
+  async function handleSubmit() {
+    await onSave({
+      defaults: {
+        username: form.username,
+        port: parseInt(form.port) || 22,
+        dns_server: form.dns_server || null,
+        terminal: form.terminal || null,
+        identity_file: form.identity_file || null,
+      },
+      ai: form.ai_api_key ? {
+        provider: form.ai_provider || null,
+        api_url: form.ai_api_url || null,
+        api_key: form.ai_api_key || null,
+        model: form.ai_model || null,
+      } : null,
+    });
+    onClose();
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal settings-modal">
+        <h3>⚙ Settings</h3>
+
+        <div className="settings-section">SSH defaults</div>
+        <div className="form-group"><label>Default username</label><input name="username" value={form.username} onChange={handleChange} placeholder="root" /></div>
+        <div className="form-group"><label>Default port</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
+        <div className="form-group"><label>DNS server (for reverse lookup)</label><input name="dns_server" value={form.dns_server} onChange={handleChange} placeholder="10.0.0.1" /></div>
+        <div className="form-group"><label>Terminal emulator</label><input name="terminal" value={form.terminal} onChange={handleChange} placeholder="terminator" /></div>
+        <div className="form-group"><label>Default identity file (SSH key)</label><input name="identity_file" value={form.identity_file} onChange={handleChange} placeholder="~/.ssh/id_rsa" /></div>
+
+        <div className="settings-section">AI analysis (optional)</div>
+        <div className="form-group">
+          <label>Provider</label>
+          <select name="ai_provider" value={form.ai_provider} onChange={handleProviderChange} className="form-select">
+            <option value="claude">Claude (Anthropic)</option>
+            <option value="openai">OpenAI</option>
+            <option value="ollama">Ollama (local)</option>
+            <option value="custom">Custom</option>
+          </select>
+        </div>
+        <div className="form-group"><label>API URL</label><input name="ai_api_url" value={form.ai_api_url} onChange={handleChange} placeholder="https://api.anthropic.com/v1/messages" /></div>
+        <div className="form-group"><label>API Key</label><input name="ai_api_key" value={form.ai_api_key} onChange={handleChange} placeholder="sk-ant-..." type="password" /></div>
+        <div className="form-group"><label>Model</label><input name="ai_model" value={form.ai_model} onChange={handleChange} placeholder="claude-haiku-4-5" /></div>
+
+        <div className="settings-section">Backup &amp; Restore</div>
+        <div className="backup-actions">
+          <button className="btn-backup" onClick={handleExport}>⬇ Export backup</button>
+          <label className="btn-backup btn-import">
+            ⬆ Import backup
+            <input type="file" accept=".json" style={{display:"none"}} onChange={handleImport} />
+          </label>
+        </div>
+        {backupMsg && <div className={`backup-msg ${backupMsg.type}`}>{backupMsg.text}</div>}
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={handleSubmit}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RunCommandModal({ hosts, network, config, onClose }) {
+  const [command, setCommand] = useState("");
+  const [running, setRunning] = useState(false);
+  const [results, setResults] = useState([]);
+  const [selectedResult, setSelectedResult] = useState(null);
+
+  async function handleRun() {
+    if (!command.trim()) return;
+    setRunning(true);
+    setResults([]);
+    try {
+      const res = await invoke("run_command", {
+        hosts,
+        network,
+        defaults: config.defaults,
+        command,
+      });
+      setResults(res);
+    } catch(e) {
+      alert("Failed: " + e);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-wide">
+        <h3>⚡ Run command on {hosts.length} host{hosts.length !== 1 ? "s" : ""}</h3>
+        <div className="cmd-input-row">
+          <input
+            className="cmd-input"
+            value={command}
+            onChange={e => setCommand(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && !running && handleRun()}
+            placeholder="df -h / uptime / systemctl status nginx..."
+            autoFocus
+          />
+          <button className="btn-primary" onClick={handleRun} disabled={running}>
+            {running ? "Running..." : "▶ Run"}
+          </button>
+        </div>
+
+        {selectedResult && <CommandOutputModal result={selectedResult} onClose={() => setSelectedResult(null)} />}
+        {results.length > 0 && (
+          <div className="cmd-results">
+            {results.map((r, i) => (
+              <div key={i}
+                className={`cmd-result cmd-result-clickable ${r.success ? "success" : "error"}`}
+                onClick={() => setSelectedResult(r)}
+              >
+                <div className="cmd-result-header">
+                  <span className={`cmd-status-dot ${r.success ? "up" : "down"}`} />
+                  <span className="cmd-result-host">{r.hostname || r.ip}</span>
+                  <span className="cmd-result-ip">{r.ip}</span>
+                  <span className="cmd-result-preview">{(r.stdout || r.stderr || "").split("\n")[0].substring(0, 60)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ScpBroadcastModal({ hosts, network, config, onClose }) {
+  const [direction, setDirection] = useState("upload");
+  const [localPath, setLocalPath] = useState("");
+  const [remotePath, setRemotePath] = useState("");
+  const [running, setRunning] = useState(false);
+  const [results, setResults] = useState([]);
+
+  async function browseLocal() {
+    const selected = await open({ multiple: false, title: "Select file" });
+    if (selected) setLocalPath(selected);
+  }
+
+  async function handleRun() {
+    if (!localPath.trim() || !remotePath.trim()) {
+      alert("Both paths are required");
+      return;
+    }
+    setRunning(true);
+    setResults([]);
+    try {
+      const res = await invoke("run_scp_broadcast", {
+        hosts,
+        network,
+        defaults: config.defaults,
+        localPath,
+        remotePath,
+        direction,
+      });
+      setResults(res);
+    } catch(e) {
+      alert("Failed: " + e);
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-wide">
+        <h3>📁 SCP Broadcast — {hosts.length} hosts</h3>
+
+        <div className="scp-direction">
+          <button className={`scp-dir-btn ${direction === "upload" ? "active" : ""}`} onClick={() => setDirection("upload")}>↑ Upload (local → remote)</button>
+          <button className={`scp-dir-btn ${direction === "download" ? "active" : ""}`} onClick={() => setDirection("download")}>↓ Download (remote → local)</button>
+        </div>
+
+        <div className="form-group">
+          <label>Local path</label>
+          <div className="form-row">
+            <input value={localPath} onChange={e => setLocalPath(e.target.value)} placeholder="/home/user/script.sh" />
+            <button className="btn-browse" onClick={browseLocal}>Browse</button>
+          </div>
+        </div>
+
+        <div className="form-group">
+          <label>Remote path</label>
+          <input value={remotePath} onChange={e => setRemotePath(e.target.value)} placeholder="/tmp/script.sh" />
+        </div>
+
+        {results.length > 0 && (
+          <div className="cmd-results">
+            {results.map((r, i) => (
+              <div key={i} className={`cmd-result ${r.success ? "success" : "error"}`}>
+                <div className="cmd-result-header">
+                  <span className={`cmd-status-dot ${r.success ? "up" : "down"}`} />
+                  <span className="cmd-result-host">{r.hostname || r.ip}</span>
+                  <span className="cmd-result-ip">{r.ip}</span>
+                  <span style={{marginLeft:"auto", fontSize:"0.72rem", color: r.success ? "var(--green)" : "var(--red)"}}>
+                    {r.success ? "✓ OK" : "✗ Failed"}
+                  </span>
+                </div>
+                {r.message && <pre className="cmd-output">{r.message}</pre>}
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Close</button>
+          <button className="btn-primary" onClick={handleRun} disabled={running}>
+            {running ? "Transferring..." : direction === "upload" ? "↑ Upload to all" : "↓ Download from all"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RemoteBrowserModal({ host, network, config, onSelect, onClose }) {
+  const [currentPath, setCurrentPath] = useState("/");
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  const username = host.username || network.username || config?.defaults?.username || "root";
+  const port = host.port || network.port || config?.defaults?.port || 22;
+  const identityFile = host.identity_file || network.identity_file || config?.defaults?.identity_file || null;
+
+  useEffect(() => { loadDir(currentPath); }, [currentPath]);
+
+  async function loadDir(path) {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await invoke("list_remote_dir", {
+        ip: host.ip, username, port, identityFile, path,
+      });
+      setEntries(res);
+    } catch(e) {
+      setError(e.toString());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function navigate(name) {
+    if (name === "..") {
+      const parts = currentPath.split("/").filter(Boolean);
+      parts.pop();
+      setCurrentPath("/" + (parts.length ? parts.join("/") : ""));
+    } else {
+      setCurrentPath(currentPath.endsWith("/") ? currentPath + name : currentPath + "/" + name);
+    }
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-wide">
+        <h3>📁 Remote browser — {host.hostname || host.ip}</h3>
+        <div className="remote-path-bar">
+          <span className="remote-path">{currentPath}</span>
+          <button className="btn-cancel" onClick={() => navigate("..")}>↑ Up</button>
+        </div>
+        {error && <div className="scp-result error">{error}</div>}
+        <div className="remote-entries">
+          {loading && <div className="remote-loading">Loading...</div>}
+          {!loading && entries.map((e, i) => (
+            <div key={i} className={`remote-entry ${e.is_dir ? "dir" : "file"}`}
+              onClick={() => e.is_dir ? navigate(e.name) : null}>
+              <span className="remote-entry-icon">{e.is_dir ? "📁" : "📄"}</span>
+              <span className="remote-entry-name">{e.name}</span>
+              <span className="remote-entry-size">{e.is_dir ? "" : e.size}</span>
+              {!e.is_dir && (
+                <button className="btn-select-file" onClick={() => {
+                  const fullPath = currentPath.endsWith("/")
+                    ? currentPath + e.name
+                    : currentPath + "/" + e.name;
+                  onSelect(fullPath);
+                  onClose();
+                }}>Select</button>
+              )}
+            </div>
+          ))}
+        </div>
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={() => { onSelect(currentPath); onClose(); }}>
+            Use this directory
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ScpModal({ host, network, config, onClose }) {
+  const [direction, setDirection] = useState("upload");
+  const [localPath, setLocalPath] = useState("");
+  const [remotePath, setRemotePath] = useState("");
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState(null);
+  const [showRemoteBrowser, setShowRemoteBrowser] = useState(false);
+
+  const username = host.username || network.username || config?.defaults?.username || "root";
+  const port = host.port || network.port || config?.defaults?.port || 22;
+  const identityFile = host.identity_file || network.identity_file || config?.defaults?.identity_file || null;
+
+  async function browseLocal() {
+    if (direction === "upload") {
+      const selected = await open({ multiple: false, title: "Select file to upload" });
+      if (selected) setLocalPath(selected);
+    } else {
+      const selected = await save({ title: "Save downloaded file as" });
+      if (selected) setLocalPath(selected);
+    }
+  }
+
+  async function handleRun() {
+    if (!localPath.trim() || !remotePath.trim()) {
+      alert("Both paths are required");
+      return;
+    }
+    setRunning(true);
+    setResult(null);
+    try {
+      const out = await invoke("run_scp", {
+        ip: host.ip,
+        username,
+        port,
+        identityFile,
+        localPath,
+        remotePath,
+        direction,
+      });
+      setResult({ success: true, message: out || "Transfer completed successfully" });
+    } catch(e) {
+      setResult({ success: false, message: e });
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal">
+        <h3>📁 SCP — {host.hostname || host.ip}</h3>
+
+        <div className="scp-direction">
+          <button
+            className={`scp-dir-btn ${direction === "upload" ? "active" : ""}`}
+            onClick={() => setDirection("upload")}
+          >↑ Upload (local → remote)</button>
+          <button
+            className={`scp-dir-btn ${direction === "download" ? "active" : ""}`}
+            onClick={() => setDirection("download")}
+          >↓ Download (remote → local)</button>
+        </div>
+
+        <div className="form-group">
+          <label>Local path</label>
+          <div className="form-row">
+            <input
+              value={localPath}
+              onChange={e => setLocalPath(e.target.value)}
+              placeholder={direction === "upload" ? "/home/user/script.sh" : "/tmp/downloaded_file"}
+            />
+            <button className="btn-browse" onClick={browseLocal}>Browse</button>
+          </div>
+        </div>
+
+        {showRemoteBrowser && (
+          <RemoteBrowserModal
+            host={host}
+            network={network}
+            config={config}
+            onSelect={setRemotePath}
+            onClose={() => setShowRemoteBrowser(false)}
+          />
+        )}
+        <div className="form-group">
+          <label>Remote path ({username}@{host.ip})</label>
+          <div className="form-row">
+            <input
+              value={remotePath}
+              onChange={e => setRemotePath(e.target.value)}
+              placeholder={direction === "upload" ? "/tmp/script.sh" : "/var/log/syslog"}
+            />
+            <button className="btn-browse" onClick={() => setShowRemoteBrowser(true)}>Browse</button>
+          </div>
+        </div>
+
+        {result && (
+          <div className={`scp-result ${result.success ? "success" : "error"}`}>
+            {result.success ? "✓" : "✗"} {result.message}
+          </div>
+        )}
+
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Close</button>
+          <button className="btn-primary" onClick={handleRun} disabled={running}>
+            {running ? "Transferring..." : direction === "upload" ? "↑ Upload" : "↓ Download"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HealthCheckModal({ host, network, config, networks, setNetworks, selectedNetworkIndex, onClose }) {
+  const [loading, setLoading] = useState(false);
+  const [raw, setRaw] = useState("");
+  const [analysis, setAnalysis] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const username = host.username || network.username || config?.defaults?.username || "root";
+  const port = host.port || network.port || config?.defaults?.port || 22;
+  const identityFile = host.identity_file || network.identity_file || config?.defaults?.identity_file || null;
+  const hasAi = !!(config?.ai?.api_key);
+
+  useEffect(() => {
+    if (host.health_status && host.health_report) {
+      try { setAnalysis(JSON.parse(host.health_report)); } catch(e) { runHealthCheck(); }
+    } else {
+      runHealthCheck();
+    }
+  }, []);
+
+  async function runHealthCheck() {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invoke("health_check", { ip: host.ip, username, port, identityFile });
+      setRaw(result.raw);
+      const a = analyzeLocal(result.raw);
+      await saveStatus(a.health, JSON.stringify(a));
+    } catch(e) { setError(e.toString()); }
+    finally { setLoading(false); }
+  }
+
+  function analyzeLocal(data) {
+    const issues = [];
+    const metrics = {};
+
+    const loadMatch = data.match(/load average[s]?:\s*([\d.]+),?\s*([\d.]+),?\s*([\d.]+)/i);
+    if (loadMatch) {
+      metrics.load1 = parseFloat(loadMatch[1]);
+      metrics.load5 = parseFloat(loadMatch[2]);
+      metrics.load15 = parseFloat(loadMatch[3]);
+      if (metrics.load1 > 8) issues.push({ level: "critical", msg: `Very high load: ${metrics.load1}` });
+      else if (metrics.load1 > 4) issues.push({ level: "warning", msg: `High load: ${metrics.load1}` });
+    }
+
+    const memMatch = data.match(/Mem:\s+(\d+)\s+(\d+)\s+(\d+)/);
+    if (memMatch) {
+      const total = parseInt(memMatch[1]);
+      const used = parseInt(memMatch[2]);
+      metrics.memUsedPct = Math.round((used / total) * 100);
+      if (metrics.memUsedPct > 95) issues.push({ level: "critical", msg: `Memory critical: ${metrics.memUsedPct}%` });
+      else if (metrics.memUsedPct > 85) issues.push({ level: "warning", msg: `Memory high: ${metrics.memUsedPct}%` });
+    }
+
+    const swapMatch = data.match(/Swap:\s+(\d+)\s+(\d+)\s+(\d+)/);
+    if (swapMatch) {
+      const swapTotal = parseInt(swapMatch[1]);
+      const swapUsed = parseInt(swapMatch[2]);
+      if (swapTotal > 0) {
+        const swapPct = Math.round((swapUsed / swapTotal) * 100);
+        metrics.swapUsedPct = swapPct;
+        if (swapPct > 90) issues.push({ level: "critical", msg: `Swap full: ${swapPct}% (${swapUsed}/${swapTotal} MB)` });
+        else if (swapPct > 50) issues.push({ level: "warning", msg: `Swap high: ${swapPct}%` });
+      }
+    }
+
+    const dfLines = data.split(String.fromCharCode(10)).filter(l => l.match(/\d+%/));
+    dfLines.forEach(line => {
+      const match = line.match(/(\d+)%\s+(\S+)$/);
+      if (match) {
+        const pct = parseInt(match[1]);
+        const mount = match[2];
+        if (pct > 95) issues.push({ level: "critical", msg: `Disk ${mount} at ${pct}%` });
+        else if (pct > 85) issues.push({ level: "warning", msg: `Disk ${mount} at ${pct}%` });
+      }
+    });
+
+    const dmesgErrors = data.match(/error|oom|killed|panic|fault/gi) || [];
+    if (dmesgErrors.length > 3) issues.push({ level: "warning", msg: `${dmesgErrors.length} error patterns in dmesg` });
+
+    const health = issues.some(i => i.level === "critical") ? "critical"
+      : issues.some(i => i.level === "warning") ? "warning" : "ok";
+
+    const a = { health, issues, metrics };
+    setAnalysis(a);
+    return a;
+  }
+
+  async function saveStatus(health, report) {
+    if (selectedNetworkIndex === undefined) return;
+    try {
+      const updated = await invoke("save_health_status", {
+        networksFile: { networks }, networkIndex: selectedNetworkIndex,
+        hostIp: host.ip, status: health, report,
+      });
+      setNetworks(updated.networks);
+    } catch(e) { console.error(e); }
+  }
+
+  async function runAiAnalysis() {
+    if (!hasAi || !raw) return;
+    setAiLoading(true);
+    const ai = config.ai;
+    try {
+      const insight = await invoke("ai_analyze", {
+        rawData: raw, hostname: host.hostname || host.ip,
+        apiUrl: ai.api_url, apiKey: ai.api_key,
+        model: ai.model, provider: ai.provider || "claude",
+      });
+      const updated = { ...analysis, ai_insight: insight };
+      setAnalysis(updated);
+      await saveStatus(updated.health, JSON.stringify(updated));
+    } catch(e) {
+      setAnalysis(a => ({ ...a, ai_insight: `AI error: ${e}` }));
+    } finally { setAiLoading(false); }
+  }
+
+  const healthColor = { ok: "var(--green)", warning: "var(--yellow)", critical: "var(--red)" };
+  const healthIcon = { ok: "🟢", warning: "🟡", critical: "🔴" };
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-wide">
+        <h3>⚕ Health Check — {host.hostname || host.ip}</h3>
+        {loading && <div className="health-loading">Running Brendan Gregg 60s checklist...</div>}
+        {error && <div className="scp-result error">{error}</div>}
+        {analysis && (
+          <div className="health-summary">
+            <div style={{display:"flex", alignItems:"center", justifyContent:"space-between"}}>
+              <div className="health-status" style={{color: healthColor[analysis.health]}}>
+                {healthIcon[analysis.health]} {analysis.health.toUpperCase()}
+              </div>
+              {host.health_status && !loading && (
+                <span style={{fontSize:"0.7rem", color:"var(--text3)"}}>
+                  Cached · <button className="btn-link" onClick={runHealthCheck}>Refresh</button>
+                </span>
+              )}
+            </div>
+            <div className="health-metrics">
+              {analysis.metrics.load1 !== undefined && (
+                <div className="health-metric">
+                  <span className="health-metric-label">Load avg</span>
+                  <span className="health-metric-value">{analysis.metrics.load1} / {analysis.metrics.load5} / {analysis.metrics.load15}</span>
+                </div>
+              )}
+              {analysis.metrics.memUsedPct !== undefined && (
+                <div className="health-metric">
+                  <span className="health-metric-label">Memory</span>
+                  <span className="health-metric-value" style={{color: analysis.metrics.memUsedPct > 85 ? "var(--red)" : "var(--text)"}}>
+                    {analysis.metrics.memUsedPct}% used
+                  </span>
+                </div>
+              )}
+              {analysis.metrics.swapUsedPct !== undefined && (
+                <div className="health-metric">
+                  <span className="health-metric-label">Swap</span>
+                  <span className="health-metric-value" style={{color: analysis.metrics.swapUsedPct > 90 ? "var(--red)" : analysis.metrics.swapUsedPct > 50 ? "var(--yellow)" : "var(--text)"}}>
+                    {analysis.metrics.swapUsedPct}% used
+                  </span>
+                </div>
+              )}
+            </div>
+            {analysis.issues.length > 0 && (
+              <div className="health-issues">
+                {analysis.issues.map((issue, i) => (
+                  <div key={i} className={`health-issue ${issue.level}`}>
+                    {issue.level === "critical" ? "🔴" : "🟡"} {issue.msg}
+                  </div>
+                ))}
+              </div>
+            )}
+            {analysis.ai_insight ? (
+              <div className="health-ai">
+                <div className="health-ai-label">🤖 AI insights</div>
+                <div className="health-ai-text"><ReactMarkdown>{analysis.ai_insight}</ReactMarkdown></div>
+              </div>
+            ) : hasAi && !aiLoading && raw && (
+              <button className="btn-ai-analyze" onClick={runAiAnalysis}>
+                🤖 Analyze with AI
+              </button>
+            )}
+            {aiLoading && <div className="health-loading">AI analyzing...</div>}
+          </div>
+        )}
+        {raw && (
+          <details className="health-raw">
+            <summary>Raw output</summary>
+            <pre className="cmd-output-full">{raw}</pre>
+          </details>
+        )}
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Close</button>
+          {!loading && <button className="btn-cancel" onClick={runHealthCheck}>↺ Rerun</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+function CommandOutputModal({ result, onClose }) {
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-wide">
+        <h3>⚡ {result.hostname || result.ip} <span style={{color:"var(--text3)", fontSize:"0.75rem"}}>{result.ip}</span></h3>
+        <div className={`cmd-result-badge ${result.success ? "success" : "error"}`}>
+          {result.success ? "✓ Exit OK" : "✗ Exit error"}
+        </div>
+        {result.stdout && (
+          <div className="form-group">
+            <label>stdout</label>
+            <pre className="cmd-output-full">{result.stdout}</pre>
+          </div>
+        )}
+        {result.stderr && (
+          <div className="form-group">
+            <label>stderr</label>
+            <pre className="cmd-output-full cmd-stderr">{result.stderr}</pre>
+          </div>
+        )}
+        <div className="modal-actions">
+          <button className="btn-primary" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [networks, setNetworks] = useState([]);
+  const [config, setConfig] = useState(null);
+  const [selectedNetwork, setSelectedNetwork] = useState(null);
+  const [filter, setFilter] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [networkModal, setNetworkModal] = useState(null);
+  const [scanning, setScanning] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [scanProgress, setScanProgress] = useState(null);
+  const [checkProgress, setCheckProgress] = useState(null);
+  const [selectedHosts, setSelectedHosts] = useState(new Set());
+  const [broadcasting, setBroadcasting] = useState(false);
+  const [hostModal, setHostModal] = useState(null);
+  const [showTagModal, setShowTagModal] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showRunCommand, setShowRunCommand] = useState(false);
+  const [showScpBroadcast, setShowScpBroadcast] = useState(false);
+  const [scpModal, setScpModal] = useState(null);
+  const [healthModal, setHealthModal] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [showHistory, setShowHistory] = useState(false);
+
+  useEffect(() => { loadData(); loadHistory(); }, []);
+  useEffect(() => { setSelectedHosts(new Set()); }, [selectedNetwork]);
+
+  async function loadData() {
+    try {
+      const [netsResult, cfgResult] = await Promise.all([invoke("get_networks"), invoke("get_config")]);
+      setNetworks(netsResult.networks);
+      setConfig(cfgResult);
+      if (netsResult.networks.length > 0) setSelectedNetwork(0);
+    } catch (e) { console.error(e); }
+    finally { setLoading(false); }
+  }
+
+  async function loadHistory() {
+    try {
+      const h = await invoke("get_history");
+      setHistory(h.connections.slice().reverse());
+    } catch(e) { console.error(e); }
+  }
+
+  function resolveUsername(host, network) { return host.username || network.username || config?.defaults?.username || "root"; }
+  function resolvePort(host, network) { return host.port || network.port || config?.defaults?.port || 22; }
+
+  function lastSeen(ip) {
+    const rec = history.find(h => h.ip === ip);
+    if (!rec) return null;
+    const ts = parseInt(rec.connected_at) * 1000;
+    const d = new Date(ts);
+    return d.toLocaleString("en-GB", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" });
+  }
+
+  async function connectSSH(host) {
+    const network = networks[selectedNetwork];
+    try { await invoke("launch_ssh", { ip: host.ip, username: resolveUsername(host, network), port: resolvePort(host, network), terminal: config?.defaults?.terminal || null, hostname: host.hostname || null, networkName: network.name, identityFile: host.identity_file || network.identity_file || config?.defaults?.identity_file || null, postConnect: host.post_connect || null }); loadHistory(); }
+    catch (e) { alert("Failed to launch SSH: " + e); }
+  }
+
+  async function handleSaveNetwork(networkData, index) {
+    try {
+      let updated;
+      if (index !== undefined) {
+        updated = await invoke("update_network", { networksFile: { networks }, index, network: networkData });
+      } else {
+        updated = await invoke("add_network", { networksFile: { networks }, network: networkData });
+        setSelectedNetwork(updated.networks.length - 1);
+      }
+      setNetworks(updated.networks);
+    } catch (e) { alert("Failed to save network: " + e); }
+  }
+
+  async function handleSaveSettings(newConfig) {
+    try {
+      await invoke("save_config", { config: newConfig });
+      setConfig(newConfig);
+    } catch(e) { alert("Failed to save settings: " + e); }
+  }
+
+  async function handleRecalibrate(index) {
+    try {
+      const updated = await invoke("recalibrate_network", {
+        networksFile: { networks },
+        networkIndex: index,
+        defaults: config.defaults,
+      });
+      setNetworks(updated.networks);
+      return updated.networks[index].scan_timeout;
+    } catch(e) {
+      alert("Calibration failed: " + e);
+    }
+  }
+
+  async function handleDeleteNetwork(index) {
+    if (!confirm(`Delete network [${networks[index].name}]?`)) return;
+    try {
+      const updated = await invoke("delete_network", { networksFile: { networks }, index });
+      setNetworks(updated.networks);
+      setSelectedNetwork(updated.networks.length > 0 ? 0 : null);
+    } catch (e) { alert("Failed to delete network: " + e); }
+  }
+
+  async function handleSaveHost({ hostData, networkIndex }) {
+    try {
+      let updated;
+      if (hostModal.index !== undefined) {
+        updated = await invoke("update_host", { networksFile: { networks }, networkIndex: selectedNetwork, hostIndex: hostModal.index, host: hostData });
+      } else {
+        updated = await invoke("add_host", { networksFile: { networks }, networkIndex, host: hostData });
+        setSelectedNetwork(networkIndex);
+      }
+      setNetworks(updated.networks);
+    } catch (e) { alert("Failed to save host: " + e); }
+  }
+
+  async function handleDeleteHost(hostIndex) {
+    const host = networks[selectedNetwork].hosts[hostIndex];
+    if (!confirm(`Delete host ${host.ip}?`)) return;
+    try {
+      const updated = await invoke("delete_host", { networksFile: { networks }, networkIndex: selectedNetwork, hostIndex });
+      setNetworks(updated.networks);
+    } catch (e) { alert("Failed to delete host: " + e); }
+  }
+
+  async function handleScan() {
+    if (selectedNetwork === null || scanning) return;
+    setScanning(true);
+    setScanProgress({ total: 0, current: 0 });
+    const unlisten = await listen("scan-progress", e => setScanProgress(e.payload));
+    try {
+      const updated = await invoke("scan_network", { networksFile: { networks }, networkIndex: selectedNetwork, defaults: config.defaults });
+      setNetworks(updated.networks);
+    } catch (e) { alert("Scan failed: " + e); }
+    finally { unlisten(); setScanning(false); setScanProgress(null); }
+  }
+
+  async function handleCheck() {
+    if (selectedNetwork === null || checking) return;
+    setChecking(true);
+    setCheckProgress({ total: 0, current: 0 });
+    const unlisten = await listen("check-progress", e => setCheckProgress(e.payload));
+    try {
+      const updated = await invoke("check_hosts", { networksFile: { networks }, networkIndex: selectedNetwork, defaults: config.defaults });
+      setNetworks(updated.networks);
+    } catch (e) { alert("Check failed: " + e); }
+    finally { unlisten(); setChecking(false); setCheckProgress(null); }
+  }
+
+  async function handleBulkTag(tag) {
+    try {
+      const updated = await invoke("bulk_tag", { networksFile: { networks }, networkIndex: selectedNetwork, hostIps: Array.from(selectedHosts), tag });
+      setNetworks(updated.networks);
+      setSelectedHosts(new Set());
+    } catch (e) { alert("Failed to tag: " + e); }
+  }
+
+  function toggleHost(ip) {
+    setSelectedHosts(prev => { const next = new Set(prev); next.has(ip) ? next.delete(ip) : next.add(ip); return next; });
+  }
+
+  function toggleAll() {
+    setSelectedHosts(selectedHosts.size === filteredHosts.length ? new Set() : new Set(filteredHosts.map(h => h.ip)));
+  }
+
+  async function handleBroadcast() {
+    if (selectedHosts.size === 0 || broadcasting) return;
+    const network = networks[selectedNetwork];
+    setBroadcasting(true);
+    try {
+      await invoke("launch_broadcast", {
+        hosts: network.hosts.filter(h => selectedHosts.has(h.ip)),
+        network, defaults: config.defaults,
+        sessionName: `merendero-${network.name.toLowerCase().replace(/\s+/g, '-')}`,
+      });
+    } catch (e) { alert("Broadcast failed: " + e); }
+    finally { setBroadcasting(false); }
+  }
+
+  function matchesFilter(host, filter) {
+    if (!filter) return true;
+    const f = filter.toLowerCase().trim();
+    if (f === ":critical") return host.health_status === "critical";
+    if (f === ":warning") return host.health_status === "warning";
+    if (f === ":issues") return host.health_status === "critical" || host.health_status === "warning";
+    if (f === ":healthy") return host.health_status === "ok";
+    if (f === ":down") return !host.active;
+    if (f === ":up") return host.active;
+    return host.ip.toLowerCase().includes(f) ||
+      (host.hostname || "").toLowerCase().includes(f) ||
+      (host.tag || "").toLowerCase().includes(f);
+  }
+
+  const filteredHosts = selectedNetwork !== null
+    ? networks[selectedNetwork]?.hosts.filter(host => matchesFilter(host, filter)) : [];
+
+  const filteredHostsWithIndex = selectedNetwork !== null
+    ? networks[selectedNetwork]?.hosts.map((host, index) => ({ host, index })).filter(({ host }) => matchesFilter(host, filter)) : [];
+
+  const allSelected = filteredHosts.length > 0 && selectedHosts.size === filteredHosts.length;
+  const currentNet = selectedNetwork !== null ? networks[selectedNetwork] : null;
+  const activeCount = currentNet ? currentNet.hosts.filter(h => h.active).length : 0;
+
+  if (loading) return <div className="loading">Loading...</div>;
+
+  return (
+    <div className="app">
+      {networkModal && <NetworkModal network={networkModal.network} index={networkModal.index} onSave={handleSaveNetwork} onClose={() => setNetworkModal(null)} onRecalibrate={handleRecalibrate} />}
+      {healthModal && <HealthCheckModal host={healthModal} network={networks[selectedNetwork]} config={config} networks={networks} setNetworks={setNetworks} selectedNetworkIndex={selectedNetwork} onClose={() => setHealthModal(null)} />}
+      {scpModal && <ScpModal host={scpModal} network={networks[selectedNetwork]} config={config} onClose={() => setScpModal(null)} />}
+      {showScpBroadcast && <ScpBroadcastModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowScpBroadcast(false)} />}
+      {showRunCommand && <RunCommandModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowRunCommand(false)} />}
+      {showSettings && <SettingsModal config={config} onSave={handleSaveSettings} onClose={() => setShowSettings(false)} />}
+      {hostModal && <HostModal host={hostModal.host} networks={networks} defaultNetworkIndex={selectedNetwork ?? 0} onSave={handleSaveHost} onClose={() => setHostModal(null)} onHealthCheck={(h) => { setHostModal(null); setHealthModal(h); }} />}
+      {showTagModal && <TagModal count={selectedHosts.size} onApply={handleBulkTag} onClose={() => setShowTagModal(false)} />}
+
+      <div className="sidebar">
+        <div className="sidebar-header">
+          <h2>Merendero</h2>
+          <span className="sidebar-tagline">// manage your systems</span>
+          
+        </div>
+        <div className="network-list">
+          {networks.map((net, i) => {
+            const active = net.hosts.filter(h => h.active).length;
+            const total = net.hosts.length;
+            return (
+              <div key={i} className={`network-item ${selectedNetwork === i ? "active" : ""}`} onClick={() => { setSelectedNetwork(i); setFilter(""); }}>
+                <div className="network-item-content">
+                  <div className="network-name">{net.name}</div>
+                  <div className="network-meta">{net.network}</div>
+                  {total > 0 && (
+                    <div className="network-badges">
+                      <span className="badge-active">▲ {active}</span>
+                      <span className="badge-inactive">▼ {total - active}</span>
+                    </div>
+                  )}
+                </div>
+                <div className="network-item-actions">
+                  <button className="btn-edit-network" onClick={e => { e.stopPropagation(); setNetworkModal({ network: net, index: i }); }} title="Edit">✎</button>
+                  <button className="btn-delete-network" onClick={e => { e.stopPropagation(); handleDeleteNetwork(i); }} title="Delete">✕</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="main">
+        {currentNet && (
+          <>
+            <div className="main-header">
+              <div className="main-title">
+                <h2>{currentNet.name}</h2>
+                <span className="network-cidr">{currentNet.network} · {activeCount}/{currentNet.hosts.length} up</span>
+              </div>
+              <div className="main-actions">
+                <input className="filter-input" type="text" placeholder="Filter: ip, fqdn, tag, :critical, :warning, :issues, :down, :up" value={filter} onChange={e => setFilter(e.target.value)} disabled={scanning || checking} />
+                <button className="btn-settings" onClick={() => setShowSettings(true)}>⚙</button>
+                <button className="btn-add-network-main" onClick={() => setNetworkModal({ network: null, index: undefined })}>+ Network</button>
+                <button className="btn-add-host" onClick={() => setHostModal({ host: null })}>+ Host</button>
+                <button className="btn-check" onClick={handleCheck} disabled={checking || scanning}>{checking ? "Checking..." : "✓ Check"}</button>
+                <button className={`btn-scan ${scanning ? "scanning" : ""}`} onClick={handleScan} disabled={scanning || checking}>{scanning ? "Scanning..." : "⟳ Scan"}</button>
+              </div>
+            </div>
+
+            {scanning && <ProgressBar progress={scanProgress} label="Scanning..." />}
+            {checking && <ProgressBar progress={checkProgress} label="Checking..." />}
+
+            {selectedHosts.size > 0 && (
+              <div className="broadcast-toolbar">
+                <span>{selectedHosts.size} hosts selected</span>
+                <div className="broadcast-actions">
+                  <button className="btn-clear" onClick={() => setSelectedHosts(new Set())}>Clear</button>
+                  <button className="btn-tag" onClick={() => setShowTagModal(true)}>🏷 Tag</button>
+                  <button className="btn-run-cmd" onClick={() => setShowRunCommand(true)}>▶ Run cmd</button>
+                  <button className="btn-run-cmd" onClick={() => setShowScpBroadcast(true)}>📁 SCP</button>
+                  <button className={`btn-broadcast ${broadcasting ? "disabled" : ""}`} onClick={handleBroadcast} disabled={broadcasting}>⚡ Broadcast ({selectedHosts.size})</button>
+                </div>
+              </div>
+            )}
+
+            <div className="host-table">
+              <div className="host-table-header">
+                <span><input type="checkbox" checked={allSelected} onChange={toggleAll} /></span>
+                <span>Up</span>
+                <span>IP</span>
+                <span>FQDN</span>
+                <span>Tag</span>
+                <span>Last connection</span>
+                <span>Actions</span>
+              </div>
+              {filteredHostsWithIndex.map(({ host, index }) => (
+                <div key={index} className={`host-row ${host.active ? "active" : "inactive"} ${selectedHosts.has(host.ip) ? "selected" : ""}`}>
+                  <span><input type="checkbox" checked={selectedHosts.has(host.ip)} onChange={() => toggleHost(host.ip)} /></span>
+                  <span style={{display:"flex", alignItems:"center", gap:"3px"}}>
+                    <span className={`status-dot ${host.active ? "up" : "down"}`} />
+                    {host.health_status === "critical" && <span title="Health: CRITICAL" style={{color:"var(--red)", fontSize:"0.65rem"}}>⚠</span>}
+                    {host.health_status === "warning" && <span title="Health: WARNING" style={{color:"var(--yellow)", fontSize:"0.65rem"}}>⚠</span>}
+                  </span>
+                  <span className="ip">{host.ip}</span>
+                  <span className="hostname" title={host.hostname || ""}>{host.hostname || ""}</span>
+                  <span>{host.tag ? <span className="tag-badge">{host.tag}</span> : ""}</span>
+                  <span className="last-seen">{lastSeen(host.ip) || ""}</span>
+                  <span className="actions">
+                    {host.notes && <span className="notes-icon" title={host.notes}>📝</span>}
+                    <button className="btn-connect" onClick={() => connectSSH(host)}>SSH</button>
+                    <button className="btn-health" onClick={() => setHealthModal(host)} title="Health check">⚕</button>
+                    <button className="btn-scp" onClick={() => setScpModal(host)} title="SCP">📁</button>
+                    <button className="btn-edit" onClick={() => setHostModal({ host, index })}>✎</button>
+                    <button className="btn-delete-host" onClick={() => handleDeleteHost(index)}>✕</button>
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            <div className="main-footer">
+              <span>{filteredHosts.length} hosts{filter ? ` (filtered)` : ""}</span>
+              {selectedHosts.size > 0 && <span className="footer-selected">{selectedHosts.size} selected</span>}
+            </div>
+          </>
+        )}
+        {selectedNetwork === null && (
+          <div className="empty-state">
+            <p>No networks configured.</p>
+            <button className="btn-primary" onClick={() => setNetworkModal({ network: null, index: undefined })}>Add your first network</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default App;
