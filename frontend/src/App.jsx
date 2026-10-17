@@ -17,6 +17,8 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
   });
   const [calibrating, setCalibrating] = useState(false);
 
+  function handleChange(e) { setForm({ ...form, [e.target.name]: e.target.value }); }
+
   async function handleRecalibrate() {
     if (!onRecalibrate) return;
     setCalibrating(true);
