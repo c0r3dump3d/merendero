@@ -886,6 +886,35 @@ function CommandOutputModal({ result, onClose }) {
   );
 }
 
+function BroadcastConfirmModal({ hosts, network, config, onConfirm, onClose }) {
+  const username = network?.username || config?.defaults?.username || "root";
+  const port = network?.port || config?.defaults?.port || 22;
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal">
+        <h3>⚡ Broadcast to {hosts.length} host{hosts.length !== 1 ? "s" : ""}</h3>
+        <div className="broadcast-confirm-list">
+          {hosts.map((h, i) => (
+            <div key={i} className="broadcast-confirm-item">
+              <span className={`status-dot ${h.active ? "up" : "down"}`} />
+              <span className="broadcast-confirm-host">{h.hostname || h.ip}</span>
+              <span className="broadcast-confirm-ip">{h.ip}</span>
+            </div>
+          ))}
+        </div>
+        <div className="broadcast-confirm-meta">
+          User: <strong>{username}</strong> · Port: <strong>{port}</strong>
+        </div>
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button className="btn-broadcast" onClick={onConfirm}>⚡ Broadcast</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [networks, setNetworks] = useState([]);
   const [config, setConfig] = useState(null);
@@ -904,6 +933,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showRunCommand, setShowRunCommand] = useState(false);
   const [showScpBroadcast, setShowScpBroadcast] = useState(false);
+  const [showBroadcastConfirm, setShowBroadcastConfirm] = useState(false);
   const [scpModal, setScpModal] = useState(null);
   const [healthModal, setHealthModal] = useState(null);
   const [history, setHistory] = useState([]);
@@ -1096,6 +1126,7 @@ function App() {
       {networkModal && <NetworkModal network={networkModal.network} index={networkModal.index} onSave={handleSaveNetwork} onClose={() => setNetworkModal(null)} onRecalibrate={handleRecalibrate} />}
       {healthModal && <HealthCheckModal host={healthModal} network={networks[selectedNetwork]} config={config} networks={networks} setNetworks={setNetworks} selectedNetworkIndex={selectedNetwork} onClose={() => setHealthModal(null)} />}
       {scpModal && <ScpModal host={scpModal} network={networks[selectedNetwork]} config={config} onClose={() => setScpModal(null)} />}
+      {showBroadcastConfirm && <BroadcastConfirmModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onConfirm={() => { setShowBroadcastConfirm(false); handleBroadcast(); }} onClose={() => setShowBroadcastConfirm(false)} />}
       {showScpBroadcast && <ScpBroadcastModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowScpBroadcast(false)} />}
       {showRunCommand && <RunCommandModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowRunCommand(false)} />}
       {showSettings && <SettingsModal config={config} onSave={handleSaveSettings} onClose={() => setShowSettings(false)} />}
@@ -1163,7 +1194,7 @@ function App() {
                   <button className="btn-tag" onClick={() => setShowTagModal(true)}>🏷 Tag</button>
                   <button className="btn-run-cmd" onClick={() => setShowRunCommand(true)}>▶ Run cmd</button>
                   <button className="btn-run-cmd" onClick={() => setShowScpBroadcast(true)}>📁 SCP</button>
-                  <button className={`btn-broadcast ${broadcasting ? "disabled" : ""}`} onClick={handleBroadcast} disabled={broadcasting}>⚡ Broadcast ({selectedHosts.size})</button>
+                  <button className={`btn-broadcast ${broadcasting ? "disabled" : ""}`} onClick={() => setShowBroadcastConfirm(true)} disabled={broadcasting}>⚡ Broadcast ({selectedHosts.size})</button>
                 </div>
               </div>
             )}
