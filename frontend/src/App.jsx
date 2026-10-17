@@ -348,20 +348,27 @@ function RunCommandModal({ hosts, network, config, onClose }) {
           </button>
         </div>
 
-        {selectedResult && <CommandOutputModal result={selectedResult} onClose={() => setSelectedResult(null)} />}
         {results.length > 0 && (
           <div className="cmd-results">
             {results.map((r, i) => (
               <div key={i}
-                className={`cmd-result cmd-result-clickable ${r.success ? "success" : "error"}`}
-                onClick={() => setSelectedResult(r)}
+                className={`cmd-result ${r.success ? "success" : "error"}`}
+                onClick={() => setSelectedResult(selectedResult === i ? null : i)}
               >
                 <div className="cmd-result-header">
                   <span className={`cmd-status-dot ${r.success ? "up" : "down"}`} />
                   <span className="cmd-result-host">{r.hostname || r.ip}</span>
                   <span className="cmd-result-ip">{r.ip}</span>
-                  <span className="cmd-result-preview">{(r.stdout || r.stderr || "").split("\n")[0].substring(0, 60)}</span>
+                  <span className="cmd-result-preview">
+                    {selectedResult === i ? "▲" : "▼"} {(r.stdout || r.stderr || "").split(String.fromCharCode(10))[0].trim().substring(0, 50)}
+                  </span>
                 </div>
+                {selectedResult === i && (
+                  <div>
+                    {r.stdout && <pre className="cmd-output">{r.stdout}</pre>}
+                    {r.stderr && <pre className="cmd-output cmd-stderr">{r.stderr}</pre>}
+                  </div>
+                )}
               </div>
             ))}
           </div>
