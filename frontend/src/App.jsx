@@ -1218,7 +1218,7 @@ function App() {
       setNetworks(updated.networks);
       return updated.networks[index].scan_timeout;
     } catch(e) {
-      alert("Calibration failed: " + e);
+      throw e;
     }
   }
 

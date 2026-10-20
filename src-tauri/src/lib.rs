@@ -216,6 +216,22 @@ async fn calibrate_timeout(network: &host::Network, defaults: &Defaults) -> u64 
     timeout_secs as u64
 }
 
+fn validate_cidr(value: &str) -> Result<(), String> {
+    if value != value.trim() {
+        return Err(format!("Invalid network '{}': remove leading/trailing spaces", value));
+    }
+    if !value.contains('/') {
+        return Err(format!(
+            "Invalid network '{}': missing prefix length, it would be scanned as a single host. Use for example {}/24",
+            value, value
+        ));
+    }
+    value
+        .parse::<ipnetwork::IpNetwork>()
+        .map(|_| ())
+        .map_err(|e| format!("Invalid network '{}': {}", value, e))
+}
+
 #[tauri::command]
 async fn scan_network(
     window: tauri::Window,
@@ -226,6 +242,8 @@ async fn scan_network(
     if network_index >= networks_file.networks.len() {
         return Err(String::from("Invalid network index"));
     }
+
+    validate_cidr(&networks_file.networks[network_index].network)?;
 
     // calibra si no tiene timeout
     let timeout = if let Some(t) = networks_file.networks[network_index].scan_timeout {
@@ -246,7 +264,7 @@ async fn scan_network(
         for host in existing.iter_mut() { host.active = false; }
         for new_host in discovered {
             match existing.iter_mut().find(|h| h.ip == new_host.ip) {
-                Some(existing_host) => { existing_host.active = true; existing_host.hostname = new_host.hostname; }
+                Some(existing_host) => { existing_host.active = true; if new_host.hostname.is_some() { existing_host.hostname = new_host.hostname; } }
                 None => { existing.push(new_host); }
             }
         }
@@ -266,6 +284,7 @@ async fn recalibrate_network(
     if network_index >= networks_file.networks.len() {
         return Err(String::from("Invalid network index"));
     }
+    validate_cidr(&networks_file.networks[network_index].network)?;
     let t = calibrate_timeout(&networks_file.networks[network_index], &defaults).await;
     networks_file.networks[network_index].scan_timeout = Some(t);
     let path = get_config_dir().join("networks.toml");
