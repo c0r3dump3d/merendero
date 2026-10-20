@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import ReactMarkdown from "react-markdown";
@@ -662,6 +662,64 @@ function ScpModal({ host, network, config, onClose }) {
   );
 }
 
+function analyzeHealth(data) {
+  const issues = [];
+  const metrics = {};
+
+  const loadLine = data.match(/load average[s]?:\s*(.*)/i);
+    const loadNums = loadLine ? (loadLine[1].match(/\d+(?:[.,]\d+)?/g) || []).map(n => n.replace(",", ".")) : [];
+    const loadMatch = loadNums.length >= 3 ? [loadLine[0], ...loadNums] : null;
+  if (loadMatch) {
+    metrics.load1 = parseFloat(loadMatch[1]);
+    metrics.load5 = parseFloat(loadMatch[2]);
+    metrics.load15 = parseFloat(loadMatch[3]);
+    if (metrics.load1 > 8) issues.push({ level: "critical", msg: `Very high load: ${metrics.load1}` });
+    else if (metrics.load1 > 4) issues.push({ level: "warning", msg: `High load: ${metrics.load1}` });
+  }
+
+  const memMatch = data.match(/Mem:\s+(\d+)\s+(\d+)\s+(\d+)/);
+  if (memMatch) {
+    const total = parseInt(memMatch[1]);
+    const used = parseInt(memMatch[2]);
+    metrics.memUsedPct = Math.round((used / total) * 100);
+    if (metrics.memUsedPct > 95) issues.push({ level: "critical", msg: `Memory critical: ${metrics.memUsedPct}%` });
+    else if (metrics.memUsedPct > 85) issues.push({ level: "warning", msg: `Memory high: ${metrics.memUsedPct}%` });
+  }
+
+  const swapMatch = data.match(/Swap:\s+(\d+)\s+(\d+)\s+(\d+)/);
+  if (swapMatch) {
+    const swapTotal = parseInt(swapMatch[1]);
+    const swapUsed = parseInt(swapMatch[2]);
+    if (swapTotal > 0) {
+      const swapPct = Math.round((swapUsed / swapTotal) * 100);
+      metrics.swapUsedPct = swapPct;
+      if (swapPct > 90) issues.push({ level: "critical", msg: `Swap full: ${swapPct}% (${swapUsed}/${swapTotal} MB)` });
+      else if (swapPct > 50) issues.push({ level: "warning", msg: `Swap high: ${swapPct}%` });
+    }
+  }
+
+  const dfLines = data.split(String.fromCharCode(10)).filter(l => l.match(/\d+%/));
+  dfLines.forEach(line => {
+    const match = line.match(/(\d+)%\s+(\S+)$/);
+    if (match) {
+      const pct = parseInt(match[1]);
+      const mount = match[2];
+      if (pct > 95) issues.push({ level: "critical", msg: `Disk ${mount} at ${pct}%` });
+      else if (pct > 85) issues.push({ level: "warning", msg: `Disk ${mount} at ${pct}%` });
+    }
+  });
+
+  const dmesgSection = (data.split("=== DMESG_TAIL ===")[1] || "").split("=== VMSTAT ===")[0];
+    const dmesgErrors = dmesgSection.match(/error|oom|killed|panic|fault/gi) || [];
+  if (dmesgErrors.length > 3) issues.push({ level: "warning", msg: `${dmesgErrors.length} error patterns in dmesg` });
+
+  const health = issues.some(i => i.level === "critical") ? "critical"
+    : issues.some(i => i.level === "warning") ? "warning" : "ok";
+
+  const a = { health, issues, metrics };
+  return a;
+}
+
 function HealthCheckModal({ host, network, config, networks, setNetworks, selectedNetworkIndex, onClose }) {
   const [loading, setLoading] = useState(false);
   const [raw, setRaw] = useState("");
@@ -695,57 +753,7 @@ function HealthCheckModal({ host, network, config, networks, setNetworks, select
   }
 
   function analyzeLocal(data) {
-    const issues = [];
-    const metrics = {};
-
-    const loadMatch = data.match(/load average[s]?:\s*([\d.]+),?\s*([\d.]+),?\s*([\d.]+)/i);
-    if (loadMatch) {
-      metrics.load1 = parseFloat(loadMatch[1]);
-      metrics.load5 = parseFloat(loadMatch[2]);
-      metrics.load15 = parseFloat(loadMatch[3]);
-      if (metrics.load1 > 8) issues.push({ level: "critical", msg: `Very high load: ${metrics.load1}` });
-      else if (metrics.load1 > 4) issues.push({ level: "warning", msg: `High load: ${metrics.load1}` });
-    }
-
-    const memMatch = data.match(/Mem:\s+(\d+)\s+(\d+)\s+(\d+)/);
-    if (memMatch) {
-      const total = parseInt(memMatch[1]);
-      const used = parseInt(memMatch[2]);
-      metrics.memUsedPct = Math.round((used / total) * 100);
-      if (metrics.memUsedPct > 95) issues.push({ level: "critical", msg: `Memory critical: ${metrics.memUsedPct}%` });
-      else if (metrics.memUsedPct > 85) issues.push({ level: "warning", msg: `Memory high: ${metrics.memUsedPct}%` });
-    }
-
-    const swapMatch = data.match(/Swap:\s+(\d+)\s+(\d+)\s+(\d+)/);
-    if (swapMatch) {
-      const swapTotal = parseInt(swapMatch[1]);
-      const swapUsed = parseInt(swapMatch[2]);
-      if (swapTotal > 0) {
-        const swapPct = Math.round((swapUsed / swapTotal) * 100);
-        metrics.swapUsedPct = swapPct;
-        if (swapPct > 90) issues.push({ level: "critical", msg: `Swap full: ${swapPct}% (${swapUsed}/${swapTotal} MB)` });
-        else if (swapPct > 50) issues.push({ level: "warning", msg: `Swap high: ${swapPct}%` });
-      }
-    }
-
-    const dfLines = data.split(String.fromCharCode(10)).filter(l => l.match(/\d+%/));
-    dfLines.forEach(line => {
-      const match = line.match(/(\d+)%\s+(\S+)$/);
-      if (match) {
-        const pct = parseInt(match[1]);
-        const mount = match[2];
-        if (pct > 95) issues.push({ level: "critical", msg: `Disk ${mount} at ${pct}%` });
-        else if (pct > 85) issues.push({ level: "warning", msg: `Disk ${mount} at ${pct}%` });
-      }
-    });
-
-    const dmesgErrors = data.match(/error|oom|killed|panic|fault/gi) || [];
-    if (dmesgErrors.length > 3) issues.push({ level: "warning", msg: `${dmesgErrors.length} error patterns in dmesg` });
-
-    const health = issues.some(i => i.level === "critical") ? "critical"
-      : issues.some(i => i.level === "warning") ? "warning" : "ok";
-
-    const a = { health, issues, metrics };
+    const a = analyzeHealth(data);
     setAnalysis(a);
     return a;
   }
@@ -762,16 +770,27 @@ function HealthCheckModal({ host, network, config, networks, setNetworks, select
   }
 
   async function runAiAnalysis() {
-    if (!hasAi || !raw) return;
+    if (!hasAi) return;
     setAiLoading(true);
     const ai = config.ai;
     try {
+      let data = raw;
+      let base = analysis;
+      if (!data) {
+        const result = await invoke("health_check", { ip: host.ip, username, port, identityFile });
+        if (!result.raw || !result.raw.includes("=== END ===")) {
+          throw new Error((result.stderr || "incomplete output").split(String.fromCharCode(10))[0]);
+        }
+        data = result.raw;
+        setRaw(data);
+        base = analyzeLocal(data);
+      }
       const insight = await invoke("ai_analyze", {
-        rawData: raw, hostname: host.hostname || host.ip,
+        rawData: data, localSummary: (base?.issues || []).map(i => `${i.level}: ${i.msg}`).join("; "), hostname: host.hostname || host.ip,
         apiUrl: ai.api_url, apiKey: ai.api_key,
         model: ai.model, provider: ai.provider || "claude",
       });
-      const updated = { ...analysis, ai_insight: insight };
+      const updated = { ...base, ai_insight: insight };
       setAnalysis(updated);
       await saveStatus(updated.health, JSON.stringify(updated));
     } catch(e) {
@@ -835,12 +854,12 @@ function HealthCheckModal({ host, network, config, networks, setNetworks, select
             )}
             {analysis.ai_insight ? (
               <div className="health-ai">
-                <div className="health-ai-label">🤖 AI insights</div>
+                <div className="health-ai-label">🤖 AI insights <button className="btn-link" onClick={runAiAnalysis} disabled={aiLoading}>↻ Regenerate</button></div>
                 <div className="health-ai-text"><ReactMarkdown>{analysis.ai_insight}</ReactMarkdown></div>
               </div>
-            ) : hasAi && !aiLoading && raw && (
+            ) : hasAi && !aiLoading && (
               <button className="btn-ai-analyze" onClick={runAiAnalysis}>
-                🤖 Analyze with AI
+                {raw ? "🤖 Analyze with AI" : "🤖 Analyze with AI · runs a fresh check"}
               </button>
             )}
             {aiLoading && <div className="health-loading">AI analyzing...</div>}
@@ -860,6 +879,121 @@ function HealthCheckModal({ host, network, config, networks, setNetworks, select
     </div>
   );
 }
+function HealthBatchModal({ hosts, network, networkIndex, config, networks, setNetworks, onOpenHost, onClose }) {
+  const POOL = 8;
+  const [targets] = useState(hosts);
+  const [items, setItems] = useState({});
+  const [running, setRunning] = useState(true);
+  const [cancelRequested, setCancelRequested] = useState(false);
+  const [saveError, setSaveError] = useState(null);
+  const cancelRef = useRef(false);
+  const startedRef = useRef(false);
+
+  useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    runBatch();
+  }, []);
+
+  function setItem(ip, value) { setItems(prev => ({ ...prev, [ip]: value })); }
+
+  async function runBatch() {
+    const queue = targets.slice();
+    const collected = [];
+
+    async function worker() {
+      while (queue.length > 0 && !cancelRef.current) {
+        const h = queue.shift();
+        setItem(h.ip, { state: "running" });
+        const username = h.username || network.username || config?.defaults?.username || "root";
+        const port = h.port || network.port || config?.defaults?.port || 22;
+        const identityFile = h.identity_file || network.identity_file || config?.defaults?.identity_file || null;
+        try {
+          const result = await invoke("health_check", { ip: h.ip, username, port, identityFile });
+          if (!result.raw || !result.raw.includes("=== END ===")) {
+            throw new Error((result.stderr || "incomplete output").split(String.fromCharCode(10))[0]);
+          }
+          const a = analyzeHealth(result.raw);
+          collected.push({ ip: h.ip, status: a.health, report: JSON.stringify(a) });
+          setItem(h.ip, { state: "done", health: a.health, issues: a.issues.length });
+        } catch (e) {
+          const msg = String(e).split(String.fromCharCode(10))[0].slice(0, 100);
+          setItem(h.ip, { state: "failed", error: msg });
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: Math.min(POOL, targets.length) }, () => worker()));
+
+    if (collected.length > 0) {
+      try {
+        const updated = await invoke("save_health_batch", {
+          networksFile: { networks }, networkIndex, entries: collected,
+        });
+        setNetworks(updated.networks);
+      } catch (e) { setSaveError(String(e)); }
+    }
+    setRunning(false);
+  }
+
+  const total = targets.length;
+  const finished = targets.filter(h => { const s = items[h.ip]?.state; return s === "done" || s === "failed"; }).length;
+  const counts = { critical: 0, warning: 0, ok: 0, failed: 0, cancelled: 0 };
+  targets.forEach(h => {
+    const it = items[h.ip];
+    if (it?.state === "done") counts[it.health] += 1;
+    else if (it?.state === "failed") counts.failed += 1;
+    else if (!running) counts.cancelled += 1;
+  });
+  const icon = { ok: "🟢", warning: "🟡", critical: "🔴" };
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-wide">
+        <h3>⚕ Health check — {total} host{total !== 1 ? "s" : ""}</h3>
+
+        <div className="hb-progress"><div className="hb-progress-bar" style={{ width: `${total ? (finished / total) * 100 : 0}%` }} /></div>
+        <div className="hb-summary">
+          <span>{finished}/{total} done</span>
+          <span style={{ color: "var(--red)" }}>{counts.critical} critical</span>
+          <span style={{ color: "var(--yellow)" }}>{counts.warning} warning</span>
+          <span style={{ color: "var(--green)" }}>{counts.ok} ok</span>
+          <span style={{ color: "var(--text3)" }}>{counts.failed} failed</span>
+          {counts.cancelled > 0 && <span style={{ color: "var(--text3)" }}>{counts.cancelled} cancelled</span>}
+        </div>
+
+        <div className="hb-list">
+          {targets.map(h => {
+            const it = items[h.ip] || { state: "pending" };
+            const clickable = it.state === "done";
+            let label = running ? "waiting" : "cancelled";
+            let cls = "muted";
+            if (it.state === "running") { label = "checking…"; }
+            if (it.state === "done") { label = `${icon[it.health]} ${it.health.toUpperCase()}${it.issues ? ` · ${it.issues} issue${it.issues !== 1 ? "s" : ""}` : ""}`; cls = it.health; }
+            if (it.state === "failed") { label = `✗ ${it.error}`; cls = "failed"; }
+            return (
+              <div key={h.ip} className={`hb-row ${clickable ? "clickable" : ""}`} onClick={() => clickable && onOpenHost(h)}>
+                {it.state === "running" ? <span className="status-dot checking" /> : <span className="status-dot" style={{ opacity: 0 }} />}
+                <span className="hb-host">{h.hostname || h.ip}</span>
+                <span className="hb-ip">{h.ip}</span>
+                <span className={`hb-state ${cls}`}>{label}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        {saveError && <div className="scp-result error">Could not save results: {saveError}</div>}
+        {!running && <div style={{ fontSize: "0.72rem", color: "var(--text3)" }}>Unreachable hosts keep their previous health status. Click a finished host to see its analysis.</div>}
+
+        <div className="modal-actions">
+          {running && <button className="btn-cancel" disabled={cancelRequested} onClick={() => { cancelRef.current = true; setCancelRequested(true); }}>{cancelRequested ? "Cancelling…" : "Cancel"}</button>}
+          <button className="btn-primary" onClick={onClose} disabled={running}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CommandOutputModal({ result, onClose }) {
   return (
     <div className="modal-overlay">
@@ -985,6 +1119,7 @@ function App() {
   const [showRunCommand, setShowRunCommand] = useState(false);
   const [showScpBroadcast, setShowScpBroadcast] = useState(false);
   const [showBroadcastConfirm, setShowBroadcastConfirm] = useState(false);
+  const [showHealthBatch, setShowHealthBatch] = useState(false);
   const [scpModal, setScpModal] = useState(null);
   const [healthModal, setHealthModal] = useState(null);
   const [history, setHistory] = useState([]);
@@ -1184,6 +1319,7 @@ function App() {
   return (
     <div className="app">
       {networkModal && <NetworkModal network={networkModal.network} index={networkModal.index} onSave={handleSaveNetwork} onClose={() => setNetworkModal(null)} onRecalibrate={handleRecalibrate} />}
+      {showHealthBatch && <HealthBatchModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} networkIndex={selectedNetwork} config={config} networks={networks} setNetworks={setNetworks} onOpenHost={(h) => { const fresh = networks[selectedNetwork]?.hosts.find(x => x.ip === h.ip) || h; setHealthModal(fresh); }} onClose={() => setShowHealthBatch(false)} />}
       {healthModal && <HealthCheckModal host={healthModal} network={networks[selectedNetwork]} config={config} networks={networks} setNetworks={setNetworks} selectedNetworkIndex={selectedNetwork} onClose={() => setHealthModal(null)} />}
       {scpModal && <ScpModal host={scpModal} network={networks[selectedNetwork]} config={config} onClose={() => setScpModal(null)} />}
       {showBroadcastConfirm && <BroadcastConfirmModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onConfirm={(reachableHosts) => { setShowBroadcastConfirm(false); handleBroadcast(reachableHosts); }} onClose={() => setShowBroadcastConfirm(false)} />}
@@ -1290,6 +1426,7 @@ function App() {
                   <button className="btn-clear" onClick={() => setSelectedHosts(new Set())}>Clear</button>
                   <button className="btn-tag" onClick={() => setShowTagModal(true)}>🏷 Tag</button>
                   <button className="btn-run-cmd" onClick={() => setShowRunCommand(true)}>▶ Run cmd</button>
+                  <button className="btn-run-cmd" onClick={() => setShowHealthBatch(true)}>⚕ Health</button>
                   <button className="btn-run-cmd" onClick={() => setShowScpBroadcast(true)}>📁 SCP</button>
                   <button className={`btn-broadcast ${broadcasting ? "disabled" : ""}`} onClick={() => setShowBroadcastConfirm(true)} disabled={broadcasting}>⚡ Broadcast ({selectedHosts.size})</button>
                 </div>

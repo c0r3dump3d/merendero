@@ -616,6 +616,9 @@ async fn health_check(
 
     // receta de Brendan Gregg — 60 second performance check
     let script = r#"
+echo "=== OS ==="
+cat /etc/os-release 2>/dev/null | grep -E '^(PRETTY_NAME|ID|ID_LIKE|VERSION_ID)='
+uname -r
 echo "=== UPTIME ==="
 uptime
 echo "=== DMESG_TAIL ==="
@@ -634,6 +637,8 @@ echo "=== NETSTAT ==="
 ss -s 2>/dev/null || netstat -s 2>/dev/null | head -20
 echo "=== TOP ==="
 top -bn1 2>/dev/null | head -30
+echo "=== TOP_MEM ==="
+ps -eo pid,user,rss,%mem,comm --sort=-%mem 2>/dev/null | head -8
 echo "=== DF ==="
 df -h
 echo "=== END ==="
@@ -739,6 +744,39 @@ fn import_backup(data: serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct HealthEntry {
+    ip: String,
+    status: String,
+    report: Option<String>,
+}
+
+#[tauri::command]
+fn save_health_batch(
+    mut networks_file: NetworksFile,
+    network_index: usize,
+    entries: Vec<HealthEntry>,
+) -> Result<NetworksFile, String> {
+    if network_index >= networks_file.networks.len() {
+        return Err(String::from("Invalid network index"));
+    }
+    for entry in entries {
+        if let Some(h) = networks_file.networks[network_index]
+            .hosts
+            .iter_mut()
+            .find(|h| h.ip == entry.ip)
+        {
+            h.health_status = Some(entry.status);
+            if let Some(r) = entry.report {
+                h.health_report = Some(r);
+            }
+        }
+    }
+    let path = get_config_dir().join("networks.toml");
+    host::save_networks(path.to_str().unwrap(), &networks_file)?;
+    Ok(networks_file)
+}
+
 #[tauri::command]
 async fn ai_analyze(
     raw_data: String,
@@ -747,23 +785,33 @@ async fn ai_analyze(
     api_key: String,
     model: String,
     provider: String,
+    local_summary: Option<String>,
 ) -> Result<String, String> {
     let client = reqwest::Client::new();
+    let data: String = raw_data.chars().take(14000).collect();
+    let summary = local_summary.unwrap_or_default();
+    let summary = if summary.is_empty() { String::from("none") } else { summary };
     let prompt = format!(
-        "You are a Linux sysadmin expert. Analyze this server health check output and provide a brief assessment (3-5 sentences max). Focus on: load, memory, disk, and any errors. Be concise and actionable.
+        r#"You are a senior Linux sysadmin. Below is the output of a 60-second performance checklist (Brendan Gregg style) from host {hostname}. The OS section tells you the distribution.
 
-Host: {}
+Automated local analysis already flagged: {summary}
 
-{}",
-        hostname,
-        &raw_data[..raw_data.len().min(4000)]
+Write a concise report in Markdown:
+1. First line: overall status in bold (OK, WARNING or CRITICAL).
+2. Findings: at most 5 short bullets, based only on the data. If a section is missing or empty, say it could not be assessed instead of guessing.
+3. For every WARNING or CRITICAL finding add a Fix subsection with exact CLI commands in fenced bash code blocks, adapted to the detected distribution (apt, dnf/yum, pacman...). Put read-only diagnostic commands first (to identify the cause, for example which process uses the memory), then the remediation. Add a comment starting with CAUTION before any command that is destructive, restarts a service or needs a reboot. Prefer reversible changes and mention how to make them persistent when relevant (fstab, sysctl.d).
+4. If everything is healthy, say so in one line and give no commands.
+Do not invent data that is not in the output.
+
+HOST OUTPUT:
+{data}"#
     );
 
     let response_text = match provider.as_str() {
         "claude" => {
             let body = serde_json::json!({
                 "model": model,
-                "max_tokens": 300,
+                "max_tokens": 1500,
                 "messages": [{ "role": "user", "content": prompt }]
             });
             let resp = client.post(&api_url)
@@ -781,7 +829,7 @@ Host: {}
         "openai" => {
             let body = serde_json::json!({
                 "model": model,
-                "max_tokens": 300,
+                "max_tokens": 1500,
                 "messages": [{ "role": "user", "content": prompt }]
             });
             let resp = client.post(&api_url)
@@ -901,6 +949,7 @@ pub fn run() {
             health_check,
             export_backup,
             import_backup,
+            save_health_batch,
             save_health_status,
             ai_analyze,
             check_hosts_reachable,

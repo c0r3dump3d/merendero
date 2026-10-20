@@ -1430,3 +1430,40 @@ html, body, #root {
   line-height: 1;
 }
 .filter-clear:hover { color: var(--red); }
+
+/* HEALTH BATCH */
+.hb-progress { height: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.hb-progress-bar { height: 100%; background: var(--accent2); transition: width 0.2s; }
+.hb-summary { display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.8rem; }
+.hb-list { max-height: 360px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+.hb-row { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 0.8rem; }
+.hb-row:last-child { border-bottom: none; }
+.hb-row.clickable { cursor: pointer; }
+.hb-row.clickable:hover { background: var(--bg3); }
+.hb-host { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hb-ip { color: var(--text3); font-size: 0.72rem; font-family: monospace; }
+.hb-state { font-size: 0.74rem; min-width: 150px; text-align: right; }
+.hb-state.critical, .hb-state.failed { color: var(--red); }
+.hb-state.warning { color: var(--yellow); }
+.hb-state.ok { color: var(--green); }
+.hb-state.muted { color: var(--text3); }
+
+/* AI REPORT: code blocks with fix commands */
+.health-ai-text pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  overflow-x: auto;
+  white-space: pre;
+  word-break: normal;
+}
+.health-ai-text pre code {
+  background: none;
+  padding: 0;
+  color: var(--text);
+  font-size: 0.78rem;
+  white-space: pre;
+}
+.health-summary { max-height: 65vh; }
