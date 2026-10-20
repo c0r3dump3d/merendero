@@ -496,26 +496,40 @@ function RunCommandModal({ hosts, network, config, onClose }) {
   const [suggestion, setSuggestion] = useState(null);
   const [confirming, setConfirming] = useState(false);
   const [confirmText, setConfirmText] = useState("");
+  const [lastRun, setLastRun] = useState(null);
 
   const hasAi = !!(config?.ai?.api_key);
   const cls = classifyCommand(command);
   const needed = String(hosts.length);
+  const justRan = !!lastRun && lastRun.status !== "running" && lastRun.command === command;
 
-  async function execute() {
+  async function execute(approved) {
+    const ran = command;
+    const total = hosts.length;
     setConfirming(false);
     setConfirmText("");
     setRunning(true);
     setResults([]);
+    setSelectedResult(null);
+    setLastRun({ command: ran, total, status: "running", approved });
+    if (approved) {
+      invoke("audit_event", {
+        action: "run_command_approved", network: network.name, hosts: hosts.map(h => h.ip),
+        detail: JSON.stringify({ command: ran, approved_by_typing: total }), success: true,
+      }).catch(() => {});
+    }
     try {
       const res = await invoke("run_command", {
         hosts,
         network,
         defaults: config.defaults,
-        command,
+        command: ran,
       });
+      const okCount = res.filter(r => r.success).length;
       setResults(res);
+      setLastRun({ command: ran, total, status: "done", ok: okCount, failed: res.length - okCount, missing: total - res.length, at: new Date(), approved });
     } catch(e) {
-      alert("Failed: " + e);
+      setLastRun({ command: ran, total, status: "error", error: String(e), at: new Date(), approved });
     } finally {
       setRunning(false);
     }
@@ -524,7 +538,7 @@ function RunCommandModal({ hosts, network, config, onClose }) {
   function handleRun() {
     if (!command.trim() || running) return;
     if (cls && cls.level === "write") { setConfirming(true); setConfirmText(""); return; }
-    execute();
+    execute(false);
   }
 
   async function handleSuggest() {
@@ -553,6 +567,37 @@ function RunCommandModal({ hosts, network, config, onClose }) {
       action: "ai_command_suggest", network: network.name, hosts: [],
       detail: JSON.stringify({ request, command: proposed }), success: ok,
     }).catch(() => {});
+  }
+
+  let receipt = null;
+  if (lastRun) {
+    const plural = lastRun.total !== 1 ? "s" : "";
+    const how = lastRun.approved ? `Approved by typing ${lastRun.total}` : "Read-only, no confirmation needed";
+    if (lastRun.status === "running") {
+      receipt = (
+        <div className="cmd-receipt run">
+          <div>⏳ Running on {lastRun.total} host{plural}…</div>
+          <code>{lastRun.command}</code>
+        </div>
+      );
+    } else if (lastRun.status === "error") {
+      receipt = (
+        <div className="cmd-receipt bad">
+          <div>✗ The command could not be run: {lastRun.error}</div>
+          <code>{lastRun.command}</code>
+        </div>
+      );
+    } else {
+      const tone = lastRun.failed === 0 && lastRun.missing === 0 ? "ok" : (lastRun.ok === 0 ? "bad" : "warn");
+      const icon = tone === "ok" ? "✓" : (tone === "warn" ? "⚠" : "✗");
+      receipt = (
+        <div className={`cmd-receipt ${tone}`}>
+          <div>{icon} Executed on {lastRun.total} host{plural} · {lastRun.ok} OK · {lastRun.failed} failed{lastRun.missing > 0 ? ` · ${lastRun.missing} did not report` : ""}</div>
+          <code>{lastRun.command}</code>
+          <div className="cmd-receipt-meta">{how} · {lastRun.at.toLocaleTimeString("en-GB")}</div>
+        </div>
+      );
+    }
   }
 
   return (
@@ -596,7 +641,7 @@ function RunCommandModal({ hosts, network, config, onClose }) {
             {running ? "Running..." : "▶ Run"}
           </button>
         </div>
-        {cls && (
+        {cls && !justRan && !running && (
           <div className={`cmd-class ${cls.level}`}>
             {cls.level === "read" ? "✓ Read-only command" : `⚠ Needs confirmation: ${cls.reason}`}
           </div>
@@ -615,39 +660,46 @@ function RunCommandModal({ hosts, network, config, onClose }) {
                 className="cmd-input"
                 value={confirmText}
                 onChange={e => setConfirmText(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && confirmText.trim() === needed && execute()}
+                onKeyDown={e => e.key === "Enter" && confirmText.trim() === needed && execute(true)}
                 placeholder={`Type ${needed} to confirm`}
                 autoFocus
               />
-              <button className="btn-primary" disabled={confirmText.trim() !== needed} onClick={execute}>Run on {needed}</button>
+              <button className="btn-primary" disabled={confirmText.trim() !== needed} onClick={() => execute(true)}>Run on {needed}</button>
               <button className="btn-cancel" onClick={() => setConfirming(false)}>Cancel</button>
             </div>
           </div>
         )}
 
+        {receipt}
+
         {results.length > 0 && (
           <div className="cmd-results">
-            {results.map((r, i) => (
-              <div key={i}
-                className={`cmd-result ${r.success ? "success" : "error"}`}
-                onClick={() => setSelectedResult(selectedResult === i ? null : i)}
-              >
-                <div className="cmd-result-header">
-                  <span className={`cmd-status-dot ${r.success ? "up" : "down"}`} />
-                  <span className="cmd-result-host">{r.hostname || r.ip}</span>
-                  <span className="cmd-result-ip">{r.ip}</span>
-                  <span className="cmd-result-preview">
-                    {selectedResult === i ? "▲" : "▼"} {(r.stdout || r.stderr || "").split(String.fromCharCode(10))[0].trim().substring(0, 50)}
-                  </span>
-                </div>
-                {selectedResult === i && (
-                  <div>
-                    {r.stdout && <pre className="cmd-output">{r.stdout}</pre>}
-                    {r.stderr && <pre className="cmd-output cmd-stderr">{r.stderr}</pre>}
+            {results.map((r, i) => {
+              const hasOutput = !!(r.stdout || r.stderr);
+              const firstLine = (r.stdout || r.stderr || "").split(String.fromCharCode(10))[0].trim().substring(0, 50);
+              return (
+                <div key={i}
+                  className={`cmd-result ${r.success ? "success" : "error"} ${hasOutput ? "cmd-result-clickable" : ""}`}
+                  onClick={hasOutput ? () => setSelectedResult(selectedResult === i ? null : i) : undefined}
+                >
+                  <div className="cmd-result-header">
+                    <span className={`cmd-status-dot ${r.success ? "up" : "down"}`} />
+                    <span className="cmd-result-host">{r.hostname || r.ip}</span>
+                    <span className="cmd-result-ip">{r.ip}</span>
+                    <span className={`cmd-result-state ${r.success ? "ok" : "bad"}`}>{r.success ? "✓ OK" : "✗ failed"}</span>
+                    <span className="cmd-result-preview">
+                      {hasOutput ? `${selectedResult === i ? "▲" : "▼"} ${firstLine}` : "no output"}
+                    </span>
                   </div>
-                )}
-              </div>
-            ))}
+                  {hasOutput && selectedResult === i && (
+                    <div>
+                      {r.stdout && <pre className="cmd-output">{r.stdout}</pre>}
+                      {r.stderr && <pre className="cmd-output cmd-stderr">{r.stderr}</pre>}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
 

@@ -1483,3 +1483,15 @@ html, body, #root {
 .cmd-confirm { display: flex; flex-direction: column; gap: 8px; border: 1px solid rgba(210,153,34,0.4); border-radius: 6px; padding: 10px 12px; background: rgba(210,153,34,0.05); }
 .cmd-confirm-title { font-size: 0.8rem; color: var(--yellow); }
 .cmd-confirm-hosts { font-size: 0.72rem; color: var(--text3); max-height: 70px; overflow-y: auto; }
+
+/* RUN CMD: execution receipt */
+.cmd-receipt { font-size: 0.78rem; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+.cmd-receipt.ok { color: var(--green); background: rgba(63,185,80,0.08); border-color: rgba(63,185,80,0.3); }
+.cmd-receipt.warn { color: var(--yellow); background: rgba(210,153,34,0.1); border-color: rgba(210,153,34,0.3); }
+.cmd-receipt.bad { color: var(--red); background: rgba(248,81,73,0.1); border-color: rgba(248,81,73,0.3); }
+.cmd-receipt.run { color: var(--text2); }
+.cmd-receipt code { color: var(--text); font-family: monospace; background: var(--bg); padding: 1px 6px; border-radius: 3px; word-break: break-all; align-self: flex-start; }
+.cmd-receipt-meta { font-size: 0.7rem; color: var(--text3); }
+.cmd-result-state { font-size: 0.72rem; }
+.cmd-result-state.ok { color: var(--green); }
+.cmd-result-state.bad { color: var(--red); }
