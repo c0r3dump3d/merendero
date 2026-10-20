@@ -333,14 +333,177 @@ function SettingsModal({ config, onSave, onClose }) {
   );
 }
 
+const READ_CMDS = new Set([
+  "ls", "cat", "head", "tail", "wc", "sort", "uniq", "cut", "grep", "egrep", "fgrep", "awk",
+  "stat", "file", "find", "df", "du", "free", "uptime", "uname", "hostname", "whoami", "id",
+  "date", "who", "w", "last", "lsblk", "lscpu", "lsmod", "lspci", "vmstat", "iostat", "mpstat",
+  "pidstat", "sar", "ps", "pgrep", "lsof", "ss", "ip", "getent", "systemctl", "journalctl",
+  "dmesg", "rpm", "dpkg", "dnf", "yum",
+]);
+const SAFE_SYSTEMCTL = new Set(["status", "is-active", "is-enabled", "is-failed", "list-units", "list-unit-files", "list-timers", "list-sockets", "list-dependencies", "show", "cat", "get-default"]);
+const SAFE_DPKG = new Set(["-l", "-L", "-s", "-S", "-p", "--list", "--listfiles", "--status", "--search", "--print-avail", "--get-selections"]);
+const SAFE_PKG_SUB = new Set(["list", "info", "repolist", "check-update", "provides", "search"]);
+const IP_DENY = new Set(["add", "del", "delete", "set", "flush", "replace", "change", "append", "exec", "monitor", "up", "down", "-b", "-batch", "-force"]);
+const FIND_DENY = new Set(["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"]);
+
+// Splits a command line into pipeline segments of words. Returns { error } when it finds
+// shell syntax that can chain, redirect or substitute commands outside quotes.
+function parseShell(cmd) {
+  const segments = [[]];
+  let word = "";
+  let inWord = false;
+  let quote = null;
+  const flush = () => {
+    if (inWord) { segments[segments.length - 1].push(word); word = ""; inWord = false; }
+  };
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    const next = cmd[i + 1];
+    if (quote === "'") {
+      if (ch === "'") quote = null; else word += ch;
+      continue;
+    }
+    if (ch === "\\") {
+      if (i + 1 >= cmd.length) return { error: "trailing backslash" };
+      word += cmd[++i];
+      inWord = true;
+      continue;
+    }
+    if (ch === "`") return { error: "uses backticks" };
+    if (ch === "$" && next !== undefined && /[A-Za-z_{('"]/.test(next)) return { error: "uses $ expansion or substitution" };
+    if (quote === '"') {
+      if (ch === '"') quote = null; else word += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; inWord = true; continue; }
+    if (ch === "\n" || ch === "\r") return { error: "multi-line command" };
+    if (";&<>".includes(ch)) return { error: `uses '${ch}' (chaining, background or redirection)` };
+    if (ch === "|") { flush(); segments.push([]); continue; }
+    if (/\s/.test(ch)) { flush(); continue; }
+    word += ch;
+    inWord = true;
+  }
+  if (quote) return { error: "unbalanced quotes" };
+  flush();
+  return { segments };
+}
+
+function checkSegment(words) {
+  if (words.length === 0) return "empty command in a pipeline";
+  const name = words[0];
+  if (!READ_CMDS.has(name)) return `'${name}' is not in the read-only list`;
+  const args = words.slice(1);
+  const positional = args.filter(a => !a.startsWith("-"));
+  const short = re => args.some(a => /^-[A-Za-z]/.test(a) && re.test(a.slice(1)));
+  const long = (...names) => args.some(a => names.some(n => a === n || a.startsWith(n + "=")));
+  switch (name) {
+    case "tail":
+      if (long("--follow") || short(/[fF]/)) return "tail -f never terminates";
+      break;
+    case "journalctl":
+      if (long("--follow", "--vacuum-size", "--vacuum-time", "--vacuum-files", "--rotate", "--flush", "--sync", "--relinquish-var", "--smart-relinquish-var", "--setup-keys", "--update-catalog") || short(/f/)) return "journalctl option that follows or changes the journal";
+      break;
+    case "systemctl":
+      if (!positional[0] || !SAFE_SYSTEMCTL.has(positional[0])) return `systemctl ${positional[0] || ""} may change a service`;
+      break;
+    case "ss":
+      if (long("--kill") || short(/K/)) return "ss -K kills sockets";
+      break;
+    case "ip":
+      if (args.some(a => IP_DENY.has(a))) return "ip subcommand that changes network configuration";
+      break;
+    case "dmesg":
+      if (long("--clear", "--read-clear", "--console-off", "--console-on", "--console-level", "--follow", "--follow-new") || short(/[cCDEnwW]/)) return "dmesg option that clears the buffer, changes the console level or follows";
+      break;
+    case "rpm":
+      if (!(args[0] && (/^-(q|V)/.test(args[0]) || args[0] === "--query" || args[0] === "--verify"))) return "rpm without -q or -V may install or remove packages";
+      break;
+    case "dpkg":
+      if (!args[0] || !SAFE_DPKG.has(args[0])) return "dpkg option that may change packages";
+      break;
+    case "dnf":
+    case "yum":
+      if (!positional[0] || !SAFE_PKG_SUB.has(positional[0])) return `${name} ${positional[0] || ""} may change packages`;
+      break;
+    case "find":
+      if (args.some(a => FIND_DENY.has(a))) return "find with an action that runs commands or writes files";
+      break;
+    case "sort":
+      if (long("--output", "--compress-program") || short(/o/)) return "sort can write to a file here";
+      break;
+    case "uniq":
+      if (positional.length > 1) return "uniq with two file arguments writes an output file";
+      break;
+    case "date":
+      if (!args.every(a => a.startsWith("+") || ["-u", "--utc", "--universal", "-R", "-I"].includes(a))) return "date with arguments can set the system clock";
+      break;
+    case "hostname":
+      if (!args.every(a => a.startsWith("-"))) return "hostname with a name sets the hostname";
+      break;
+    case "free":
+      if (long("--seconds") || short(/s/)) return "free -s repeats forever";
+      break;
+    case "lsof":
+      if (short(/r/)) return "lsof -r repeats forever";
+      break;
+    case "file":
+      if (short(/C/) || long("--compile")) return "file -C writes a compiled magic file";
+      break;
+    case "awk": {
+      const badFlag = args.find(a => a.startsWith("-") && !/^-F/.test(a) && a !== "-v");
+      if (badFlag) return `awk option ${badFlag} is not accepted`;
+      if (/system\s*\(|getline|[|>]/.test(args.join(" "))) return "awk program may run commands or write files";
+      break;
+    }
+    case "vmstat":
+    case "iostat":
+    case "mpstat":
+    case "pidstat":
+    case "sar": {
+      if (name === "sar" && short(/o/)) return "sar -o writes a file";
+      const nums = positional.filter(a => /^\d+$/.test(a));
+      if (nums.length === 1) return `${name} with an interval but no count never terminates`;
+      break;
+    }
+    default:
+      break;
+  }
+  return null;
+}
+
+// Local, conservative classification. Anything it cannot prove read-only needs confirmation.
+// It reduces accidents; it is not a security boundary.
+function classifyCommand(raw) {
+  const cmd = (raw || "").trim();
+  if (!cmd) return null;
+  const cleaned = cmd.replace(/\s2>\s*\/dev\/null(?=\s|$)/g, "").replace(/\s2>&1(?=\s|$)/g, "");
+  const parsed = parseShell(cleaned);
+  if (parsed.error) return { level: "write", reason: parsed.error };
+  for (const words of parsed.segments) {
+    const problem = checkSegment(words);
+    if (problem) return { level: "write", reason: problem };
+  }
+  return { level: "read", reason: "" };
+}
+
 function RunCommandModal({ hosts, network, config, onClose }) {
   const [command, setCommand] = useState("");
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState([]);
   const [selectedResult, setSelectedResult] = useState(null);
+  const [request, setRequest] = useState("");
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestion, setSuggestion] = useState(null);
+  const [confirming, setConfirming] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
 
-  async function handleRun() {
-    if (!command.trim()) return;
+  const hasAi = !!(config?.ai?.api_key);
+  const cls = classifyCommand(command);
+  const needed = String(hosts.length);
+
+  async function execute() {
+    setConfirming(false);
+    setConfirmText("");
     setRunning(true);
     setResults([]);
     try {
@@ -358,15 +521,73 @@ function RunCommandModal({ hosts, network, config, onClose }) {
     }
   }
 
+  function handleRun() {
+    if (!command.trim() || running) return;
+    if (cls && cls.level === "write") { setConfirming(true); setConfirmText(""); return; }
+    execute();
+  }
+
+  async function handleSuggest() {
+    if (!request.trim() || suggesting) return;
+    const ai = config.ai;
+    setSuggesting(true);
+    setSuggestion(null);
+    setConfirming(false);
+    let ok = true;
+    let proposed = "";
+    try {
+      const out = await invoke("ai_suggest_command", {
+        request, apiUrl: ai.api_url, apiKey: ai.api_key,
+        model: ai.model, provider: ai.provider || "claude",
+      });
+      proposed = out.command || "";
+      setSuggestion({ explanation: out.explanation || "", empty: !proposed });
+      if (proposed) setCommand(proposed);
+    } catch (e) {
+      ok = false;
+      setSuggestion({ explanation: `AI error: ${e}`, error: true });
+    } finally {
+      setSuggesting(false);
+    }
+    invoke("audit_event", {
+      action: "ai_command_suggest", network: network.name, hosts: [],
+      detail: JSON.stringify({ request, command: proposed }), success: ok,
+    }).catch(() => {});
+  }
+
   return (
     <div className="modal-overlay">
       <div className="modal modal-wide">
         <h3>⚡ Run command on {hosts.length} host{hosts.length !== 1 ? "s" : ""}</h3>
+
+        {hasAi && (
+          <div className="cmd-input-row">
+            <input
+              className="cmd-input"
+              value={request}
+              onChange={e => setRequest(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && handleSuggest()}
+              placeholder="🤖 Describe what you want, e.g. which processes use the most memory"
+            />
+            <button className="btn-ai-analyze" onClick={handleSuggest} disabled={suggesting || !request.trim()}>
+              {suggesting ? "Thinking…" : "🤖 Suggest"}
+            </button>
+          </div>
+        )}
+        {suggestion && (suggestion.error
+          ? <div className="scp-result error">{suggestion.explanation}</div>
+          : (
+            <div className="health-ai">
+              <div className="health-ai-label">🤖 Suggestion · review it before running</div>
+              <div className="health-ai-text">{suggestion.empty ? "No command proposed. " : ""}{suggestion.explanation}</div>
+            </div>
+          ))}
+
         <div className="cmd-input-row">
           <input
             className="cmd-input"
             value={command}
-            onChange={e => setCommand(e.target.value)}
+            onChange={e => { setCommand(e.target.value); setConfirming(false); setSuggestion(null); }}
             onKeyDown={e => e.key === "Enter" && !running && handleRun()}
             placeholder="df -h / uptime / systemctl status nginx..."
             autoFocus
@@ -375,6 +596,34 @@ function RunCommandModal({ hosts, network, config, onClose }) {
             {running ? "Running..." : "▶ Run"}
           </button>
         </div>
+        {cls && (
+          <div className={`cmd-class ${cls.level}`}>
+            {cls.level === "read" ? "✓ Read-only command" : `⚠ Needs confirmation: ${cls.reason}`}
+          </div>
+        )}
+
+        {confirming && (
+          <div className="cmd-confirm">
+            <div className="cmd-confirm-title">This command may change the system or not terminate. It will run on {hosts.length} host{hosts.length !== 1 ? "s" : ""}:</div>
+            <pre className="cmd-output">{command}</pre>
+            <div className="cmd-confirm-hosts">
+              {hosts.slice(0, 40).map(h => h.hostname || h.ip).join(", ")}
+              {hosts.length > 40 ? `, … (${hosts.length - 40} more)` : ""}
+            </div>
+            <div className="cmd-input-row">
+              <input
+                className="cmd-input"
+                value={confirmText}
+                onChange={e => setConfirmText(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && confirmText.trim() === needed && execute()}
+                placeholder={`Type ${needed} to confirm`}
+                autoFocus
+              />
+              <button className="btn-primary" disabled={confirmText.trim() !== needed} onClick={execute}>Run on {needed}</button>
+              <button className="btn-cancel" onClick={() => setConfirming(false)}>Cancel</button>
+            </div>
+          </div>
+        )}
 
         {results.length > 0 && (
           <div className="cmd-results">

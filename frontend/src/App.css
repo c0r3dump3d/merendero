@@ -1475,3 +1475,11 @@ html, body, #root {
 .hh-table { max-height: 220px; overflow-y: auto; }
 .hh-row { display: grid; grid-template-columns: 1.4fr 1fr 0.7fr 0.7fr 0.7fr; gap: 8px; padding: 5px 12px; font-size: 0.76rem; border-top: 1px solid var(--border); font-family: monospace; }
 .hh-head { color: var(--text3); text-transform: uppercase; font-size: 0.66rem; letter-spacing: 0.8px; border-top: none; }
+
+/* RUN CMD: classification and confirmation */
+.cmd-class { font-size: 0.74rem; padding: 4px 10px; border-radius: 4px; }
+.cmd-class.read { color: var(--green); background: rgba(63,185,80,0.08); border: 1px solid rgba(63,185,80,0.25); }
+.cmd-class.write { color: var(--yellow); background: rgba(210,153,34,0.1); border: 1px solid rgba(210,153,34,0.25); }
+.cmd-confirm { display: flex; flex-direction: column; gap: 8px; border: 1px solid rgba(210,153,34,0.4); border-radius: 6px; padding: 10px 12px; background: rgba(210,153,34,0.05); }
+.cmd-confirm-title { font-size: 0.8rem; color: var(--yellow); }
+.cmd-confirm-hosts { font-size: 0.72rem; color: var(--text3); max-height: 70px; overflow-y: auto; }

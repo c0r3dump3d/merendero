@@ -637,6 +637,56 @@ async fn ai_call(
         .ok_or_else(|| String::from("The API response had no text"))
 }
 
+fn parse_suggestion(text: &str) -> Result<serde_json::Value, String> {
+    let start = text
+        .find('{')
+        .ok_or_else(|| String::from("The AI response had no JSON object"))?;
+    let end = text
+        .rfind('}')
+        .ok_or_else(|| String::from("The AI response had no JSON object"))?;
+    if end < start {
+        return Err(String::from("The AI response had no JSON object"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text[start..=end])
+        .map_err(|e| format!("Could not parse the AI response: {}", e))?;
+    let command = v["command"].as_str().unwrap_or("").trim().to_string();
+    let explanation = v["explanation"].as_str().unwrap_or("").trim().to_string();
+    if command.contains('\n') || command.contains('\r') || command.chars().count() > 1000 {
+        return Ok(serde_json::json!({
+            "command": "",
+            "explanation": "The AI proposed a multi-line or very long command, which is not accepted. Rephrase the request."
+        }));
+    }
+    Ok(serde_json::json!({ "command": command, "explanation": explanation }))
+}
+
+#[tauri::command]
+async fn ai_suggest_command(
+    request: String,
+    api_url: String,
+    api_key: String,
+    model: String,
+    provider: String,
+) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::new();
+    let request: String = request.chars().take(500).collect();
+    let prompt = format!(
+        r#"You translate a sysadmin's request into ONE shell command to run over SSH on Linux servers. Both RHEL-family (AlmaLinux, CentOS) and Debian-family hosts may be present, so avoid package-manager commands unless the request is about packages.
+
+Rules:
+- Prefer read-only commands that only inspect state.
+- One single line. Pipes are fine. No sudo, no ; or && chains, no redirection, no command substitution, no variables.
+- The command must finish on its own: no -f/--follow, no watch or top, no interactive programs. For vmstat, iostat or mpstat always give both interval and count.
+- If the request implies changing something (restart, install, delete, edit), still propose the command and say in the explanation that it modifies the system.
+- If the request is unclear or cannot be done in one command, return an empty command and explain what is missing.
+- Reply with ONLY a JSON object, no Markdown, in the form {{"command": "...", "explanation": "..."}}. The explanation is one or two short sentences.
+
+REQUEST: {request}"#
+    );
+    let text = ai_call(&client, &provider, &api_url, &api_key, &model, &prompt, 400).await?;
+    parse_suggestion(&text)
+}
+
 #[tauri::command]
 async fn ai_fleet_summary(
     summary_text: String,
@@ -1278,6 +1328,7 @@ pub fn run() {
             export_backup,
             import_backup,
             ai_fleet_summary,
+            ai_suggest_command,
             health_history_record,
             get_health_history,
             audit_event,
