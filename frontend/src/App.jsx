@@ -969,6 +969,7 @@ function App() {
   const [networks, setNetworks] = useState([]);
   const [config, setConfig] = useState(null);
   const [selectedNetwork, setSelectedNetwork] = useState(null);
+  const [networkScoped, setNetworkScoped] = useState(false);
   const [filter, setFilter] = useState("");
   const [loading, setLoading] = useState(true);
   const [networkModal, setNetworkModal] = useState(null);
@@ -1020,8 +1021,8 @@ function App() {
     return d.toLocaleString("en-GB", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" });
   }
 
-  async function connectSSH(host) {
-    const network = networks[selectedNetwork];
+  async function connectSSH(host, netIdx = selectedNetwork) {
+    const network = networks[netIdx];
     try { await invoke("launch_ssh", { ip: host.ip, username: resolveUsername(host, network), port: resolvePort(host, network), terminal: config?.defaults?.terminal || null, hostname: host.hostname || null, networkName: network.name, identityFile: host.identity_file || network.identity_file || config?.defaults?.identity_file || null, postConnect: host.post_connect || null }); loadHistory(); }
     catch (e) { alert("Failed to launch SSH: " + e); }
   }
@@ -1165,6 +1166,15 @@ function App() {
   const filteredHostsWithIndex = selectedNetwork !== null
     ? networks[selectedNetwork]?.hosts.map((host, index) => ({ host, index })).filter(({ host }) => matchesFilter(host, filter)) : [];
 
+  useEffect(() => { if (filter.trim() === "") setNetworkScoped(false); }, [filter]);
+  const globalMode = filter.trim() !== "" && !networkScoped;
+  const globalResults = globalMode
+    ? networks
+        .map((net, netIdx) => ({ net, netIdx, hosts: net.hosts.filter(h => matchesFilter(h, filter)) }))
+        .filter(r => r.hosts.length > 0)
+    : [];
+  const globalTotal = globalResults.reduce((n, r) => n + r.hosts.length, 0);
+
   const allSelected = filteredHosts.length > 0 && selectedHosts.size === filteredHosts.length;
   const currentNet = selectedNetwork !== null ? networks[selectedNetwork] : null;
   const activeCount = currentNet ? currentNet.hosts.filter(h => h.active).length : 0;
@@ -1220,23 +1230,60 @@ function App() {
           <>
             <div className="main-header">
               <div className="main-title">
-                <h2>{currentNet.name}</h2>
-                <span className="network-cidr">{currentNet.network} · {activeCount}/{currentNet.hosts.length} up</span>
+                <h2>{globalMode ? `Search: ${filter}` : currentNet.name}</h2>
+                <span className="network-cidr">{globalMode ? `${globalTotal} ${globalTotal === 1 ? "match" : "matches"} in ${globalResults.length} ${globalResults.length === 1 ? "network" : "networks"}` : `${currentNet.network} · ${activeCount}/${currentNet.hosts.length} up`}</span>
               </div>
               <div className="main-actions">
-                <input className="filter-input" type="text" placeholder="Filter: ip, fqdn, tag, :critical, :warning, :issues, :down, :up" value={filter} onChange={e => setFilter(e.target.value)} disabled={scanning || checking} />
+                <div className="filter-wrap"><input onKeyDown={e => { if (e.key === "Escape") setFilter(""); }} className="filter-input" type="text" placeholder="Filter: ip, fqdn, tag, :critical, :warning, :issues, :down, :up" value={filter} onChange={e => setFilter(e.target.value)} disabled={scanning || checking} />{filter && <button className="filter-clear" onClick={() => setFilter("")} title="Clear filter (Esc)">✕</button>}</div>
                 <button className="btn-settings" onClick={() => setShowSettings(true)}>⚙</button>
                 <button className="btn-add-network-main" onClick={() => setNetworkModal({ network: null, index: undefined })}>+ Network</button>
-                <button className="btn-add-host" onClick={() => setHostModal({ host: null })}>+ Host</button>
-                <button className="btn-check" onClick={handleCheck} disabled={checking || scanning}>{checking ? "Checking..." : "✓ Check"}</button>
-                <button className={`btn-scan ${scanning ? "scanning" : ""}`} onClick={handleScan} disabled={scanning || checking}>{scanning ? "Scanning..." : "⟳ Scan"}</button>
+                {globalMode && <button className="btn-clear" onClick={() => setFilter("")}>✕ Clear search</button>}
+                {!globalMode && <button className="btn-add-host" onClick={() => setHostModal({ host: null })}>+ Host</button>}
+                {!globalMode && <button className="btn-check" onClick={handleCheck} disabled={checking || scanning}>{checking ? "Checking..." : "✓ Check"}</button>}
+                {!globalMode && <button className={`btn-scan ${scanning ? "scanning" : ""}`} onClick={handleScan} disabled={scanning || checking}>{scanning ? "Scanning..." : "⟳ Scan"}</button>}
               </div>
             </div>
 
             {scanning && <ProgressBar progress={scanProgress} label="Scanning..." />}
             {checking && <ProgressBar progress={checkProgress} label="Checking..." />}
 
-            {selectedHosts.size > 0 && (
+            {globalMode ? (
+<>
+  <div className="global-results">
+    {globalResults.length === 0 && <div className="global-empty">No matches in any network</div>}
+    {globalResults.map(({ net, netIdx, hosts }) => (
+      <div key={netIdx} className="global-block">
+        <div className="global-block-header">
+          <span className="global-block-name">{net.name}</span>
+          <span className="global-block-meta">{net.network} · {hosts.length} {hosts.length === 1 ? "match" : "matches"}</span>
+          <button className="btn-edit" onClick={() => { setNetworkScoped(true); setSelectedNetwork(netIdx); }} title="Open this network keeping the filter">→ Open network</button>
+        </div>
+        {hosts.map(host => (
+          <div key={host.ip} className={`global-row ${host.active ? "" : "inactive"}`}>
+            <span style={{display:"flex", alignItems:"center", gap:"3px"}}>
+              <span className={`status-dot ${host.active ? "up" : "down"}`} />
+              {host.health_status === "critical" && <span title="Health: CRITICAL" style={{color:"var(--red)", fontSize:"0.65rem"}}>⚠</span>}
+              {host.health_status === "warning" && <span title="Health: WARNING" style={{color:"var(--yellow)", fontSize:"0.65rem"}}>⚠</span>}
+            </span>
+            <span className="ip">{host.ip}</span>
+            <span className="hostname" title={host.hostname || ""}>{host.hostname || ""}</span>
+            <span>{host.tag ? <span className="tag-badge">{host.tag}</span> : ""}</span>
+            <span className="last-seen">{lastSeen(host.ip) || ""}</span>
+            <span className="actions">
+              <button className="btn-connect" onClick={() => connectSSH(host, netIdx)}>SSH</button>
+            </span>
+          </div>
+        ))}
+      </div>
+    ))}
+  </div>
+  <div className="main-footer">
+    <span>{globalTotal} {globalTotal === 1 ? "match" : "matches"} in {globalResults.length} {globalResults.length === 1 ? "network" : "networks"}</span>
+  </div>
+</>
+) : (
+<>
+{selectedHosts.size > 0 && (
               <div className="broadcast-toolbar">
                 <span>{selectedHosts.size} hosts selected</span>
                 <div className="broadcast-actions">
@@ -1287,6 +1334,8 @@ function App() {
               <span>{filteredHosts.length} hosts{filter ? ` (filtered)` : ""}</span>
               {selectedHosts.size > 0 && <span className="footer-selected">{selectedHosts.size} selected</span>}
             </div>
+</>
+)}
           </>
         )}
         {selectedNetwork === null && (
