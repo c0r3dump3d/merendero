@@ -244,8 +244,8 @@ function SettingsModal({ config, onSave, onClose }) {
         setBackupMsg({ type: "error", text: "Invalid backup file" });
         return;
       }
-      await invoke("import_backup", { data });
-      setBackupMsg({ type: "success", text: "Backup imported. Restart to apply changes." });
+      const notes = await invoke("import_backup", { data });
+      setBackupMsg({ type: "success", text: "Backup imported. Restart to apply changes." + (Array.isArray(notes) && notes.length ? " " + notes.join(" ") : "") });
     } catch(e) {
       setBackupMsg({ type: "error", text: `Import failed: ${e}` });
     }

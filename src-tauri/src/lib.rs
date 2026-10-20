@@ -812,7 +812,11 @@ fn audit_event(action: String, network: String, hosts: Vec<String>, detail: Stri
         .into_iter()
         .map(|ip| serde_json::json!({ "ip": ip }))
         .collect();
-    audit_write(&action, &network, entries, serde_json::json!({ "detail": detail, "success": success }));
+    let detail_value = serde_json::from_str::<serde_json::Value>(&detail)
+        .ok()
+        .filter(|v| v.is_object())
+        .unwrap_or(serde_json::Value::String(detail));
+    audit_write(&action, &network, entries, serde_json::json!({ "detail": detail_value, "success": success }));
 }
 
 #[tauri::command]
@@ -1070,17 +1074,59 @@ fn save_health_status(
     Ok(networks_file)
 }
 
+fn write_private(path: &std::path::Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
+}
+
+// Restores a JSON-lines log. It never overwrites a log that already has entries:
+// in that case the imported copy is saved next to it.
+fn restore_log(dir: &std::path::Path, file: &str, imported: &str, notes: &mut Vec<String>) -> Result<(), String> {
+    if imported.trim().is_empty() {
+        return Ok(());
+    }
+    let valid = imported
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok());
+    if !valid {
+        notes.push(format!("{} in the backup is not valid JSON lines, so it was not restored.", file));
+        return Ok(());
+    }
+    let local = dir.join(file);
+    let local_empty = match std::fs::read_to_string(&local) {
+        Ok(t) => t.trim().is_empty(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => return Err(format!("Could not read {}: {}", file, e)),
+    };
+    if local_empty {
+        write_private(&local, imported)?;
+        notes.push(format!("{} restored.", file));
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let side = format!("{}.imported-{}.jsonl", file.trim_end_matches(".jsonl"), now);
+        write_private(&dir.join(&side), imported)?;
+        notes.push(format!("{} already has entries, so it was kept. The imported copy is saved as {}.", file, side));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn export_backup() -> Result<serde_json::Value, String> {
     let config_dir = get_config_dir();
-
-    let config_path = config_dir.join("config.toml");
-    let networks_path = config_dir.join("networks.toml");
-    let history_path = config_dir.join("history.toml");
-
-    let config = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let networks = std::fs::read_to_string(&networks_path).unwrap_or_default();
-    let history = std::fs::read_to_string(&history_path).unwrap_or_default();
+    let read = |name: &str| std::fs::read_to_string(config_dir.join(name)).unwrap_or_default();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1090,36 +1136,33 @@ fn export_backup() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "version": "1.0",
         "created_at": now,
-        "config": config,
-        "networks": networks,
-        "history": history,
+        "config": read("config.toml"),
+        "networks": read("networks.toml"),
+        "history": read("history.toml"),
+        "audit": read("audit.jsonl"),
+        "health_history": read("health_history.jsonl"),
     }))
 }
 
 #[tauri::command]
-fn import_backup(data: serde_json::Value) -> Result<(), String> {
+fn import_backup(data: serde_json::Value) -> Result<Vec<String>, String> {
     let config_dir = get_config_dir();
+    let mut notes: Vec<String> = Vec::new();
 
-    if let Some(config) = data["config"].as_str() {
-        if !config.is_empty() {
-            std::fs::write(config_dir.join("config.toml"), config)
-                .map_err(|e| format!("Failed to write config: {}", e))?;
+    for (field, file) in [("config", "config.toml"), ("networks", "networks.toml"), ("history", "history.toml")] {
+        if let Some(text) = data[field].as_str() {
+            if !text.is_empty() {
+                write_private(&config_dir.join(file), text)?;
+            }
         }
     }
-    if let Some(networks) = data["networks"].as_str() {
-        if !networks.is_empty() {
-            std::fs::write(config_dir.join("networks.toml"), networks)
-                .map_err(|e| format!("Failed to write networks: {}", e))?;
-        }
+    if let Some(text) = data["audit"].as_str() {
+        restore_log(&config_dir, "audit.jsonl", text, &mut notes)?;
     }
-    if let Some(history) = data["history"].as_str() {
-        if !history.is_empty() {
-            std::fs::write(config_dir.join("history.toml"), history)
-                .map_err(|e| format!("Failed to write history: {}", e))?;
-        }
+    if let Some(text) = data["health_history"].as_str() {
+        restore_log(&config_dir, "health_history.jsonl", text, &mut notes)?;
     }
-
-    Ok(())
+    Ok(notes)
 }
 
 #[derive(serde::Deserialize)]
