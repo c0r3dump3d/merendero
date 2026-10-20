@@ -200,6 +200,13 @@ function ProgressBar({ progress, label }) {
   );
 }
 
+// AI is usable when the endpoint and model are set and, for providers that need it, a key.
+// Ollama and custom endpoints can run without an API key.
+function aiReady(ai) {
+  if (!ai || !ai.api_url || !ai.model) return false;
+  return !!ai.api_key || ai.provider === "ollama" || ai.provider === "custom";
+}
+
 function SettingsModal({ config, onSave, onClose }) {
   const [form, setForm] = useState({
     username: config?.defaults?.username || "root",
@@ -279,10 +286,10 @@ function SettingsModal({ config, onSave, onClose }) {
         terminal: form.terminal || null,
         identity_file: form.identity_file || null,
       },
-      ai: form.ai_api_key ? {
+      ai: (form.ai_api_key || form.ai_provider === "ollama" || form.ai_provider === "custom") ? {
         provider: form.ai_provider || null,
         api_url: form.ai_api_url || null,
-        api_key: form.ai_api_key || null,
+        api_key: form.ai_provider === "ollama" ? null : (form.ai_api_key || null),
         model: form.ai_model || null,
       } : null,
     });
@@ -312,7 +319,7 @@ function SettingsModal({ config, onSave, onClose }) {
           </select>
         </div>
         <div className="form-group"><label>API URL</label><input name="ai_api_url" value={form.ai_api_url} onChange={handleChange} placeholder="https://api.anthropic.com/v1/messages" /></div>
-        <div className="form-group"><label>API Key</label><input name="ai_api_key" value={form.ai_api_key} onChange={handleChange} placeholder="sk-ant-..." type="password" /></div>
+        <div className="form-group"><label>API Key{form.ai_provider === "ollama" ? " (not needed for Ollama)" : ""}</label><input name="ai_api_key" value={form.ai_api_key} onChange={handleChange} placeholder="sk-ant-..." type="password" /></div>
         <div className="form-group"><label>Model</label><input name="ai_model" value={form.ai_model} onChange={handleChange} placeholder="claude-haiku-4-5" /></div>
 
         <div className="settings-section">Backup &amp; Restore</div>
@@ -498,7 +505,7 @@ function RunCommandModal({ hosts, network, config, onClose }) {
   const [confirmText, setConfirmText] = useState("");
   const [lastRun, setLastRun] = useState(null);
 
-  const hasAi = !!(config?.ai?.api_key);
+  const hasAi = aiReady(config?.ai);
   const cls = classifyCommand(command);
   const needed = String(hosts.length);
   const justRan = !!lastRun && lastRun.status !== "running" && lastRun.command === command;
@@ -551,7 +558,7 @@ function RunCommandModal({ hosts, network, config, onClose }) {
     let proposed = "";
     try {
       const out = await invoke("ai_suggest_command", {
-        request, apiUrl: ai.api_url, apiKey: ai.api_key,
+        request, apiUrl: ai.api_url, apiKey: ai.api_key || "",
         model: ai.model, provider: ai.provider || "claude",
       });
       proposed = out.command || "";
@@ -1113,7 +1120,7 @@ function HealthCheckModal({ host, network, config, networks, setNetworks, select
   const username = host.username || network.username || config?.defaults?.username || "root";
   const port = host.port || network.port || config?.defaults?.port || 22;
   const identityFile = host.identity_file || network.identity_file || config?.defaults?.identity_file || null;
-  const hasAi = !!(config?.ai?.api_key);
+  const hasAi = aiReady(config?.ai);
 
   useEffect(() => {
     if (host.health_status && host.health_report) {
@@ -1171,7 +1178,7 @@ function HealthCheckModal({ host, network, config, networks, setNetworks, select
       }
       const insight = await invoke("ai_analyze", {
         rawData: data, localSummary: (base?.issues || []).map(i => `${i.level}: ${i.msg}`).join("; "), hostname: host.hostname || host.ip,
-        apiUrl: ai.api_url, apiKey: ai.api_key,
+        apiUrl: ai.api_url, apiKey: ai.api_key || "",
         model: ai.model, provider: ai.provider || "claude",
       });
       const updated = { ...base, ai_insight: insight };
@@ -1326,7 +1333,7 @@ function HealthBatchModal({ hosts, network, networkIndex, config, networks, setN
 
   async function runFleetSummary() {
     const ai = config?.ai;
-    if (!ai?.api_key || fleetLoading) return;
+    if (!aiReady(ai) || fleetLoading) return;
     const done = targets.filter(h => items[h.ip]?.state === "done");
     const flagged = done.filter(h => items[h.ip].health !== "ok");
     const okCount = done.length - flagged.length;
@@ -1345,7 +1352,7 @@ function HealthBatchModal({ hosts, network, networkIndex, config, networks, setN
     let ok = true;
     try {
       const out = await invoke("ai_fleet_summary", {
-        summaryText: text, apiUrl: ai.api_url, apiKey: ai.api_key,
+        summaryText: text, apiUrl: ai.api_url, apiKey: ai.api_key || "",
         model: ai.model, provider: ai.provider || "claude",
       });
       setFleetSummary(out);
@@ -1408,7 +1415,7 @@ function HealthBatchModal({ hosts, network, networkIndex, config, networks, setN
         </div>
 
         {saveError && <div className="scp-result error">Could not save results: {saveError}</div>}
-        {!running && config?.ai?.api_key && !fleetSummary && (
+        {!running && aiReady(config?.ai) && !fleetSummary && (
           <>
             <button className="btn-ai-analyze" onClick={runFleetSummary} disabled={fleetLoading}>
               {fleetLoading ? "AI summarizing…" : "🤖 Summarize results with AI"}

@@ -11,6 +11,7 @@ All notable changes to Merendero are documented here.
 - Run cmd: describe what you want and the AI proposes a command (only your description is sent). A local check classifies every command; anything not provably read-only needs you to type the host count to confirm
 - Run cmd shows an execution receipt (command, hosts OK/failed, how it was approved, time); approved commands are recorded in the audit log
 - Export backup now includes the audit log and the health history. On import they are restored only when the local file is empty; otherwise the imported copy is saved next to it
+- AI features work with Ollama and custom endpoints without an API key; `config.toml` is created with owner-only permissions
 - Health check on a selection of hosts, with limited concurrency (8 at a time) and a single batched save
 - AI health report now includes diagnostic and fix commands for each issue, adapted to the host's distribution, with a Regenerate button
 - AI analysis can be requested from a saved report (runs a fresh check first)

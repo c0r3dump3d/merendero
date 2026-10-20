@@ -122,8 +122,7 @@ fn save_config(config: host::Config) -> Result<(), String> {
     let path = get_config_dir().join("config.toml");
     let content = toml::to_string(&config)
         .map_err(|e| format!("Could not serialize config: {}", e))?;
-    std::fs::write(path, content)
-        .map_err(|e| format!("Could not write config: {}", e))
+    write_private(&path, &content)
 }
 
 #[tauri::command]
@@ -618,7 +617,17 @@ async fn ai_call(
     };
     let resp = req.send().await.map_err(|e| format!("Request failed: {}", e))?;
     let status = resp.status();
-    let body: serde_json::Value = resp.json().await.map_err(|e| format!("Parse failed: {}", e))?;
+    let raw = resp
+        .text()
+        .await
+        .map_err(|e| format!("Could not read the response: {}", e))?;
+    let body: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            let snippet: String = raw.trim().chars().take(200).collect();
+            return Err(format!("API returned {} with a non-JSON body: {}", status, snippet));
+        }
+    };
     if !status.is_success() {
         let msg = body["error"]["message"]
             .as_str()
