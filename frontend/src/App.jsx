@@ -5,6 +5,17 @@ import ReactMarkdown from "react-markdown";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
+function validateCidr(value) {
+  if (!value) return "Network is required (example: 192.168.122.0/24)";
+  if (value !== value.trim()) return "Remove leading/trailing spaces";
+  const m = value.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/(\d{1,2}))?$/);
+  if (!m) return "Invalid format. Use IPv4 CIDR, for example 192.168.122.0/24";
+  if (m[5] === undefined) return `Missing prefix length: "${value}" would be scanned as a single host. Use for example ${value}/24`;
+  if ([m[1], m[2], m[3], m[4]].some(o => parseInt(o, 10) > 255)) return "Each octet must be between 0 and 255";
+  if (parseInt(m[5], 10) > 32) return "Prefix length must be between 0 and 32";
+  return null;
+}
+
 function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
   const isEdit = network !== null;
   const [form, setForm] = useState({
@@ -16,8 +27,10 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
     identity_file: network?.identity_file || "",
   });
   const [calibrating, setCalibrating] = useState(false);
+  const [netError, setNetError] = useState(null);
+  const [netWarn, setNetWarn] = useState(null);
 
-  function handleChange(e) { setForm({ ...form, [e.target.name]: e.target.value }); }
+  function handleChange(e) { setForm({ ...form, [e.target.name]: e.target.value }); setNetError(null); setNetWarn(null); }
 
   async function handleRecalibrate() {
     if (!onRecalibrate) return;
@@ -33,6 +46,17 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
   }
 
   async function handleSubmit() {
+    const cidrError = validateCidr(form.network);
+    if (cidrError) { setNetError(cidrError); setNetWarn(null); return; }
+    const prefix = parseInt(form.network.split("/")[1], 10);
+    const warn = prefix === 32
+      ? "A /32 network is a single host, so the scan will only check that one IP."
+      : prefix < 16
+        ? `/${prefix} has ${Math.pow(2, 32 - prefix).toLocaleString()} addresses. The scan opens one connection per address and will take very long.`
+        : null;
+    if (warn && netWarn !== warn) { setNetError(null); setNetWarn(warn); return; }
+    setNetError(null);
+    setNetWarn(null);
     if (!form.name || !form.network) { alert("Name and CIDR are required"); return; }
     await onSave({
       name: form.name, network: form.network,
@@ -69,6 +93,8 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
           </div>
           {form.scan_timeout && <span className="timeout-info">RTT-based · editable</span>}
         </div>
+        {netError && <div className="scp-result error">{netError}</div>}
+        {netWarn && <div className="health-issue warning">⚠ {netWarn} Press {isEdit ? "Save" : "Add"} again to confirm.</div>}
         <div className="modal-actions">
           <button className="btn-cancel" onClick={onClose}>Cancel</button>
           <button className="btn-primary" onClick={handleSubmit}>{isEdit ? "Save" : "Add"}</button>
