@@ -6,6 +6,8 @@ All notable changes to Merendero are documented here.
 
 ### Added
 - Local audit log (`~/.config/merendero/audit.jsonl`): SSH sessions, Run cmd, SCP, SCP broadcast and broadcast, with start and end records
+- AI fleet summary after a batch health check: groups flagged hosts by shared problem using only the local findings (no raw output); each request is recorded in the audit log
+- Health history (`health_history.jsonl`, 90 days): each check is recorded and the host modal shows what changed since the previous check
 - Health check on a selection of hosts, with limited concurrency (8 at a time) and a single batched save
 - AI health report now includes diagnostic and fix commands for each issue, adapted to the host's distribution, with a Regenerate button
 - AI analysis can be requested from a saved report (runs a fresh check first)

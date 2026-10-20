@@ -736,14 +736,70 @@ function analyzeHealth(data) {
   });
 
   const dmesgSection = (data.split("=== DMESG_TAIL ===")[1] || "").split("=== VMSTAT ===")[0];
-    const dmesgErrors = dmesgSection.match(/error|oom|killed|panic|fault/gi) || [];
-  if (dmesgErrors.length > 3) issues.push({ level: "warning", msg: `${dmesgErrors.length} error patterns in dmesg` });
+    const dmesgPat = /\b(segfault|oom-killer|out of memory|killed process|kernel panic|call trace|blocked for more than|general protection fault|hardware error|i\/o error|errors?)\b/i;
+    const dmesgErrors = dmesgSection.split(String.fromCharCode(10)).filter(l => dmesgPat.test(l));
+  const dmesgSamples = [...new Set(
+      dmesgSection.split(String.fromCharCode(10))
+        .filter(l => dmesgPat.test(l))
+        .map(l => l.replace(/^\[[^\]]*\]\s*/, "").trim().slice(0, 120))
+    )].slice(0, 3);
+  if (dmesgErrors.length > 3) issues.push({ level: "warning", msg: `${dmesgErrors.length} suspicious lines in dmesg`, sample: dmesgSamples });
 
   const health = issues.some(i => i.level === "critical") ? "critical"
     : issues.some(i => i.level === "warning") ? "warning" : "ok";
 
   const a = { health, issues, metrics };
   return a;
+}
+
+function HealthHistory({ networkName, ip, refreshKey }) {
+  const [rows, setRows] = useState([]);
+
+  useEffect(() => {
+    if (refreshKey === "busy") return;
+    invoke("get_health_history", { network: networkName, ip, limit: 30 })
+      .then(setRows)
+      .catch(() => setRows([]));
+  }, [networkName, ip, refreshKey]);
+
+  if (rows.length === 0) return null;
+
+  const icon = { ok: "🟢", warning: "🟡", critical: "🔴" };
+  const norm = s => s.replace(/\d+([.,]\d+)?/g, "#");
+  const latest = rows[0];
+  const prev = rows[1];
+  let changeLine = null;
+  if (prev) {
+    const prevN = new Set((prev.issues || []).map(norm));
+    const curN = new Set((latest.issues || []).map(norm));
+    const added = (latest.issues || []).filter(m => !prevN.has(norm(m)));
+    const resolved = (prev.issues || []).filter(m => !curN.has(norm(m)));
+    const parts = [];
+    if (prev.status !== latest.status) parts.push(`${icon[prev.status] || ""} ${prev.status} → ${icon[latest.status] || ""} ${latest.status}`);
+    if (added.length) parts.push(`new: ${added.join("; ")}`);
+    if (resolved.length) parts.push(`resolved: ${resolved.join("; ")}`);
+    changeLine = parts.length ? parts.join(" · ") : "no change since the previous check";
+  }
+  const fmt = ts => new Date(ts * 1000).toLocaleString("en-GB", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" });
+  const val = (v, suffix = "") => (v === null || v === undefined ? "–" : `${v}${suffix}`);
+
+  return (
+    <details className="hh">
+      <summary>History · {rows.length} check{rows.length !== 1 ? "s" : ""}{changeLine ? ` · ${changeLine}` : ""}</summary>
+      <div className="hh-table">
+        <div className="hh-row hh-head"><span>Date</span><span>Status</span><span>Load</span><span>Mem</span><span>Swap</span></div>
+        {rows.map((r, i) => (
+          <div key={i} className="hh-row">
+            <span>{fmt(r.ts)}</span>
+            <span>{icon[r.status] || ""} {r.status}</span>
+            <span>{val(r.load1)}</span>
+            <span>{val(r.mem, "%")}</span>
+            <span>{val(r.swap, "%")}</span>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
 }
 
 function HealthCheckModal({ host, network, config, networks, setNetworks, selectedNetworkIndex, onClose }) {
@@ -787,6 +843,7 @@ function HealthCheckModal({ host, network, config, networks, setNetworks, select
   async function saveStatus(health, report) {
     if (selectedNetworkIndex === undefined) return;
     try {
+      await invoke("health_history_record", { network: network.name, entries: [{ ip: host.ip, status: health, report }] }).catch(() => {});
       const updated = await invoke("save_health_status", {
         networksFile: { networks }, networkIndex: selectedNetworkIndex,
         hostIp: host.ip, status: health, report,
@@ -891,6 +948,7 @@ function HealthCheckModal({ host, network, config, networks, setNetworks, select
             {aiLoading && <div className="health-loading">AI analyzing...</div>}
           </div>
         )}
+        <HealthHistory networkName={network.name} ip={host.ip} refreshKey={(loading || aiLoading) ? "busy" : (analysis ? `${analysis.health}|${JSON.stringify(analysis.metrics)}` : "none")} />
         {raw && (
           <details className="health-raw">
             <summary>Raw output</summary>
@@ -912,6 +970,8 @@ function HealthBatchModal({ hosts, network, networkIndex, config, networks, setN
   const [running, setRunning] = useState(true);
   const [cancelRequested, setCancelRequested] = useState(false);
   const [saveError, setSaveError] = useState(null);
+  const [fleetSummary, setFleetSummary] = useState(null);
+  const [fleetLoading, setFleetLoading] = useState(false);
   const cancelRef = useRef(false);
   const startedRef = useRef(false);
 
@@ -941,7 +1001,7 @@ function HealthBatchModal({ hosts, network, networkIndex, config, networks, setN
           }
           const a = analyzeHealth(result.raw);
           collected.push({ ip: h.ip, status: a.health, report: JSON.stringify(a) });
-          setItem(h.ip, { state: "done", health: a.health, issues: a.issues.length });
+          setItem(h.ip, { state: "done", health: a.health, issues: a.issues.length, list: a.issues.map(i => `${i.level}: ${i.msg}${i.sample && i.sample.length ? ` [e.g. ${i.sample.join(" | ")}]` : ""}`) });
         } catch (e) {
           const msg = String(e).split(String.fromCharCode(10))[0].slice(0, 100);
           setItem(h.ip, { state: "failed", error: msg });
@@ -953,6 +1013,7 @@ function HealthBatchModal({ hosts, network, networkIndex, config, networks, setN
 
     if (collected.length > 0) {
       try {
+        await invoke("health_history_record", { network: network.name, entries: collected }).catch(() => {});
         const updated = await invoke("save_health_batch", {
           networksFile: { networks }, networkIndex, entries: collected,
         });
@@ -960,6 +1021,43 @@ function HealthBatchModal({ hosts, network, networkIndex, config, networks, setN
       } catch (e) { setSaveError(String(e)); }
     }
     setRunning(false);
+  }
+
+  async function runFleetSummary() {
+    const ai = config?.ai;
+    if (!ai?.api_key || fleetLoading) return;
+    const done = targets.filter(h => items[h.ip]?.state === "done");
+    const flagged = done.filter(h => items[h.ip].health !== "ok");
+    const okCount = done.length - flagged.length;
+    const failedCount = targets.filter(h => items[h.ip]?.state === "failed").length;
+    if (flagged.length === 0) {
+      setFleetSummary(`All ${done.length} checked hosts are OK. Nothing to summarize.`);
+      return;
+    }
+    const MAX = 150;
+    const shown = flagged.slice(0, MAX);
+    const lines = shown.map(h => `${h.hostname || h.ip} (${h.ip}) -> ${items[h.ip].health.toUpperCase()}: ${(items[h.ip].list || []).join("; ")}`);
+    if (flagged.length > shown.length) lines.push(`(${flagged.length - shown.length} more flagged hosts omitted)`);
+    const text = `Network: ${network.name}\nHosts checked: ${done.length}, OK: ${okCount}, flagged: ${flagged.length}, unreachable or failed: ${failedCount}\n\n` + lines.join("\n");
+    setFleetLoading(true);
+    setFleetSummary(null);
+    let ok = true;
+    try {
+      const out = await invoke("ai_fleet_summary", {
+        summaryText: text, apiUrl: ai.api_url, apiKey: ai.api_key,
+        model: ai.model, provider: ai.provider || "claude",
+      });
+      setFleetSummary(out);
+    } catch (e) {
+      ok = false;
+      setFleetSummary(`AI error: ${e}`);
+    } finally {
+      setFleetLoading(false);
+    }
+    invoke("audit_event", {
+      action: "ai_fleet_summary", network: network.name, hosts: shown.map(h => h.ip),
+      detail: `sent ${shown.length} host summaries (names, IPs and finding texts) to ${ai.provider || "claude"}`, success: ok,
+    }).catch(() => {});
   }
 
   const total = targets.length;
@@ -1009,6 +1107,20 @@ function HealthBatchModal({ hosts, network, networkIndex, config, networks, setN
         </div>
 
         {saveError && <div className="scp-result error">Could not save results: {saveError}</div>}
+        {!running && config?.ai?.api_key && !fleetSummary && (
+          <>
+            <button className="btn-ai-analyze" onClick={runFleetSummary} disabled={fleetLoading}>
+              {fleetLoading ? "AI summarizing…" : "🤖 Summarize results with AI"}
+            </button>
+            <div style={{ fontSize: "0.7rem", color: "var(--text3)" }}>Sends host names, IPs and the local findings (not the raw output) to the configured AI provider.</div>
+          </>
+        )}
+        {fleetSummary && (
+          <div className="health-ai">
+            <div className="health-ai-label">🤖 Fleet summary <button className="btn-link" onClick={runFleetSummary} disabled={fleetLoading}>↻ Regenerate</button></div>
+            <div className="health-ai-text"><ReactMarkdown>{fleetSummary}</ReactMarkdown></div>
+          </div>
+        )}
         {!running && <div style={{ fontSize: "0.72rem", color: "var(--text3)" }}>Unreachable hosts keep their previous health status. Click a finished host to see its analysis.</div>}
 
         <div className="modal-actions">

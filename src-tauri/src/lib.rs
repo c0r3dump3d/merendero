@@ -581,6 +581,181 @@ fn audit_write(action: &str, network: &str, hosts: Vec<serde_json::Value>, detai
     }
 }
 
+async fn ai_call(
+    client: &reqwest::Client,
+    provider: &str,
+    api_url: &str,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> Result<String, String> {
+    let req = match provider {
+        "claude" => client
+            .post(api_url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [{ "role": "user", "content": prompt }]
+            })),
+        "openai" => client
+            .post(api_url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&serde_json::json!({
+                "model": model,
+                "max_tokens": max_tokens,
+                "messages": [{ "role": "user", "content": prompt }]
+            })),
+        _ => client
+            .post(api_url)
+            .json(&serde_json::json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": prompt }],
+                "stream": false
+            })),
+    };
+    let resp = req.send().await.map_err(|e| format!("Request failed: {}", e))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.map_err(|e| format!("Parse failed: {}", e))?;
+    if !status.is_success() {
+        let msg = body["error"]["message"]
+            .as_str()
+            .or(body["error"].as_str())
+            .unwrap_or("no details");
+        return Err(format!("API returned {}: {}", status, msg));
+    }
+    let text = match provider {
+        "claude" => body["content"][0]["text"].as_str(),
+        "openai" => body["choices"][0]["message"]["content"].as_str(),
+        _ => body["message"]["content"]
+            .as_str()
+            .or(body["choices"][0]["message"]["content"].as_str()),
+    };
+    text.map(|t| t.to_string())
+        .ok_or_else(|| String::from("The API response had no text"))
+}
+
+#[tauri::command]
+async fn ai_fleet_summary(
+    summary_text: String,
+    api_url: String,
+    api_key: String,
+    model: String,
+    provider: String,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let data: String = summary_text.chars().take(24000).collect();
+    let prompt = format!(
+        r#"You are a senior Linux sysadmin reviewing the results of an automated health check that ran on a group of hosts. Hosts with status OK are only counted, not listed. Each listed host line has the format: name (ip) -> STATUS: findings.
+
+Write a concise report in Markdown:
+1. One line with the overall picture (counts).
+2. Group the flagged hosts that share the same kind of problem. Use naming patterns (same prefix or service family) only to group hosts. State a common cause only when the findings or the example log lines support it; otherwise say it cannot be inferred.
+3. A short prioritised list of which hosts to open first and why.
+Findings come from simple regex rules, so a count such as "N suspicious lines in dmesg" is not a measure of severity. Use the example log lines, when present, to judge whether they look benign or serious. When only a count is given, say the evidence is weak and do not rank hosts by that count. Never state or suggest a root cause (including misconfiguration, memory corruption, hardware or environment problems) unless a log line says so explicitly; describe what is observed and what to check instead. Each host has at most 3 example lines while the count may include other kinds of lines, so never claim that all counted lines are of the type shown in the examples. The same message on several hosts only means the message repeats; it can be harmless noise from a common image or tool, so do not present it as evidence of a shared fault. Stay consistent: if you say a cause cannot be inferred, do not claim one later. Only call a problem ongoing or recurring when the data shows it. Do not use Markdown headings; use bold labels and lists. Do not give shell commands: the per-host report provides them. Do not invent data that is not in the input.
+
+DATA:
+{data}"#
+    );
+    ai_call(&client, &provider, &api_url, &api_key, &model, &prompt, 1200).await
+}
+
+const HEALTH_RETENTION_DAYS: u64 = 90;
+
+fn health_history_path() -> std::path::PathBuf {
+    get_config_dir().join("health_history.jsonl")
+}
+
+#[tauri::command]
+fn health_history_record(network: String, entries: Vec<HealthEntry>) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cutoff = now.saturating_sub(HEALTH_RETENTION_DAYS * 86400);
+    let path = health_history_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut last: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+    let mut pruned = false;
+    for line in existing.lines() {
+        if line.trim().is_empty() { continue; }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => { pruned = true; continue; }
+        };
+        if v["ts"].as_u64().unwrap_or(0) < cutoff { pruned = true; continue; }
+        if let (Some(n), Some(ip)) = (v["network"].as_str(), v["ip"].as_str()) {
+            last.insert(format!("{}|{}", n, ip), v.clone());
+        }
+        kept.push(line.to_string());
+    }
+
+    let mut fresh: Vec<String> = Vec::new();
+    for e in entries {
+        let report: serde_json::Value = e.report.as_deref()
+            .and_then(|r| serde_json::from_str(r).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let issues: Vec<String> = report["issues"].as_array()
+            .map(|a| a.iter().filter_map(|i| i["msg"].as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        let rec = serde_json::json!({
+            "ts": now,
+            "time": iso_utc(now),
+            "network": network,
+            "ip": e.ip,
+            "status": e.status,
+            "load1": report["metrics"]["load1"],
+            "mem": report["metrics"]["memUsedPct"],
+            "swap": report["metrics"]["swapUsedPct"],
+            "issues": issues,
+        });
+        let key = format!("{}|{}", network, e.ip);
+        if let Some(prev) = last.get(&key) {
+            let same = prev["status"] == rec["status"]
+                && prev["load1"] == rec["load1"]
+                && prev["mem"] == rec["mem"]
+                && prev["swap"] == rec["swap"]
+                && prev["issues"] == rec["issues"];
+            if same && now.saturating_sub(prev["ts"].as_u64().unwrap_or(0)) < 300 { continue; }
+        }
+        last.insert(key, rec.clone());
+        fresh.push(rec.to_string());
+    }
+    if fresh.is_empty() && !pruned { return; }
+
+    if pruned {
+        let tmp = path.with_extension("jsonl.tmp");
+        let _ = (|| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true).write(true).truncate(true).mode(0o600).open(&tmp)?;
+            for l in kept.iter().chain(fresh.iter()) { writeln!(f, "{}", l)?; }
+            std::fs::rename(&tmp, &path)
+        })();
+    } else if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path) {
+        for l in &fresh { let _ = writeln!(f, "{}", l); }
+    }
+}
+
+#[tauri::command]
+fn get_health_history(network: String, ip: String, limit: usize) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(health_history_path()).unwrap_or_default();
+    let mut rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["network"].as_str() == Some(network.as_str()) && v["ip"].as_str() == Some(ip.as_str()))
+        .collect();
+    rows.reverse();
+    rows.truncate(limit);
+    rows
+}
+
 #[tauri::command]
 fn audit_event(action: String, network: String, hosts: Vec<String>, detail: String, success: bool) {
     let entries: Vec<serde_json::Value> = hosts
@@ -1102,6 +1277,9 @@ pub fn run() {
             health_check,
             export_backup,
             import_backup,
+            ai_fleet_summary,
+            health_history_record,
+            get_health_history,
             audit_event,
             save_health_batch,
             save_health_status,
