@@ -1296,15 +1296,21 @@ function App() {
   async function handleBroadcast(reachableHosts) {
     if (selectedHosts.size === 0 || broadcasting) return;
     const network = networks[selectedNetwork];
+    const targets = reachableHosts && reachableHosts.length > 0
+      ? reachableHosts
+      : network.hosts.filter(h => selectedHosts.has(h.ip));
     setBroadcasting(true);
+    let ok = true;
+    let detail = "tmux session launched (delivery to each host is not confirmed)";
     try {
       await invoke("launch_broadcast", {
-        hosts: network.hosts.filter(h => selectedHosts.has(h.ip)),
+        hosts: targets,
         network, defaults: config.defaults,
         sessionName: `merendero-${network.name.toLowerCase().replace(/\s+/g, '-')}`,
       });
-    } catch (e) { alert("Broadcast failed: " + e); }
+    } catch (e) { ok = false; detail = String(e); alert("Broadcast failed: " + e); }
     finally { setBroadcasting(false); }
+    invoke("audit_event", { action: "broadcast", network: network.name, hosts: targets.map(h => h.ip), detail, success: ok }).catch(() => {});
   }
 
   function matchesFilter(host, filter) {

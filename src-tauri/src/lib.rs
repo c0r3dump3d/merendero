@@ -132,8 +132,7 @@ fn get_history() -> host::History {
     host::load_history(path.to_str().unwrap())
 }
 
-#[tauri::command]
-fn launch_ssh(ip: String, username: String, port: u16, terminal: Option<String>, hostname: Option<String>, network_name: Option<String>, identity_file: Option<String>, post_connect: Option<String>) -> Result<(), String> {
+fn launch_ssh_inner(ip: String, username: String, port: u16, terminal: Option<String>, hostname: Option<String>, network_name: Option<String>, identity_file: Option<String>, post_connect: Option<String>) -> Result<(), String> {
     let identity_arg = identity_file
         .map(|f| format!(" -i {}", f))
         .unwrap_or_default();
@@ -419,8 +418,7 @@ async fn list_remote_dir(
     Ok(entries)
 }
 
-#[tauri::command]
-fn run_scp(
+fn run_scp_inner(
     ip: String,
     username: String,
     port: u16,
@@ -463,8 +461,7 @@ fn run_scp(
     }
 }
 
-#[tauri::command]
-async fn run_scp_broadcast(
+async fn run_scp_broadcast_inner(
     hosts: Vec<host::Host>,
     network: host::Network,
     defaults: host::Defaults,
@@ -539,8 +536,145 @@ async fn run_scp_broadcast(
     results
 }
 
+fn iso_utc(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
+}
+
+fn audit_write(action: &str, network: &str, hosts: Vec<serde_json::Value>, detail: serde_json::Value) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let user = std::env::var("USER").unwrap_or_else(|_| String::from("unknown"));
+    let entry = serde_json::json!({
+        "time": iso_utc(secs),
+        "user": user,
+        "action": action,
+        "network": network,
+        "hosts": hosts,
+        "detail": detail,
+    });
+    let path = get_config_dir().join("audit.jsonl");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{}", entry);
+    }
+}
+
+#[tauri::command]
+fn audit_event(action: String, network: String, hosts: Vec<String>, detail: String, success: bool) {
+    let entries: Vec<serde_json::Value> = hosts
+        .into_iter()
+        .map(|ip| serde_json::json!({ "ip": ip }))
+        .collect();
+    audit_write(&action, &network, entries, serde_json::json!({ "detail": detail, "success": success }));
+}
+
 #[tauri::command]
 async fn run_command(
+    hosts: Vec<host::Host>,
+    network: host::Network,
+    defaults: host::Defaults,
+    command: String,
+) -> Vec<serde_json::Value> {
+    let net_name = network.name.clone();
+    let targets: Vec<serde_json::Value> = hosts
+        .iter()
+        .map(|h| serde_json::json!({ "ip": h.ip, "hostname": h.hostname }))
+        .collect();
+    audit_write("run_command", &net_name, targets, serde_json::json!({ "phase": "start", "command": command }));
+    let results = run_command_inner(hosts, network, defaults, command.clone()).await;
+    let outcome: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| serde_json::json!({ "ip": r["ip"], "success": r["success"] }))
+        .collect();
+    audit_write("run_command", &net_name, outcome, serde_json::json!({ "phase": "end", "command": command }));
+    results
+}
+
+#[tauri::command]
+async fn run_scp_broadcast(
+    hosts: Vec<host::Host>,
+    network: host::Network,
+    defaults: host::Defaults,
+    local_path: String,
+    remote_path: String,
+    direction: String,
+) -> Vec<serde_json::Value> {
+    let net_name = network.name.clone();
+    let transfer = serde_json::json!({ "direction": direction, "local": local_path, "remote": remote_path });
+    let targets: Vec<serde_json::Value> = hosts
+        .iter()
+        .map(|h| serde_json::json!({ "ip": h.ip, "hostname": h.hostname }))
+        .collect();
+    audit_write("scp_broadcast", &net_name, targets, serde_json::json!({ "phase": "start", "transfer": transfer }));
+    let results = run_scp_broadcast_inner(hosts, network, defaults, local_path, remote_path, direction).await;
+    let outcome: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| serde_json::json!({ "ip": r["ip"], "success": r["success"] }))
+        .collect();
+    audit_write("scp_broadcast", &net_name, outcome, serde_json::json!({ "phase": "end", "transfer": transfer }));
+    results
+}
+
+#[tauri::command]
+fn run_scp(
+    ip: String,
+    username: String,
+    port: u16,
+    identity_file: Option<String>,
+    local_path: String,
+    remote_path: String,
+    direction: String,
+) -> Result<String, String> {
+    let target = vec![serde_json::json!({ "ip": ip })];
+    let transfer = serde_json::json!({ "direction": direction, "local": local_path, "remote": remote_path, "remote_user": username });
+    audit_write("scp", "", target.clone(), serde_json::json!({ "phase": "start", "transfer": transfer }));
+    let result = run_scp_inner(ip, username, port, identity_file, local_path, remote_path, direction);
+    audit_write("scp", "", target, serde_json::json!({ "phase": "end", "success": result.is_ok(), "transfer": transfer }));
+    result
+}
+
+#[tauri::command]
+fn launch_ssh(
+    ip: String,
+    username: String,
+    port: u16,
+    terminal: Option<String>,
+    hostname: Option<String>,
+    network_name: Option<String>,
+    identity_file: Option<String>,
+    post_connect: Option<String>,
+) -> Result<(), String> {
+    let net_name = network_name.clone().unwrap_or_default();
+    let target = vec![serde_json::json!({ "ip": ip, "hostname": hostname })];
+    let detail = serde_json::json!({ "user": username, "port": port, "post_connect": post_connect });
+    let result = launch_ssh_inner(ip, username, port, terminal, hostname, network_name, identity_file, post_connect);
+    audit_write("ssh", &net_name, target, serde_json::json!({ "session": detail, "terminal_launched": result.is_ok() }));
+    result
+}
+
+async fn run_command_inner(
     hosts: Vec<host::Host>,
     network: host::Network,
     defaults: host::Defaults,
@@ -968,6 +1102,7 @@ pub fn run() {
             health_check,
             export_backup,
             import_backup,
+            audit_event,
             save_health_batch,
             save_health_status,
             ai_analyze,

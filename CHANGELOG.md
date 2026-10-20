@@ -5,6 +5,7 @@ All notable changes to Merendero are documented here.
 ## [Unreleased]
 
 ### Added
+- Local audit log (`~/.config/merendero/audit.jsonl`): SSH sessions, Run cmd, SCP, SCP broadcast and broadcast, with start and end records
 - Health check on a selection of hosts, with limited concurrency (8 at a time) and a single batched save
 - AI health report now includes diagnostic and fix commands for each issue, adapted to the host's distribution, with a Regenerate button
 - AI analysis can be requested from a saved report (runs a fresh check first)
@@ -12,6 +13,7 @@ All notable changes to Merendero are documented here.
 - `scan_network` and `recalibrate_network` return a visible error for an invalid CIDR
 
 ### Fixed
+- Broadcast now really launches only on hosts that passed the pre-flight check (v0.1.2 showed the check but launched on all selected hosts)
 - Load average parsing on hosts with comma decimal locale (e.g. `0,11`)
 - dmesg error count no longer matches unrelated text such as process names
 - AI prompt truncated the health output at 4000 bytes, dropping the disk section and risking a panic on multibyte characters
