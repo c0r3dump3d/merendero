@@ -1580,7 +1580,7 @@ function App() {
       setNetworks(netsResult.networks);
       setConfig(cfgResult);
       if (netsResult.networks.length > 0) setSelectedNetwork(0);
-    } catch (e) { console.error(e); }
+    } catch (e) { console.error(e); alert("Could not load your configuration: " + e); }
     finally { setLoading(false); }
   }
 

@@ -20,6 +20,7 @@ All notable changes to Merendero are documented here.
 
 ### Fixed
 - Broadcast now really launches only on hosts that passed the pre-flight check (v0.1.2 showed the check but launched on all selected hosts)
+- On a first run, saving the first network failed because `~/.config/merendero/` did not exist, so a new user could not start. Merendero now creates the directory (owner-only) and starts with default settings (user `root`, port 22). A configuration file that exists but cannot be read now shows an error instead of an empty window. In 0.1.2 and earlier, the workaround is `mkdir -p ~/.config/merendero`
 - Reverse DNS lookups during a scan no longer go to Google's public DNS when no DNS server is set in Settings. In 0.1.2 and earlier, the internal IPs found by a scan were sent to 8.8.8.8 and 8.8.4.4 in that case. Merendero now uses the system resolver (`/etc/resolv.conf`), and does no lookups if the system has none
 - Load average parsing on hosts with comma decimal locale (e.g. `0,11`)
 - dmesg error count no longer matches unrelated text such as process names

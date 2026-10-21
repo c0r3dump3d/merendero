@@ -9,6 +9,11 @@ fn get_config_dir() -> PathBuf {
     let mut path = dirs::home_dir().expect("Cannot find home directory");
     path.push(".config");
     path.push("merendero");
+    // Create it on first use. It holds SSH settings, API keys and logs, so owner only.
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&path);
+    }
     path
 }
 

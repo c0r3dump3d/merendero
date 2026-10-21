@@ -41,9 +41,24 @@ pub struct NetworksFile {
     pub networks: Vec<Network>,
 }
 
+// Used on a first run, when config.toml does not exist yet. Nothing is written until the user saves.
+pub fn default_config() -> Config {
+    Config {
+        defaults: Defaults {
+            username: String::from("root"),
+            port: 22,
+            dns_server: None,
+            identity_file: None,
+            terminal: None,
+        },
+        ai: None,
+    }
+}
+
 pub fn load_config(path: &str) -> Result<Config, String> {
     let content = match fs::read_to_string(path) {
         Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(default_config()),
         Err(e) => return Err(format!("Could not read {}: {}", path, e)),
     };
     match toml::from_str(&content) {
@@ -55,6 +70,7 @@ pub fn load_config(path: &str) -> Result<Config, String> {
 pub fn load_networks(path: &str) -> Result<NetworksFile, String> {
     let content = match fs::read_to_string(path) {
         Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(NetworksFile { networks: vec![] }),
         Err(e) => return Err(format!("Could not read {}: {}", path, e)),
     };
     match toml::from_str(&content) {
