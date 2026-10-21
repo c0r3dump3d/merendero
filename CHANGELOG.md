@@ -27,6 +27,9 @@ All notable changes to Merendero are documented here.
 - Calibration errors are surfaced instead of being swallowed
 - Error dialogs were never displayed because the `dialog:allow-message` permission was missing
 
+### Removed
+- The legacy terminal CLI (`merendero-cli`). It rewrote `networks.toml` with only the fields it knew, so using it on a configuration managed by the GUI dropped notes, SSH keys, post-connect commands, health results and scan timeouts
+
 ## [0.1.2] - 2026-10-20
 
 ### Added
