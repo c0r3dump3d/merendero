@@ -44,7 +44,12 @@ async fn resolve_hostname(ip: &str, dns_server: Option<&str>) -> Option<String> 
             });
             TokioAsyncResolver::tokio(config, ResolverOpts::default())
         }
-        None => TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default()),
+        // No DNS server configured: use the system resolver (/etc/resolv.conf).
+        // Never fall back to a public resolver, which would receive the internal IPs being scanned.
+        None => match TokioAsyncResolver::tokio_from_system_conf() {
+            Ok(resolver) => resolver,
+            Err(_) => return None,
+        },
     };
 
     match resolver.reverse_lookup(ip_addr).await {

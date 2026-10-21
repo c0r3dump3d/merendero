@@ -20,6 +20,7 @@ All notable changes to Merendero are documented here.
 
 ### Fixed
 - Broadcast now really launches only on hosts that passed the pre-flight check (v0.1.2 showed the check but launched on all selected hosts)
+- Reverse DNS lookups during a scan no longer go to Google's public DNS when no DNS server is set in Settings. In 0.1.2 and earlier, the internal IPs found by a scan were sent to 8.8.8.8 and 8.8.4.4 in that case. Merendero now uses the system resolver (`/etc/resolv.conf`), and does no lookups if the system has none
 - Load average parsing on hosts with comma decimal locale (e.g. `0,11`)
 - dmesg error count no longer matches unrelated text such as process names
 - AI prompt truncated the health output at 4000 bytes, dropping the disk section and risking a panic on multibyte characters
