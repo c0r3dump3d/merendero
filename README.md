@@ -62,7 +62,7 @@ Built by a sysadmin, for sysadmins.
 
 - Linux. Arch Linux is the only distribution it has been tested on
 - `ssh` and `scp` in your PATH, and `tmux` for broadcast
-- A terminal emulator (`terminator`, `alacritty`, `kitty`, `xterm`...)
+- A terminal emulator: `terminator` (the default), `alacritty` or `kitty`. Any other is started with `-e <command>`, which not every terminal accepts
 
 ### From release
 
@@ -133,10 +133,14 @@ The first build compiles hundreds of dependencies, so it takes a while. `tauri b
 
 ## Quick start
 
-1. Launch `merendero`
-2. Click **+ Network** and enter a CIDR range (e.g. `192.168.1.0/24`)
-3. Click **⟳ Scan** — Merendero discovers hosts and resolves their FQDNs via reverse DNS
-4. Click **SSH** to connect, or select multiple hosts for **⚡ Broadcast**
+1. Launch `merendero`. On a first run the window is empty
+2. Open **Settings** (⚙) and set what you need: the default SSH username (`root` until you change it), your terminal emulator (`terminator` is the default; `alacritty` and `kitty` are also supported) and, if you want, a DNS server for reverse lookups (by default Merendero uses your system's)
+3. Click **+ Network** and enter a name and a CIDR range with its prefix, such as `192.168.1.0/24`
+4. Click **⟳ Scan**. Merendero finds the hosts with the SSH port open and looks up their names with reverse DNS. The first scan of a network also measures its latency, so it takes a little longer. Later, **✓ Check** re-tests the hosts you already have
+5. Click **SSH** on a host to open a terminal with the session. It uses your normal SSH setup (agent and default keys) unless you set a key for the host, the network or globally
+6. Tick several hosts to get the toolbar: **Tag**, **Run cmd**, **Health**, **SCP** and **⚡ Broadcast**. The ⚕ button on a row runs a health check on that host
+
+If the SSH button reports that it could not launch the terminal, choose an installed terminal in Settings.
 
 ## Configuration
 
