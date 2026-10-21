@@ -3,10 +3,10 @@
   "version": "0.1.2",
   "identifier": "com.merendero.app",
   "build": {
-    "beforeDevCommand": "cd /home/andrew/merendero/frontend && npm run dev",
-    "beforeBuildCommand": "cd /home/andrew/merendero/frontend && npm run build",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:1420",
-    "frontendDist": "/home/andrew/merendero/frontend/dist"
+    "frontendDist": "../frontend/dist"
   },
   "app": {
     "windows": [
