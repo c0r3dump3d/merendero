@@ -4,6 +4,18 @@ All notable changes to Merendero are documented here.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-22
+
+### Added
+- Automatic availability check: every 15 minutes by default, only while Merendero is open (Settings → Monitoring; `0` turns it off). Each run opens a TCP connection to the SSH port of every known host. It never runs while a dialog is open or another operation is in progress, it shows its state in the footer, and a Pause button stops it until you close Merendero
+- In an automatic check, if every host of a network stops answering at once, the previous state is kept (the likely cause is that this machine lost its connection). The ✓ Check button still applies what it finds
+- Health history retention is configurable in Settings (90 days by default, `0` keeps everything)
+- The running version is shown in the sidebar
+
+### Fixed
+- Checking hosts no longer overwrites edits made while the check is running, and no longer overwrites a `networks.toml` that cannot be read: the results are applied to the file as it is on disk
+- After a successful broadcast the selected hosts are deselected, as they already were when you changed network. If the broadcast fails, the selection is kept so you can retry
+
 ## [0.1.3] - 2026-10-22
 
 ### Added

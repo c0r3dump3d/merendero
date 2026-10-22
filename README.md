@@ -37,6 +37,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 
 - **Network scanning** — scan a CIDR range, find hosts with SSH open and resolve their FQDNs through reverse DNS. A prefix such as `/24` is required, so a typo can't silently scan a single host
 - **Timeout calibration** — measures latency per network and sets the scan timeout for you
+- **Automatic availability check** — while Merendero is open, it re-checks which known hosts answer every 15 minutes (you can change that or turn it off), and shows its state in the footer with a Pause button. Scans stay manual
 - **Global search** — one filter box searches every network and groups the matches by network. `:critical`, `:warning`, `:issues`, `:down`, `:up` and `:healthy` work as filters
 - **Tags, notes and history** — tag hosts one by one or in bulk, keep notes on each host and see when you last connected
 
@@ -50,7 +51,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 **Health checks**
 
 - **Brendan Gregg's 60-second checklist** on any host or on a whole selection (8 at a time), with a local analysis and a status mark in the host table
-- **Health history** — each check is kept for 90 days, and the host window shows what changed since the previous one
+- **Health history** — each check is kept for 90 days by default (you can change that in Settings), and the host window shows what changed since the previous one
 
 **Optional AI** (Claude, OpenAI, Ollama or a custom endpoint)
 
@@ -154,13 +155,13 @@ If the SSH button reports that it could not launch the terminal, choose an insta
 
 Merendero keeps its data in `~/.config/merendero/`:
 
-- `config.toml` — global defaults (username, port, DNS server, terminal, SSH key) and the optional AI settings
+- `config.toml` — global defaults (username, port, DNS server, terminal, SSH key), the monitoring settings and the optional AI settings
 - `networks.toml` — your networks and hosts, with tags, notes and the latest health result of each host
 - `history.toml` — when you last connected to each host
 - `audit.jsonl` — what you ran from Merendero, one JSON object per line. Commands are stored as typed, so don't put passwords in them
-- `health_history.jsonl` — the health check history, kept for 90 days
+- `health_history.jsonl` — the health check history, kept for 90 days by default
 
-You normally don't edit these by hand: the defaults and the AI settings live in the Settings window (⚙), and networks and hosts are managed from the main window.
+You normally don't edit these by hand: the defaults, the monitoring settings and the AI settings live in the Settings window (⚙), and networks and hosts are managed from the main window.
 
 `config.toml` can hold your AI API key in plain text, and the backup you export from Settings includes it, so keep both private: `chmod 600 ~/.config/merendero/config.toml`.
 
@@ -170,9 +171,13 @@ You normally don't edit these by hand: the defaults and the AI settings live in 
 [defaults]
 username = "root"
 port = 22
-dns_server = "10.0.0.1"               # for PTR resolution
+dns_server = "10.0.0.1"               # optional, for reverse lookups; the system's DNS if unset
 terminal = "terminator"               # or alacritty, kitty, xterm...
 identity_file = "~/.ssh/id_ed25519"   # optional default SSH key
+
+[monitoring]                          # optional
+check_interval_minutes = 15           # automatic availability check; 0 turns it off
+history_days = 90                     # how long the health history is kept; 0 keeps everything
 
 [ai]                                  # optional
 provider = "claude"
@@ -180,6 +185,15 @@ api_url = "https://api.anthropic.com/v1/messages"
 api_key = "sk-ant-..."
 model = "claude-haiku-4-5"
 ```
+
+### Automatic check
+
+While Merendero is open, it checks the known hosts of every network every 15 minutes by default. It opens a TCP connection to each host's SSH port, the same thing the ✓ Check button does, so your IDS may see it as a sweep. Scans are never automatic.
+
+- Change the interval in Settings (⚙), under Monitoring, or with `check_interval_minutes`. `0` turns it off for good
+- The **Pause** button in the footer stops it until you close Merendero
+- It doesn't run while a dialog is open or another operation is in progress; it tries again a minute later
+- If every host of a network stops answering at once, it keeps the previous state, assuming this machine lost its connection (VPN, Wi-Fi). The ✓ Check button doesn't do this, so use it to confirm a real outage
 
 ### AI settings (optional)
 
