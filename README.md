@@ -25,10 +25,10 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 ### Selection toolbar — tag, run a command, check health, copy files or broadcast to several hosts at once
 ![Selection toolbar](docs/screenshots/selection.png)
 
-### Run cmd — one command on several hosts, with a result for each host and an execution receipt
+### Run cmd — a result for each host and an execution receipt of what was run and how it was approved
 ![Run cmd](docs/screenshots/run-cmd.png)
 
-### Confirmation — a command that isn't clearly read-only asks you to type the number of hosts first
+### Confirmation — Run cmd checks every command, and anything that isn't clearly read-only needs confirmation before it runs
 ![Run cmd confirmation](docs/screenshots/run-cmd-confirm.png)
 
 ## Features
