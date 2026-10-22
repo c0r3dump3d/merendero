@@ -14,14 +14,22 @@ Built by a sysadmin, for sysadmins.
 
 ## Screenshots
 
-### Main view — networks, hosts, health status and tags
-![Main view](docs/screenshots/merendero1.png)
+The hosts in these screenshots are made up, except in the two Run cmd ones, which ran on lab virtual machines.
 
-### Smart filtering — `:critical` shows only hosts with health issues
-![Filter](docs/screenshots/merendero2.png)
+### Main view — networks, hosts, health marks, tags and last connection
+![Main view](docs/screenshots/main.png)
 
-### Multi-host selection — broadcast SSH, run commands, SCP to all at once
-![Broadcast](docs/screenshots/merendero3.png)
+### Global search — one filter box searches every network and groups the matches by network
+![Global search](docs/screenshots/global-search.png)
+
+### Selection toolbar — tag, run a command, check health, copy files or broadcast to several hosts at once
+![Selection toolbar](docs/screenshots/selection.png)
+
+### Run cmd — one command on several hosts, with a result for each host and an execution receipt
+![Run cmd](docs/screenshots/run-cmd.png)
+
+### Confirmation — a command that isn't clearly read-only asks you to type the number of hosts first
+![Run cmd confirmation](docs/screenshots/run-cmd-confirm.png)
 
 ## Features
 
