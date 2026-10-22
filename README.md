@@ -70,7 +70,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 
 - Linux. Arch Linux is the only distribution it has been tested on
 - `ssh` and `scp` in your PATH, and `tmux` for broadcast
-- A terminal emulator: `terminator` (the default), `alacritty` or `kitty`. Any other is started with `-e <command>`, which not every terminal accepts
+- A terminal emulator. `terminator` is the default, and `alacritty` and `kitty` have their own support. Any other, such as `xterm` or `xfce4-terminal`, is started as `<terminal> -e "<command>"`; a terminal that expects the command as separate arguments may not work
 
 ### From release
 
@@ -142,7 +142,7 @@ The first build compiles hundreds of dependencies, so it takes a while. `tauri b
 ## Quick start
 
 1. Launch `merendero`. On a first run the window is empty
-2. Open **Settings** (⚙) and set what you need: the default SSH username (`root` until you change it), your terminal emulator (`terminator` is the default; `alacritty` and `kitty` are also supported) and, if you want, a DNS server for reverse lookups (by default Merendero uses your system's)
+2. Open **Settings** (⚙) and set what you need: the default SSH username (`root` until you change it), your terminal emulator (`terminator` is the default; type the name of the one you use, such as `alacritty`, `kitty`, `xterm` or `xfce4-terminal`) and, if you want, a DNS server for reverse lookups (by default Merendero uses your system's)
 3. Click **+ Network** and enter a name and a CIDR range with its prefix, such as `192.168.1.0/24`
 4. Click **⟳ Scan**. Merendero finds the hosts with the SSH port open and looks up their names with reverse DNS. The first scan of a network also measures its latency, so it takes a little longer. Later, **✓ Check** re-tests the hosts you already have
 5. Click **SSH** on a host to open a terminal with the session. It uses your normal SSH setup (agent and default keys) unless you set a key for the host, the network or globally
