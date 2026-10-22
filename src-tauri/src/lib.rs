@@ -295,12 +295,49 @@ async fn recalibrate_network(
     Ok(networks_file)
 }
 
+enum CheckApply {
+    Changed,
+    Unchanged,
+    KeptOffline,
+}
+
+// Applies the result of a check to the networks file as it is on disk right now, so that
+// edits made while the check was running are not lost. In an automatic check, if every host
+// of a network fails at once, this machine most likely lost connectivity (VPN down, no
+// network): the last known state is kept instead of marking everything as down.
+fn apply_check_results(
+    current: &mut NetworksFile,
+    name: &str,
+    cidr: &str,
+    results: &std::collections::HashMap<String, bool>,
+    auto: bool,
+) -> Result<CheckApply, String> {
+    let idx = current.networks.iter()
+        .position(|n| n.name == name && n.network == cidr)
+        .ok_or_else(|| String::from("The network was edited while it was being checked. Run the check again."))?;
+    let hosts = &mut current.networks[idx].hosts;
+    if auto && !results.is_empty() && !results.values().any(|&up| up) && hosts.iter().any(|h| h.active) {
+        return Ok(CheckApply::KeptOffline);
+    }
+    let mut changed = false;
+    for host in hosts.iter_mut() {
+        if let Some(&status) = results.get(&host.ip) {
+            if host.active != status {
+                host.active = status;
+                changed = true;
+            }
+        }
+    }
+    Ok(if changed { CheckApply::Changed } else { CheckApply::Unchanged })
+}
+
 #[tauri::command]
 async fn check_hosts(
     window: tauri::Window,
-    mut networks_file: NetworksFile,
+    networks_file: NetworksFile,
     network_index: usize,
     defaults: Defaults,
+    auto: Option<bool>,
 ) -> Result<NetworksFile, String> {
     use tokio::net::TcpStream;
     use std::time::Duration;
@@ -343,15 +380,14 @@ async fn check_hosts(
         let _ = window.emit("check-progress", serde_json::json!({ "total": total, "current": current }));
     }
 
-    for host in networks_file.networks[network_index].hosts.iter_mut() {
-        if let Some(&status) = results.get(&host.ip) {
-            host.active = status;
-        }
-    }
-
     let path = get_config_dir().join("networks.toml");
-    host::save_networks(path.to_str().unwrap(), &networks_file)?;
-    Ok(networks_file)
+    let mut current = host::load_networks(path.to_str().unwrap())?;
+    let target = &networks_file.networks[network_index];
+    match apply_check_results(&mut current, &target.name, &target.network, &results, auto.unwrap_or(false))? {
+        CheckApply::Changed => host::save_networks(path.to_str().unwrap(), &current)?,
+        CheckApply::Unchanged | CheckApply::KeptOffline => {}
+    }
+    Ok(current)
 }
 
 #[tauri::command]
@@ -741,7 +777,14 @@ fn health_history_record(network: String, entries: Vec<HealthEntry>) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let cutoff = now.saturating_sub(HEALTH_RETENTION_DAYS * 86400);
+    // Retention comes from Settings (monitoring.history_days). 0 keeps everything.
+    let retention_days: u64 = host::load_config(get_config_dir().join("config.toml").to_str().unwrap())
+        .ok()
+        .and_then(|c| c.monitoring)
+        .and_then(|m| m.history_days)
+        .map(|d| d as u64)
+        .unwrap_or(HEALTH_RETENTION_DAYS);
+    let cutoff = if retention_days == 0 { 0 } else { now.saturating_sub(retention_days * 86400) };
     let path = health_history_path();
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 

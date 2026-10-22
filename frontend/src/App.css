@@ -1503,3 +1503,22 @@ html, body, #root {
   letter-spacing: 1px;
   opacity: 0.75;
 }
+
+/* MONITORING */
+.auto-check-status { display: inline-flex; align-items: center; gap: 8px; }
+.auto-check-label { opacity: 0.75; }
+.btn-auto-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text3);
+  font-size: 0.68rem;
+  padding: 1px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.btn-auto-toggle:hover { color: var(--accent); border-color: var(--accent); }
+.settings-hint {
+  font-size: 0.68rem;
+  color: var(--text3);
+  margin: -2px 0 10px;
+}

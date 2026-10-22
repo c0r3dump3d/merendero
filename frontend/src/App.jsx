@@ -207,6 +207,12 @@ function aiReady(ai) {
   return !!ai.api_key || ai.provider === "ollama" || ai.provider === "custom";
 }
 
+function clampInt(value, min, max, fallback) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
 function SettingsModal({ config, onSave, onClose }) {
   const [form, setForm] = useState({
     username: config?.defaults?.username || "root",
@@ -218,6 +224,8 @@ function SettingsModal({ config, onSave, onClose }) {
     ai_api_url: config?.ai?.api_url || "https://api.anthropic.com/v1/messages",
     ai_api_key: config?.ai?.api_key || "",
     ai_model: config?.ai?.model || "claude-haiku-4-5",
+    check_interval: config?.monitoring?.check_interval_minutes?.toString() ?? "15",
+    history_days: config?.monitoring?.history_days?.toString() ?? "90",
   });
 
   const [backupMsg, setBackupMsg] = useState(null);
@@ -292,6 +300,10 @@ function SettingsModal({ config, onSave, onClose }) {
         api_key: form.ai_provider === "ollama" ? null : (form.ai_api_key || null),
         model: form.ai_model || null,
       } : null,
+      monitoring: {
+        check_interval_minutes: clampInt(form.check_interval, 0, 1440, 15),
+        history_days: clampInt(form.history_days, 0, 3650, 90),
+      },
     });
     onClose();
   }
@@ -307,6 +319,11 @@ function SettingsModal({ config, onSave, onClose }) {
         <div className="form-group"><label>DNS server (for reverse lookup)</label><input name="dns_server" value={form.dns_server} onChange={handleChange} placeholder="10.0.0.1" /></div>
         <div className="form-group"><label>Terminal emulator</label><input name="terminal" value={form.terminal} onChange={handleChange} placeholder="terminator" /></div>
         <div className="form-group"><label>Default identity file (SSH key)</label><input name="identity_file" value={form.identity_file} onChange={handleChange} placeholder="~/.ssh/id_rsa" /></div>
+
+        <div className="settings-section">Monitoring</div>
+        <div className="form-group"><label>Check hosts automatically every (minutes, 0 = off)</label><input name="check_interval" value={form.check_interval} onChange={handleChange} placeholder="15" type="number" min="0" max="1440" /></div>
+        <div className="form-group"><label>Keep health history for (days, 0 = forever)</label><input name="history_days" value={form.history_days} onChange={handleChange} placeholder="90" type="number" min="0" max="3650" /></div>
+        <div className="settings-hint">Automatic checks only run while Merendero is open. A shorter history is applied the next time a health check is saved.</div>
 
         <div className="settings-section">AI analysis (optional)</div>
         <div className="form-group">
@@ -1571,10 +1588,71 @@ function App() {
   const [healthModal, setHealthModal] = useState(null);
   const [history, setHistory] = useState([]);
   const [showHistory, setShowHistory] = useState(false);
+  const [autoChecking, setAutoChecking] = useState(false);
+  const [lastAutoCheck, setLastAutoCheck] = useState(null);
+  const [autoPaused, setAutoPaused] = useState(false);
+  const autoCheckBusyRef = useRef(false);
+  const autoStateRef = useRef({});
 
   useEffect(() => { loadData(); loadHistory(); }, []);
   useEffect(() => { invoke("app_version").then(setAppVersion).catch(() => {}); }, []);
   useEffect(() => { setSelectedHosts(new Set()); }, [selectedNetwork]);
+
+  // Automatic availability check: every N minutes, only while the app is open.
+  // It never runs while a dialog is open or another operation is in progress.
+  const checkMinutes = config?.monitoring?.check_interval_minutes ?? 15;
+  const configReady = !!config;
+  const modalOpen = !!(networkModal || hostModal || showTagModal || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal);
+  autoStateRef.current = { networks, config, paused: autoPaused, busy: scanning || checking || broadcasting || modalOpen };
+
+  async function runAutoCheck() {
+    const first = autoStateRef.current;
+    if (autoCheckBusyRef.current || !first.config || first.networks.length === 0) return "skip";
+    if (first.busy || first.paused) return "busy";
+    autoCheckBusyRef.current = true;
+    setAutoChecking(true);
+    try {
+      for (let i = 0; i < first.networks.length; i++) {
+        const cur = autoStateRef.current;
+        if (cur.busy || cur.paused) return "busy";
+        const updated = await invoke("check_hosts", { networksFile: { networks: cur.networks }, networkIndex: i, defaults: cur.config.defaults, auto: true });
+        setNetworks(updated.networks);
+      }
+      setLastAutoCheck(new Date());
+      return "done";
+    } catch (e) {
+      console.error("Automatic check failed:", e);
+      return "done";
+    } finally {
+      autoCheckBusyRef.current = false;
+      setAutoChecking(false);
+    }
+  }
+
+  useEffect(() => {
+    if (loading || !configReady || checkMinutes <= 0 || autoPaused) return;
+    let cancelled = false;
+    let timer = null;
+    const tick = async () => {
+      if (cancelled) return;
+      const outcome = await runAutoCheck();
+      if (!cancelled) timer = setTimeout(tick, outcome === "busy" ? 60 * 1000 : checkMinutes * 60 * 1000);
+    };
+    timer = setTimeout(tick, 10 * 1000);
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, configReady, checkMinutes, autoPaused]);
+
+  const lastAutoCheckText = lastAutoCheck ? lastAutoCheck.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+  const autoCheckLabel = checkMinutes <= 0
+    ? "Auto-check off"
+    : autoPaused
+      ? `Auto-check paused${lastAutoCheckText ? ` · last ${lastAutoCheckText}` : ""}`
+      : autoChecking
+        ? "Auto-check running…"
+        : lastAutoCheckText
+          ? `Auto-check every ${checkMinutes} min · last ${lastAutoCheckText}`
+          : `Auto-check every ${checkMinutes} min`;
 
   async function loadData() {
     try {
@@ -1676,7 +1754,7 @@ function App() {
   }
 
   async function handleScan() {
-    if (selectedNetwork === null || scanning) return;
+    if (selectedNetwork === null || scanning || autoChecking) return;
     setScanning(true);
     setScanProgress({ total: 0, current: 0 });
     const unlisten = await listen("scan-progress", e => setScanProgress(e.payload));
@@ -1688,7 +1766,7 @@ function App() {
   }
 
   async function handleCheck() {
-    if (selectedNetwork === null || checking) return;
+    if (selectedNetwork === null || checking || autoChecking) return;
     setChecking(true);
     setCheckProgress({ total: 0, current: 0 });
     const unlisten = await listen("check-progress", e => setCheckProgress(e.payload));
@@ -1732,6 +1810,7 @@ function App() {
       });
     } catch (e) { ok = false; detail = String(e); alert("Broadcast failed: " + e); }
     finally { setBroadcasting(false); }
+    if (ok) setSelectedHosts(new Set());
     invoke("audit_event", { action: "broadcast", network: network.name, hosts: targets.map(h => h.ip), detail, success: ok }).catch(() => {});
   }
 
@@ -1830,8 +1909,8 @@ function App() {
                 <button className="btn-add-network-main" onClick={() => setNetworkModal({ network: null, index: undefined })}>+ Network</button>
                 {globalMode && <button className="btn-clear" onClick={() => setFilter("")}>✕ Clear search</button>}
                 {!globalMode && <button className="btn-add-host" onClick={() => setHostModal({ host: null })}>+ Host</button>}
-                {!globalMode && <button className="btn-check" onClick={handleCheck} disabled={checking || scanning}>{checking ? "Checking..." : "✓ Check"}</button>}
-                {!globalMode && <button className={`btn-scan ${scanning ? "scanning" : ""}`} onClick={handleScan} disabled={scanning || checking}>{scanning ? "Scanning..." : "⟳ Scan"}</button>}
+                {!globalMode && <button className="btn-check" onClick={handleCheck} disabled={checking || scanning || autoChecking}>{checking ? "Checking..." : "✓ Check"}</button>}
+                {!globalMode && <button className={`btn-scan ${scanning ? "scanning" : ""}`} onClick={handleScan} disabled={scanning || checking || autoChecking}>{scanning ? "Scanning..." : "⟳ Scan"}</button>}
               </div>
             </div>
 
@@ -1924,6 +2003,10 @@ function App() {
 
             <div className="main-footer">
               <span>{filteredHosts.length} hosts{filter ? ` (filtered)` : ""}</span>
+              <span className="auto-check-status">
+                <span className="auto-check-label">{autoCheckLabel}</span>
+                {checkMinutes > 0 && <button className="btn-auto-toggle" onClick={() => setAutoPaused(p => !p)} title={autoPaused ? "Resume automatic checks" : "Pause automatic checks until you close Merendero (Settings: 0 turns them off for good)"}>{autoPaused ? "Resume" : "Pause"}</button>}
+              </span>
               {selectedHosts.size > 0 && <span className="footer-selected">{selectedHosts.size} selected</span>}
             </div>
 </>

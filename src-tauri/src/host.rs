@@ -52,6 +52,7 @@ pub fn default_config() -> Config {
             terminal: None,
         },
         ai: None,
+        monitoring: None,
     }
 }
 
@@ -152,7 +153,14 @@ pub struct AiConfig {
 }
 
 #[derive(Deserialize, Serialize, Clone)]
+pub struct MonitoringConfig {
+    pub check_interval_minutes: Option<u32>,
+    pub history_days: Option<u32>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 pub struct Config {
     pub defaults: Defaults,
     pub ai: Option<AiConfig>,
+    pub monitoring: Option<MonitoringConfig>,
 }
