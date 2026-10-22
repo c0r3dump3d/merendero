@@ -1495,3 +1495,11 @@ html, body, #root {
 .cmd-result-state { font-size: 0.72rem; }
 .cmd-result-state.ok { color: var(--green); }
 .cmd-result-state.bad { color: var(--red); }
+
+/* VERSION */
+.sidebar-version {
+  font-size: 0.62rem;
+  color: var(--text3);
+  letter-spacing: 1px;
+  opacity: 0.75;
+}

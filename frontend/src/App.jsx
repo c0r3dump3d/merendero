@@ -1548,6 +1548,7 @@ function BroadcastConfirmModal({ hosts, network, config, onConfirm, onClose }) {
 function App() {
   const [networks, setNetworks] = useState([]);
   const [config, setConfig] = useState(null);
+  const [appVersion, setAppVersion] = useState("");
   const [selectedNetwork, setSelectedNetwork] = useState(null);
   const [networkScoped, setNetworkScoped] = useState(false);
   const [filter, setFilter] = useState("");
@@ -1572,6 +1573,7 @@ function App() {
   const [showHistory, setShowHistory] = useState(false);
 
   useEffect(() => { loadData(); loadHistory(); }, []);
+  useEffect(() => { invoke("app_version").then(setAppVersion).catch(() => {}); }, []);
   useEffect(() => { setSelectedHosts(new Set()); }, [selectedNetwork]);
 
   async function loadData() {
@@ -1785,6 +1787,7 @@ function App() {
         <div className="sidebar-header">
           <h2>Merendero</h2>
           <span className="sidebar-tagline">// manage your systems</span>
+          {appVersion && <span className="sidebar-version" title="Merendero version">v{appVersion}</span>}
           
         </div>
         <div className="network-list">

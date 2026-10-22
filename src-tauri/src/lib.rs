@@ -821,6 +821,11 @@ fn get_health_history(network: String, ip: String, limit: usize) -> Vec<serde_js
 }
 
 #[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
 fn audit_event(action: String, network: String, hosts: Vec<String>, detail: String, success: bool) {
     let entries: Vec<serde_json::Value> = hosts
         .into_iter()
@@ -1385,6 +1390,7 @@ pub fn run() {
             export_backup,
             import_backup,
             ai_fleet_summary,
+            app_version,
             ai_suggest_command,
             health_history_record,
             get_health_history,
