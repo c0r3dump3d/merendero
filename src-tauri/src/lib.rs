@@ -136,21 +136,129 @@ fn get_history() -> host::History {
     host::load_history(path.to_str().unwrap())
 }
 
+// ---------------------------------------------------------------------------------------
+// Programs and terminals
+// ---------------------------------------------------------------------------------------
+
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    p.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+// Directories where programs are looked for: the PATH this process inherited (the user's PATH)
+// first, then well-known directories that a desktop session often leaves out.
+fn user_path() -> String {
+    let mut dirs: Vec<String> = std::env::var("PATH").unwrap_or_default()
+        .split(':').filter(|d| !d.is_empty()).map(String::from).collect();
+    let mut extra: Vec<String> = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin", "/run/current-system/sw/bin", "/snap/bin"]
+        .iter().map(|s| s.to_string()).collect();
+    if let Some(home) = dirs::home_dir() {
+        for rel in [".local/bin", ".cargo/bin", ".nix-profile/bin", ".guix-profile/bin"] {
+            extra.push(home.join(rel).to_string_lossy().into_owned());
+        }
+    }
+    for d in extra {
+        if !dirs.contains(&d) { dirs.push(d); }
+    }
+    dirs.join(":")
+}
+
+// Finds a program by name in user_path(). A name with a '/' (or starting with "~/") is used as given.
+fn find_program(name: &str) -> Option<std::path::PathBuf> {
+    let name = name.trim();
+    if name.is_empty() { return None; }
+    if name.contains('/') || name.starts_with('~') {
+        let p = match name.strip_prefix("~/") {
+            Some(rest) => dirs::home_dir()?.join(rest),
+            None => std::path::PathBuf::from(name),
+        };
+        return if is_executable_file(&p) { Some(p) } else { None };
+    }
+    user_path().split(':').map(|d| std::path::Path::new(d).join(name)).find(|p| is_executable_file(p))
+}
+
+// Path to use when spawning a program. If it cannot be found, the bare name is returned so that
+// the error that follows names the missing program.
+fn program(name: &str) -> String {
+    find_program(name).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| name.to_string())
+}
+
+// Quotes a string for a POSIX shell. Strings made only of safe characters stay as they are.
+fn sh_quote(s: &str) -> String {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c)) {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[derive(Clone, Copy)]
+enum LaunchStyle {
+    ETextString, // terminal -e "<command as one string>"
+    EShC,        // terminal -e sh -c <command>
+    ShC,         // terminal sh -c <command>
+    DashDashShC, // terminal -- sh -c <command>
+    XShC,        // terminal -x sh -c <command>
+}
+
+struct TerminalRecipe {
+    id: &'static str,
+    style: LaunchStyle,
+    maximize: &'static [&'static str],
+}
+
+// How to start each known terminal with a command. Every form below was checked against the real
+// terminal (the program receives the command as a single argument, quotes included), and so was
+// every maximize option (the window ends up covering the screen).
+const TERMINALS: &[TerminalRecipe] = &[
+    TerminalRecipe { id: "terminator", style: LaunchStyle::ETextString, maximize: &["--maximise"] },
+    TerminalRecipe { id: "alacritty", style: LaunchStyle::EShC, maximize: &["-o", "window.startup_mode=\"Maximized\""] },
+    TerminalRecipe { id: "kitty", style: LaunchStyle::ShC, maximize: &["--start-as=maximized"] },
+    TerminalRecipe { id: "foot", style: LaunchStyle::ShC, maximize: &[] },
+    TerminalRecipe { id: "gnome-terminal", style: LaunchStyle::DashDashShC, maximize: &["--maximize"] },
+    TerminalRecipe { id: "mate-terminal", style: LaunchStyle::DashDashShC, maximize: &["--maximize"] },
+    TerminalRecipe { id: "xfce4-terminal", style: LaunchStyle::XShC, maximize: &["--maximize"] },
+    TerminalRecipe { id: "tilix", style: LaunchStyle::EShC, maximize: &["--maximize"] },
+    TerminalRecipe { id: "konsole", style: LaunchStyle::EShC, maximize: &[] },
+    TerminalRecipe { id: "qterminal", style: LaunchStyle::EShC, maximize: &[] },
+    TerminalRecipe { id: "xterm", style: LaunchStyle::EShC, maximize: &["-maximized"] },
+    TerminalRecipe { id: "lxterminal", style: LaunchStyle::EShC, maximize: &[] },
+    TerminalRecipe { id: "urxvt", style: LaunchStyle::EShC, maximize: &[] },
+    TerminalRecipe { id: "sakura", style: LaunchStyle::ETextString, maximize: &[] },
+];
+
+// Builds the command that opens `terminal` (a name or a path; terminator if empty) running
+// `shell_cmd`. A terminal that is not in the table is started with -e "<command>".
+fn terminal_command(terminal: Option<&str>, shell_cmd: &str, maximize: bool) -> Result<std::process::Command, String> {
+    let name = terminal.map(str::trim).filter(|t| !t.is_empty()).unwrap_or("terminator");
+    let base = std::path::Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
+    let recipe = TERMINALS.iter().find(|r| r.id == base);
+    let bin = find_program(name).ok_or_else(|| format!("Terminal '{}' not found. Choose another one in Settings", name))?;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.env("PATH", user_path());
+    if maximize {
+        if let Some(r) = recipe { cmd.args(r.maximize); }
+    }
+    match recipe.map(|r| r.style).unwrap_or(LaunchStyle::ETextString) {
+        LaunchStyle::ETextString => { cmd.args(["-e", shell_cmd]); }
+        LaunchStyle::EShC => { cmd.args(["-e", "sh", "-c", shell_cmd]); }
+        LaunchStyle::ShC => { cmd.args(["sh", "-c", shell_cmd]); }
+        LaunchStyle::DashDashShC => { cmd.args(["--", "sh", "-c", shell_cmd]); }
+        LaunchStyle::XShC => { cmd.args(["-x", "sh", "-c", shell_cmd]); }
+    }
+    Ok(cmd)
+}
+
 fn launch_ssh_inner(ip: String, username: String, port: u16, terminal: Option<String>, hostname: Option<String>, network_name: Option<String>, identity_file: Option<String>, post_connect: Option<String>) -> Result<(), String> {
-    let identity_arg = identity_file
-        .map(|f| format!(" -i {}", f))
-        .unwrap_or_default();
-    let ssh_cmd = match post_connect {
-        Some(cmd) => format!("/usr/bin/ssh -t -p {}{} {}@{} '{}'", port, identity_arg, username, ip, cmd),
-        None => format!("/usr/bin/ssh -p {}{} {}@{}", port, identity_arg, username, ip),
+    let ssh = sh_quote(&program("ssh"));
+    let identity_arg = identity_file.as_deref().map(str::trim).filter(|f| !f.is_empty())
+        .map(|f| format!(" -i {}", sh_quote(f))).unwrap_or_default();
+    let target = sh_quote(&format!("{}@{}", username, ip));
+    let ssh_cmd = match post_connect.as_deref().filter(|c| !c.trim().is_empty()) {
+        Some(cmd) => format!("{} -t -p {}{} {} {}", ssh, port, identity_arg, target, sh_quote(cmd)),
+        None => format!("{} -p {}{} {}", ssh, port, identity_arg, target),
     };
-    let preferred = terminal.as_deref().unwrap_or("terminator");
-    let result = match preferred {
-        "terminator" => std::process::Command::new("/usr/bin/terminator").env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin").args(["-e", &ssh_cmd]).spawn(),
-        "alacritty" => std::process::Command::new("/usr/bin/alacritty").env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin").args(["-e", "bash", "-c", &ssh_cmd]).spawn(),
-        "kitty" => std::process::Command::new("/usr/bin/kitty").env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin").args(["bash", "-c", &ssh_cmd]).spawn(),
-        _ => std::process::Command::new(preferred).env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin").args(["-e", &ssh_cmd]).spawn(),
-    };
+    let result = terminal_command(terminal.as_deref(), &ssh_cmd, false)
+        .and_then(|mut c| c.spawn().map_err(|e| format!("Failed to launch terminal: {}", e)));
     // guarda en historial
     if result.is_ok() {
         let path = get_config_dir().join("history.toml");
@@ -169,7 +277,7 @@ fn launch_ssh_inner(ip: String, username: String, port: u16, terminal: Option<St
         });
         let _ = host::save_history(path.to_str().unwrap(), &history);
     }
-    result.map(|_| ()).map_err(|e| format!("Failed to launch terminal: {}", e))
+    result.map(|_| ())
 }
 
 async fn calibrate_timeout(network: &host::Network, defaults: &Defaults) -> u64 {
@@ -415,7 +523,7 @@ async fn list_remote_dir(
     // ls -la con formato parseable
     args.push(format!("for f in {}/* {}/.*; do [ -e \"$f\" ] || continue; n=$(basename \"$f\"); [ \"$n\" = \".\" ] || [ \"$n\" = \"..\" ] && continue; if [ -d \"$f\" ]; then echo \"d:$n\"; else echo \"f:$n\"; fi; done 2>/dev/null", path, path));
 
-    let output = Command::new("/usr/bin/ssh")
+    let output = Command::new(program("ssh")).env("PATH", user_path())
         .args(&args)
         .output()
         .await
@@ -488,8 +596,8 @@ fn run_scp_inner(
         args.push(local_path);
     }
 
-    let output = std::process::Command::new("/usr/bin/scp")
-        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin")
+    let output = std::process::Command::new(program("scp"))
+        .env("PATH", user_path())
         .args(&args)
         .output()
         .map_err(|e| format!("Failed to run scp: {}", e))?;
@@ -545,8 +653,8 @@ async fn run_scp_broadcast_inner(
                 args.push(local);
             }
 
-            let output = Command::new("/usr/bin/scp")
-                .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin")
+            let output = Command::new(program("scp"))
+                .env("PATH", user_path())
                 .args(&args)
                 .output()
                 .await;
@@ -998,7 +1106,7 @@ async fn run_command_inner(
             args.push(format!("{}@{}", username, ip));
             args.push(cmd);
 
-            let output = Command::new("/usr/bin/ssh")
+            let output = Command::new(program("ssh")).env("PATH", user_path())
                 .args(&args)
                 .output()
                 .await;
@@ -1091,7 +1199,7 @@ echo "=== END ==="
     let mut args = base_args.clone();
     args.push(script.to_string());
 
-    let output = Command::new("/usr/bin/ssh")
+    let output = Command::new(program("ssh")).env("PATH", user_path())
         .args(&args)
         .output()
         .await
@@ -1392,18 +1500,41 @@ async fn check_hosts_reachable(
 #[tauri::command]
 fn launch_broadcast(hosts: Vec<host::Host>, network: host::Network, defaults: Defaults, session_name: String) -> Result<(), String> {
     if hosts.is_empty() { return Err(String::from("No hosts selected")); }
-    std::process::Command::new("tmux").args(["kill-session", "-t", &session_name]).output().ok();
-    let first_ssh = format!("/usr/bin/ssh -p {} {}@{}", host::resolve_port(&hosts[0], &network, &defaults), host::resolve_username(&hosts[0], &network, &defaults), hosts[0].ip);
-    std::process::Command::new("tmux").env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin").args(["new-session", "-d", "-s", &session_name, "-x", "220", "-y", "50", &first_ssh]).status().map_err(|e| format!("Failed to create tmux session: {}", e))?;
-    for host in hosts.iter().skip(1) {
-        let ssh_cmd = format!("/usr/bin/ssh -p {} {}@{}", host::resolve_port(host, &network, &defaults), host::resolve_username(host, &network, &defaults), host.ip);
-        std::process::Command::new("tmux").env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin").args(["split-window", "-t", &session_name, "-v", &ssh_cmd]).status().ok();
-        std::process::Command::new("tmux").args(["select-layout", "-t", &session_name, "tiled"]).status().ok();
+    let tmux = program("tmux");
+    let run_tmux = |args: &[&str]| std::process::Command::new(&tmux).env("PATH", user_path()).args(args).output();
+    let ssh = sh_quote(&program("ssh"));
+    // Same SSH key rules as a single session: the host's key, then the network's, then the global default
+    let pane_cmd = |h: &host::Host| -> String {
+        let key = h.identity_file.clone().or(network.identity_file.clone()).or(defaults.identity_file.clone())
+            .filter(|f| !f.trim().is_empty());
+        let ident = key.map(|f| format!(" -i {}", sh_quote(f.trim()))).unwrap_or_default();
+        let target = sh_quote(&format!("{}@{}", host::resolve_username(h, &network, &defaults), h.ip));
+        format!("{} -p {}{} {}", ssh, host::resolve_port(h, &network, &defaults), ident, target)
+    };
+    let _ = run_tmux(&["kill-session", "-t", &session_name]);
+    let out = run_tmux(&["new-session", "-d", "-s", &session_name, "-x", "220", "-y", "50", &pane_cmd(&hosts[0])])
+        .map_err(|e| format!("Failed to run tmux: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("tmux could not create the session: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
-    std::process::Command::new("tmux").args(["set-window-option", "-t", &session_name, "synchronize-panes", "on"]).status().ok();
-    let attach_cmd = format!("/usr/bin/tmux attach-session -t {}", session_name);
-    std::process::Command::new("/usr/bin/terminator").env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin").args(["-e", &attach_cmd]).spawn().map_err(|e| format!("Failed to launch terminal: {}", e))?;
-    Ok(())
+    for (i, h) in hosts.iter().enumerate().skip(1) {
+        let out = run_tmux(&["split-window", "-t", &session_name, "-v", &pane_cmd(h)])
+            .map_err(|e| format!("Failed to run tmux: {}", e))?;
+        if !out.status.success() {
+            let _ = run_tmux(&["kill-session", "-t", &session_name]);
+            return Err(format!("tmux has no room for more panes: only {} of {} hosts fit. Select fewer hosts", i, hosts.len()));
+        }
+        let _ = run_tmux(&["select-layout", "-t", &session_name, "tiled"]);
+    }
+    let _ = run_tmux(&["set-window-option", "-t", &session_name, "synchronize-panes", "on"]);
+    let attach = format!("{} attach-session -t {}", sh_quote(&tmux), sh_quote(&session_name));
+    // With several hosts the panes get small, so the terminal opens maximized when it can
+    let launched = terminal_command(defaults.terminal.as_deref(), &attach, hosts.len() >= 4)
+        .and_then(|mut c| c.spawn().map(|_| ()).map_err(|e| format!("Failed to launch terminal: {}", e)));
+    if launched.is_err() {
+        let _ = run_tmux(&["kill-session", "-t", &session_name]);
+    }
+    launched
 }
 
 pub fn run() {
