@@ -4,6 +4,14 @@ All notable changes to Merendero are documented here.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-23
+
+Thanks again to [@jvir](https://github.com/jvir), who found and reported both issues fixed in this release.
+
+### Security
+- The remote file browser (used to pick an SCP destination) passed the directory path into a shell command run on the remote host without quoting it. A folder named with shell command-substitution syntax could have that part executed on the remote server the moment you browsed into it. The path is now quoted before it reaches the shell
+- ssh and scp received the destination (`user@host`) as a plain, unquoted argument. A username starting with `-` — for example one coming from an imported backup — could be read by ssh or scp as an option instead of as the destination. Every ssh/scp invocation (interactive SSH, Run cmd, health check, SCP upload/download, broadcast) now puts `--` before the destination, so it is always read as the destination regardless of its content
+
 ## [0.1.5] - 2026-10-23
 
 Thanks to [@jvir](https://github.com/jvir) and [@jackychan2](https://github.com/jackychan2), who took the time to test Merendero and found the problems fixed in this release.
