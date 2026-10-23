@@ -16,6 +16,72 @@ function validateCidr(value) {
   return null;
 }
 
+function TerminalSelect({ value, onChange }) {
+  const [terminals, setTerminals] = useState(null);
+  const [autoId, setAutoId] = useState(null);
+  const [otherMode, setOtherMode] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    Promise.all([invoke("list_terminals"), invoke("default_terminal")])
+      .then(([list, def]) => {
+        if (!alive) return;
+        setTerminals([...(list || [])].sort((a, b) => a.id.localeCompare(b.id)));
+        setAutoId(def || null);
+      })
+      .catch(() => { if (alive) { setTerminals([]); setAutoId(null); } });
+    return () => { alive = false; };
+  }, []);
+  const current = value || "auto";
+  const detected = terminals || [];
+  const known = current === "auto" || detected.some(t => t.id === current);
+  const showOther = otherMode || (terminals !== null && !known);
+  function handleSelect(e) {
+    const picked = e.target.value;
+    if (picked === "__other__") {
+      setOtherMode(true);
+      if (known) onChange({ target: { name: "terminal", value: "" } });
+    } else {
+      setOtherMode(false);
+      onChange({ target: { name: "terminal", value: picked } });
+    }
+  }
+  const effective = detected.find(t => t.id === (current === "auto" ? autoId : current));
+  return (
+    <>
+      <select value={showOther ? "__other__" : current} onChange={handleSelect} className="form-select" disabled={terminals === null}>
+        <option value="auto">{`Automatic (${autoId || "none found"})`}</option>
+        {detected.map(t => <option key={t.id} value={t.id}>{t.id}</option>)}
+        <option value="__other__">Other…</option>
+      </select>
+      {showOther && <input name="terminal" value={value || ""} onChange={onChange} placeholder="name or full path, e.g. /opt/term/bin/kitty" />}
+      {terminals !== null && detected.length === 0 && <div className="key-hint">No supported terminal found. Install one, or use Other…</div>}
+      {effective && !effective.maximize && <div className="settings-hint">Broadcast windows open at this terminal's normal size.</div>}
+    </>
+  );
+}
+
+function TerminalPromptModal({ terminals, autoId, onChoose }) {
+  const [choice, setChoice] = useState(autoId || (terminals[0] && terminals[0].id) || "");
+  return (
+    <div className="modal-overlay">
+      <div className="modal">
+        <h3>Which terminal do you use?</h3>
+        <div className="settings-hint">Merendero opens SSH sessions and broadcasts in a terminal, and it found {terminals.length} on this system. You can change this later in Settings.</div>
+        <div className="form-group">
+          <label>Terminal emulator</label>
+          <select value={choice} onChange={e => setChoice(e.target.value)} className="form-select">
+            {terminals.map(t => <option key={t.id} value={t.id}>{t.id}</option>)}
+          </select>
+        </div>
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={() => onChoose("auto")}>Keep automatic{autoId ? ` (${autoId})` : ""}</button>
+          <button className="btn-primary" onClick={() => onChoose(choice)}>Use this one</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function KeyFileField({ name, value, onChange }) {
   const [hint, setHint] = useState("");
   async function browse() {
@@ -343,7 +409,7 @@ function SettingsModal({ config, onSave, onClose }) {
         <div className="form-group"><label>Default username</label><input name="username" value={form.username} onChange={handleChange} placeholder="root" /></div>
         <div className="form-group"><label>Default port</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
         <div className="form-group"><label>DNS server (for reverse lookup)</label><input name="dns_server" value={form.dns_server} onChange={handleChange} placeholder="10.0.0.1" /></div>
-        <div className="form-group"><label>Terminal emulator</label><input name="terminal" value={form.terminal} onChange={handleChange} placeholder="terminator" /></div>
+        <div className="form-group"><label>Terminal emulator</label><TerminalSelect value={form.terminal} onChange={handleChange} /></div>
         <div className="form-group"><label>Default identity file (SSH key)</label><KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} /></div>
 
         <div className="settings-section">Monitoring</div>
@@ -1617,18 +1683,32 @@ function App() {
   const [autoChecking, setAutoChecking] = useState(false);
   const [lastAutoCheck, setLastAutoCheck] = useState(null);
   const [autoPaused, setAutoPaused] = useState(false);
+  const [terminalPrompt, setTerminalPrompt] = useState(null);
+  const terminalPromptChecked = useRef(false);
   const autoCheckBusyRef = useRef(false);
   const autoStateRef = useRef({});
 
   useEffect(() => { loadData(); loadHistory(); }, []);
   useEffect(() => { invoke("app_version").then(setAppVersion).catch(() => {}); }, []);
+
+  // First run: if no terminal has been chosen and there are several installed, ask once which to use.
+  useEffect(() => {
+    if (loading || !config || terminalPromptChecked.current) return;
+    terminalPromptChecked.current = true;
+    if (config.defaults && config.defaults.terminal) return;
+    Promise.all([invoke("list_terminals"), invoke("default_terminal")])
+      .then(([list, def]) => {
+        if (list && list.length >= 2) setTerminalPrompt({ terminals: [...list].sort((a, b) => a.id.localeCompare(b.id)), autoId: def || null });
+      })
+      .catch(() => {});
+  }, [loading, config]);
   useEffect(() => { setSelectedHosts(new Set()); }, [selectedNetwork]);
 
   // Automatic availability check: every N minutes, only while the app is open.
   // It never runs while a dialog is open or another operation is in progress.
   const checkMinutes = config?.monitoring?.check_interval_minutes ?? 15;
   const configReady = !!config;
-  const modalOpen = !!(networkModal || hostModal || showTagModal || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal);
+  const modalOpen = !!(networkModal || hostModal || showTagModal || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal || terminalPrompt);
   autoStateRef.current = { networks, config, paused: autoPaused, busy: scanning || checking || broadcasting || modalOpen };
 
   async function runAutoCheck() {
@@ -1885,6 +1965,7 @@ function App() {
       {showScpBroadcast && <ScpBroadcastModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowScpBroadcast(false)} />}
       {showRunCommand && <RunCommandModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowRunCommand(false)} />}
       {showSettings && <SettingsModal config={config} onSave={handleSaveSettings} onClose={() => setShowSettings(false)} />}
+      {terminalPrompt && <TerminalPromptModal terminals={terminalPrompt.terminals} autoId={terminalPrompt.autoId} onChoose={async (v) => { setTerminalPrompt(null); await handleSaveSettings({ ...config, defaults: { ...config.defaults, terminal: v } }); }} />}
       {hostModal && <HostModal host={hostModal.host} networks={networks} defaultNetworkIndex={selectedNetwork ?? 0} onSave={handleSaveHost} onClose={() => setHostModal(null)} onHealthCheck={(h) => { setHostModal(null); setHealthModal(h); }} />}
       {showTagModal && <TagModal count={selectedHosts.size} onApply={handleBulkTag} onClose={() => setShowTagModal(false)} />}
 

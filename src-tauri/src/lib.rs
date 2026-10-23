@@ -226,10 +226,11 @@ const TERMINALS: &[TerminalRecipe] = &[
     TerminalRecipe { id: "sakura", style: LaunchStyle::ETextString, maximize: &[] },
 ];
 
-// Builds the command that opens `terminal` (a name or a path; terminator if empty) running
+// Builds the command that opens `terminal` (a name or a path; the automatic choice if empty or "auto") running
 // `shell_cmd`. A terminal that is not in the table is started with -e "<command>".
 fn terminal_command(terminal: Option<&str>, shell_cmd: &str, maximize: bool) -> Result<std::process::Command, String> {
-    let name = terminal.map(str::trim).filter(|t| !t.is_empty()).unwrap_or("terminator");
+    let name_owned = resolve_terminal_name(terminal, auto_terminal)?;
+    let name = name_owned.as_str();
     let base = std::path::Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
     let recipe = TERMINALS.iter().find(|r| r.id == base);
     let bin = find_program(name).ok_or_else(|| format!("Terminal '{}' not found. Choose another one in Settings", name))?;
@@ -246,6 +247,73 @@ fn terminal_command(terminal: Option<&str>, shell_cmd: &str, maximize: bool) -> 
         LaunchStyle::XShC => { cmd.args(["-x", "sh", "-c", shell_cmd]); }
     }
     Ok(cmd)
+}
+
+// ---------------------------------------------------------------------------------------
+// Terminal choice
+// ---------------------------------------------------------------------------------------
+
+// The terminals to try, in order, when none is chosen (or "auto" is). terminator comes first
+// because it was always the default; then the one that belongs to the user's desktop; then the rest.
+fn auto_order_for(desktop: &str) -> Vec<&'static str> {
+    let mut order: Vec<&'static str> = vec!["terminator"];
+    for part in desktop.to_lowercase().split(':') {
+        let own = match part.trim() {
+            "gnome" | "x-cinnamon" | "budgie" | "unity" => Some("gnome-terminal"),
+            "kde" => Some("konsole"),
+            "xfce" => Some("xfce4-terminal"),
+            "mate" => Some("mate-terminal"),
+            "lxqt" => Some("qterminal"),
+            "lxde" => Some("lxterminal"),
+            _ => None,
+        };
+        if let Some(t) = own {
+            if !order.contains(&t) { order.push(t); }
+        }
+    }
+    for t in ["tilix", "alacritty", "kitty", "gnome-terminal", "konsole", "xfce4-terminal", "mate-terminal", "lxterminal", "qterminal", "xterm", "urxvt", "sakura", "foot"] {
+        if !order.contains(&t) { order.push(t); }
+    }
+    order
+}
+
+fn pick_auto(desktop: &str, installed: impl Fn(&str) -> bool) -> Option<String> {
+    auto_order_for(desktop).into_iter().find(|t| installed(t)).map(String::from)
+}
+
+// What "automatic" resolves to on this system right now.
+fn auto_terminal() -> Option<String> {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    pick_auto(&desktop, |t| find_program(t).is_some())
+}
+
+// The terminal to use: the one chosen, or the automatic choice when none is chosen (or it is "auto").
+fn resolve_terminal_name(chosen: Option<&str>, auto: impl FnOnce() -> Option<String>) -> Result<String, String> {
+    match chosen.map(str::trim).filter(|t| !t.is_empty() && *t != "auto") {
+        Some(name) => Ok(name.to_string()),
+        None => auto().ok_or_else(|| String::from("No supported terminal emulator found. Install one (for example xterm or gnome-terminal) or set another in Settings")),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct TerminalInfo {
+    id: String,
+    path: String,
+    maximize: bool,
+}
+
+// The known terminals that are installed, for the picker in Settings.
+#[tauri::command]
+fn list_terminals() -> Vec<TerminalInfo> {
+    TERMINALS.iter().filter_map(|r| {
+        find_program(r.id).map(|p| TerminalInfo { id: r.id.to_string(), path: p.to_string_lossy().into_owned(), maximize: !r.maximize.is_empty() })
+    }).collect()
+}
+
+// What "automatic" resolves to, to show it in Settings.
+#[tauri::command]
+fn default_terminal() -> Option<String> {
+    auto_terminal()
 }
 
 fn launch_ssh_inner(ip: String, username: String, port: u16, terminal: Option<String>, hostname: Option<String>, network_name: Option<String>, identity_file: Option<String>, post_connect: Option<String>) -> Result<(), String> {
@@ -1602,6 +1670,8 @@ pub fn run() {
             ai_fleet_summary,
             app_version,
             key_picker_start,
+            list_terminals,
+            default_terminal,
             normalize_key_path,
             ai_suggest_command,
             health_history_record,
