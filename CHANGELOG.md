@@ -6,7 +6,7 @@ All notable changes to Merendero are documented here.
 
 ## [0.1.5] - 2026-10-23
 
-Thanks to [@jvir](https://github.com/jvir) and [@jabanos](https://github.com/jabanos), who took the time to test Merendero and found the problems fixed in this release.
+Thanks to [@jvir](https://github.com/jvir) and [@jackychan2](https://github.com/jackychan2), who took the time to test Merendero and found the problems fixed in this release.
 
 ### Added
 - Terminal choice: Merendero detects the terminals installed on your system and lists them in Settings, with Automatic (the default: `terminator` first, then your desktop's own terminal) and Other… for a name or a full path. If you have not chosen one and have two or more installed, it asks once, the first time. If none is installed, the error says so. It knows how to start `terminator`, `alacritty`, `kitty`, `foot`, `gnome-terminal`, `mate-terminal`, `xfce4-terminal`, `tilix`, `konsole`, `qterminal`, `xterm`, `lxterminal`, `urxvt` and `sakura`; any other one is started as `<terminal> -e "<command>"`

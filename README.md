@@ -12,7 +12,7 @@ Most SSH managers are either too simple (just a list of hosts) or too complex (f
 
 Built by a sysadmin, for sysadmins.
 
-🙏 Thanks to [@jvir](https://github.com/jvir) and [@jabanos](https://github.com/jabanos), who took the time to test Merendero and found the problems fixed in 0.1.5.
+🙏 Thanks to [@jvir](https://github.com/jvir) and [@jackychan2](https://github.com/jackychan2), who took the time to test Merendero and found the problems fixed in 0.1.5.
 
 ## Screenshots
 
