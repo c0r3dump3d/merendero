@@ -320,10 +320,12 @@ fn launch_ssh_inner(ip: String, username: String, port: u16, terminal: Option<St
     let ssh = sh_quote(&program("ssh"));
     let identity_arg = identity_file.as_deref().map(str::trim).filter(|f| !f.is_empty())
         .map(|f| format!(" -i {}", sh_quote(f))).unwrap_or_default();
+    // '--' before the destination: without it, a username/ip starting with '-' (e.g. from an imported
+    // backup) could be read by ssh/scp as an OPTION instead of the destination.
     let target = sh_quote(&format!("{}@{}", username, ip));
     let ssh_cmd = match post_connect.as_deref().filter(|c| !c.trim().is_empty()) {
-        Some(cmd) => format!("{} -t -p {}{} {} {}", ssh, port, identity_arg, target, sh_quote(cmd)),
-        None => format!("{} -p {}{} {}", ssh, port, identity_arg, target),
+        Some(cmd) => format!("{} -t -p {}{} -- {} {}", ssh, port, identity_arg, target, sh_quote(cmd)),
+        None => format!("{} -p {}{} -- {}", ssh, port, identity_arg, target),
     };
     let result = terminal_command(terminal.as_deref(), &ssh_cmd, false)
         .and_then(|mut c| c.spawn().map_err(|e| format!("Failed to launch terminal: {}", e)));
@@ -712,7 +714,9 @@ async fn list_remote_dir(
     args.extend(identity_arg);
     args.push(format!("{}@{}", username, ip));
     // ls -la con formato parseable
-    args.push(format!("for f in {}/* {}/.*; do [ -e \"$f\" ] || continue; n=$(basename \"$f\"); [ \"$n\" = \".\" ] || [ \"$n\" = \"..\" ] && continue; if [ -d \"$f\" ]; then echo \"d:$n\"; else echo \"f:$n\"; fi; done 2>/dev/null", path, path));
+    // The path goes through the remote shell: quote it, or a folder named  x$(command)  would run that command.
+    // The * and .* stay outside the quotes so the shell still expands them.
+    args.push(format!("for f in {}/* {}/.*; do [ -e \"$f\" ] || continue; n=$(basename \"$f\"); [ \"$n\" = \".\" ] || [ \"$n\" = \"..\" ] && continue; if [ -d \"$f\" ]; then echo \"d:$n\"; else echo \"f:$n\"; fi; done 2>/dev/null", sh_quote(&path), sh_quote(&path)));
 
     let output = Command::new(program("ssh")).env("PATH", user_path())
         .args(&args)
@@ -779,6 +783,9 @@ fn run_scp_inner(
 
     let remote = format!("{}@{}:{}", username, ip, remote_path);
 
+    // '--' before the destination: without it, a username/ip starting with '-' (e.g. from an imported
+    // backup) could be read by ssh/scp as an OPTION instead of the destination.
+    args.push(String::from("--"));
     if direction == "upload" {
         args.push(local_path);
         args.push(remote);
@@ -836,6 +843,7 @@ async fn run_scp_broadcast_inner(
 
             let remote_full = format!("{}@{}:{}", username, ip, remote);
 
+            args.push(String::from("--"));
             if dir == "upload" {
                 args.push(local);
                 args.push(remote_full);
@@ -1330,6 +1338,7 @@ async fn run_command_inner(
                 "-o".to_string(), "BatchMode=yes".to_string(),
             ];
             args.extend(identity_arg);
+            args.push(String::from("--"));
             args.push(format!("{}@{}", username, ip));
             args.push(cmd);
 
@@ -1391,6 +1400,9 @@ async fn health_check(
         "-o".to_string(), "BatchMode=yes".to_string(),
     ];
     base_args.extend(identity_arg);
+    // '--' before the destination: without it, a username/ip starting with '-' (e.g. from an imported
+    // backup) could be read by ssh/scp as an OPTION instead of the destination.
+    base_args.push(String::from("--"));
     base_args.push(format!("{}@{}", username, ip));
 
     // receta de Brendan Gregg — 60 second performance check
@@ -1878,7 +1890,7 @@ fn launch_broadcast(hosts: Vec<host::Host>, network: host::Network, defaults: De
             .filter(|f| !f.trim().is_empty());
         let ident = key.map(|f| format!(" -i {}", sh_quote(f.trim()))).unwrap_or_default();
         let target = sh_quote(&format!("{}@{}", host::resolve_username(h, &network, &defaults), h.ip));
-        format!("{} -p {}{} {}", ssh, host::resolve_port(h, &network, &defaults), ident, target)
+        format!("{} -p {}{} -- {}", ssh, host::resolve_port(h, &network, &defaults), ident, target)
     };
     let _ = run_tmux(&["kill-session", "-t", &session_name]);
     let out = run_tmux(&["new-session", "-d", "-s", &session_name, "-x", "220", "-y", "50", &pane_cmd(&hosts[0])])
