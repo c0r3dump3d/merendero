@@ -375,21 +375,14 @@ function SettingsModal({ config, onSave, onClose }) {
   });
 
   const [backupMsg, setBackupMsg] = useState(null);
+  const [includeKey, setIncludeKey] = useState(false);
 
   function handleChange(e) { setForm({ ...form, [e.target.name]: e.target.value }); }
 
   async function handleExport() {
     try {
-      const backup = await invoke("export_backup");
-      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      const date = new Date().toISOString().slice(0, 10);
-      a.href = url;
-      a.download = `merendero-backup-${date}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      setBackupMsg({ type: "success", text: `Backup saved as merendero-backup-${date}.json in your Downloads folder` });
+      const r = await invoke("save_backup", { includeApiKey: includeKey });
+      setBackupMsg({ type: "success", text: `Backup saved to ${r.path}. Only you can read it${r.includes_api_key ? ", and it includes your AI API key, so keep it safe." : "; it does not include the AI API key."}` });
     } catch(e) {
       setBackupMsg({ type: "error", text: `Export failed: ${e}` });
     }
@@ -493,6 +486,8 @@ function SettingsModal({ config, onSave, onClose }) {
             <input type="file" accept=".json" style={{display:"none"}} onChange={handleImport} />
           </label>
         </div>
+        <label className="backup-key-option"><input type="checkbox" checked={includeKey} onChange={e => setIncludeKey(e.target.checked)} /> Include the AI API key</label>
+        <div className="settings-hint">Off by default. A backup is a plain text file: with this on, anyone who can read it can use your key.</div>
         {backupMsg && <div className={`backup-msg ${backupMsg.type}`}>{backupMsg.text}</div>}
         <div className="modal-actions">
           <button className="btn-cancel" onClick={onClose}>Cancel</button>

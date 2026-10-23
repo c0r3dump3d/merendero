@@ -1540,3 +1540,5 @@ html, body, #root {
 }
 .btn-cancel-scan:hover { border-color: var(--red); background: rgba(248,81,73,0.08); }
 .scan-note { color: var(--text2); font-size: 0.72rem; }
+
+.backup-key-option { display: flex; align-items: center; gap: 6px; margin: 8px 0 2px; font-size: 0.78rem; color: var(--text2); cursor: pointer; }

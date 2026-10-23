@@ -1473,7 +1473,7 @@ fn save_health_status(
 
 fn write_private(path: &std::path::Path, content: &str) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -1481,6 +1481,9 @@ fn write_private(path: &std::path::Path, content: &str) -> Result<(), String> {
         .mode(0o600)
         .open(path)
         .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+    // mode() only applies when the file is created: a file that already existed keeps its old permissions.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("Failed to restrict {}: {}", path.display(), e))?;
     f.write_all(content.as_bytes())
         .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
@@ -1520,20 +1523,82 @@ fn restore_log(dir: &std::path::Path, file: &str, imported: &str, notes: &mut Ve
     Ok(())
 }
 
-#[tauri::command]
-fn export_backup() -> Result<serde_json::Value, String> {
-    let config_dir = get_config_dir();
+// ===== backup: begin =====
+/// The API key of the AI provider, if the config text has a non-empty one.
+fn api_key_of(value: &toml::Value) -> Option<&str> {
+    value.get("ai")?.get("api_key")?.as_str().map(str::trim).filter(|k| !k.is_empty())
+}
+
+fn config_has_api_key(text: &str) -> bool {
+    text.parse::<toml::Value>().map(|v| api_key_of(&v).is_some()).unwrap_or(false)
+}
+
+/// Takes the API key out of the text of a config.toml. If the text is not valid TOML it fails instead of
+/// guessing, and the message does not quote the offending line (it could be the key itself).
+fn config_without_api_key(text: &str) -> Result<String, String> {
+    let mut value: toml::Value = text.parse().map_err(|e: toml::de::Error| {
+        let line = e.span().and_then(|s| text.get(..s.start)).map(|before| before.matches('\n').count() + 1);
+        match line {
+            Some(l) => format!("config.toml is not valid TOML (near line {}), so the API key cannot be left out of the backup. Fix the file, or export with the key included.", l),
+            None => String::from("config.toml is not valid TOML, so the API key cannot be left out of the backup. Fix the file, or export with the key included."),
+        }
+    })?;
+    if let Some(ai) = value.get_mut("ai").and_then(|a| a.as_table_mut()) {
+        ai.remove("api_key");
+    }
+    toml::to_string(&value).map_err(|e| format!("Could not write the config without the API key: {}", e))
+}
+
+#[derive(Debug, PartialEq)]
+enum KeyRestore {
+    /// The backup has no [ai] section, so there is no key to talk about.
+    NoAi,
+    /// The backup carries its own key.
+    Included,
+    /// The backup has no key and the config already here has one: it is kept.
+    KeptLocal,
+    /// The backup has no key and neither has the config here.
+    Missing,
+}
+
+/// The text to write as config.toml when restoring `incoming`. A backup without the API key never wipes
+/// the key that is already saved here.
+fn config_for_restore(incoming: &str, local: Option<&str>) -> Result<(String, KeyRestore), String> {
+    let mut value: toml::Value = match incoming.parse() {
+        Ok(v) => v,
+        Err(_) => return Ok((incoming.to_string(), KeyRestore::NoAi)),
+    };
+    if value.get("ai").and_then(|a| a.as_table()).is_none() {
+        return Ok((incoming.to_string(), KeyRestore::NoAi));
+    }
+    if api_key_of(&value).is_some() {
+        return Ok((incoming.to_string(), KeyRestore::Included));
+    }
+    let local_key = local
+        .and_then(|t| t.parse::<toml::Value>().ok())
+        .and_then(|v| api_key_of(&v).map(|k| k.to_string()));
+    match local_key {
+        Some(key) => {
+            if let Some(ai) = value.get_mut("ai").and_then(|a| a.as_table_mut()) {
+                ai.insert(String::from("api_key"), toml::Value::String(key));
+            }
+            let text = toml::to_string(&value).map_err(|e| format!("Could not merge the saved API key into the config: {}", e))?;
+            Ok((text, KeyRestore::KeptLocal))
+        }
+        None => Ok((incoming.to_string(), KeyRestore::Missing)),
+    }
+}
+
+fn build_backup(config_dir: &std::path::Path, include_api_key: bool, now: u64) -> Result<serde_json::Value, String> {
     let read = |name: &str| std::fs::read_to_string(config_dir.join(name)).unwrap_or_default();
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
+    let config = read("config.toml");
+    let has_key = config_has_api_key(&config);
+    let config = if include_api_key { config } else { config_without_api_key(&config)? };
     Ok(serde_json::json!({
         "version": "1.0",
         "created_at": now,
-        "config": read("config.toml"),
+        "includes_api_key": include_api_key && has_key,
+        "config": config,
         "networks": read("networks.toml"),
         "history": read("history.toml"),
         "audit": read("audit.jsonl"),
@@ -1541,25 +1606,102 @@ fn export_backup() -> Result<serde_json::Value, String> {
     }))
 }
 
-#[tauri::command]
-fn import_backup(data: serde_json::Value) -> Result<Vec<String>, String> {
-    let config_dir = get_config_dir();
+/// Calendar date (UTC) of a Unix time, without a date library.
+fn civil_date(secs: u64) -> (i64, u32, u32) {
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn backup_dir() -> std::path::PathBuf {
+    dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Writes the backup as a NEW file that only its owner can read. It never overwrites an earlier backup:
+/// if the name is taken it uses -2, -3, ...
+fn write_backup_file(dir: &std::path::Path, date: &str, content: &str) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    for n in 1..=1000u32 {
+        let name = if n == 1 { format!("merendero-backup-{}.json", date) } else { format!("merendero-backup-{}-{}.json", date, n) };
+        let path = dir.join(&name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(content.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("Could not write {}: {}", path.display(), e));
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Could not save the backup in {}: {}", dir.display(), e)),
+        }
+    }
+    Err(format!("There are too many backups for {} in {}", date, dir.display()))
+}
+
+fn save_backup_in(config_dir: &std::path::Path, out_dir: &std::path::Path, include_api_key: bool, now: u64) -> Result<serde_json::Value, String> {
+    let backup = build_backup(config_dir, include_api_key, now)?;
+    let content = serde_json::to_string_pretty(&backup).map_err(|e| format!("Could not build the backup: {}", e))?;
+    let (y, m, d) = civil_date(now);
+    let path = write_backup_file(out_dir, &format!("{:04}-{:02}-{:02}", y, m, d), &content)?;
+    Ok(serde_json::json!({
+        "path": path.to_string_lossy(),
+        "includes_api_key": backup["includes_api_key"],
+    }))
+}
+
+fn import_backup_into(config_dir: &std::path::Path, data: &serde_json::Value) -> Result<Vec<String>, String> {
     let mut notes: Vec<String> = Vec::new();
 
     for (field, file) in [("config", "config.toml"), ("networks", "networks.toml"), ("history", "history.toml")] {
         if let Some(text) = data[field].as_str() {
             if !text.is_empty() {
-                write_private(&config_dir.join(file), text)?;
+                let path = config_dir.join(file);
+                if field == "config" {
+                    let local = std::fs::read_to_string(&path).ok();
+                    let (merged, key) = config_for_restore(text, local.as_deref())?;
+                    write_private(&path, &merged)?;
+                    match key {
+                        KeyRestore::KeptLocal => notes.push(String::from("The backup does not include the AI API key, so the one already saved here was kept.")),
+                        KeyRestore::Missing => notes.push(String::from("The backup does not include the AI API key: enter it again in Settings if you use AI analysis.")),
+                        _ => {}
+                    }
+                } else {
+                    write_private(&path, text)?;
+                }
             }
         }
     }
     if let Some(text) = data["audit"].as_str() {
-        restore_log(&config_dir, "audit.jsonl", text, &mut notes)?;
+        restore_log(config_dir, "audit.jsonl", text, &mut notes)?;
     }
     if let Some(text) = data["health_history"].as_str() {
-        restore_log(&config_dir, "health_history.jsonl", text, &mut notes)?;
+        restore_log(config_dir, "health_history.jsonl", text, &mut notes)?;
     }
     Ok(notes)
+}
+// ===== backup: end =====
+
+#[tauri::command]
+fn save_backup(include_api_key: bool) -> Result<serde_json::Value, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    save_backup_in(&get_config_dir(), &backup_dir(), include_api_key, now)
+}
+
+#[tauri::command]
+fn import_backup(data: serde_json::Value) -> Result<Vec<String>, String> {
+    import_backup_into(&get_config_dir(), &data)
 }
 
 #[derive(serde::Deserialize)]
@@ -1791,7 +1933,7 @@ pub fn run() {
             run_scp_broadcast,
             run_command,
             health_check,
-            export_backup,
+            save_backup,
             import_backup,
             ai_fleet_summary,
             app_version,
