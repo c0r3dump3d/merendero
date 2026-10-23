@@ -971,6 +971,42 @@ fn get_health_history(network: String, ip: String, limit: usize) -> Vec<serde_js
     rows
 }
 
+// Where the SSH key picker opens: ~/.ssh if it exists, otherwise the home directory.
+#[tauri::command]
+fn key_picker_start() -> String {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let ssh = home.join(".ssh");
+    let start = if ssh.is_dir() { ssh } else { home };
+    start.to_string_lossy().into_owned()
+}
+
+#[derive(serde::Serialize)]
+struct KeyPathChoice {
+    path: String,
+    note: Option<String>,
+}
+
+// Turns the file chosen in the picker into what gets stored. A path inside the home directory is
+// written as ~/..., which is shorter and still works if the configuration is moved to another
+// machine. A public key (.pub) is replaced by the private key next to it, when that file exists.
+#[tauri::command]
+fn normalize_key_path(path: String) -> KeyPathChoice {
+    let mut p = std::path::PathBuf::from(path.trim());
+    let mut note = None;
+    if p.extension().map(|e| e == "pub").unwrap_or(false) {
+        let private = p.with_extension("");
+        if private.is_file() {
+            p = private;
+            note = Some(String::from("That was the public key (.pub). The private key next to it is used instead."));
+        }
+    }
+    let shown = match dirs::home_dir().and_then(|h| p.strip_prefix(&h).ok().map(|r| r.to_path_buf())) {
+        Some(rest) if !rest.as_os_str().is_empty() => format!("~/{}", rest.to_string_lossy()),
+        _ => p.to_string_lossy().into_owned(),
+    };
+    KeyPathChoice { path: shown, note }
+}
+
 #[tauri::command]
 fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -1565,6 +1601,8 @@ pub fn run() {
             import_backup,
             ai_fleet_summary,
             app_version,
+            key_picker_start,
+            normalize_key_path,
             ai_suggest_command,
             health_history_record,
             get_health_history,

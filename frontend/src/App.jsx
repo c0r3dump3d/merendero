@@ -16,6 +16,32 @@ function validateCidr(value) {
   return null;
 }
 
+function KeyFileField({ name, value, onChange }) {
+  const [hint, setHint] = useState("");
+  async function browse() {
+    setHint("");
+    try {
+      const start = await invoke("key_picker_start");
+      const selected = await open({ multiple: false, directory: false, title: "Select SSH private key", defaultPath: start });
+      if (!selected) return;
+      const choice = await invoke("normalize_key_path", { path: Array.isArray(selected) ? selected[0] : selected });
+      onChange({ target: { name, value: choice.path } });
+      if (choice.note) setHint(choice.note);
+    } catch (e) {
+      alert("Could not open the file picker: " + e);
+    }
+  }
+  return (
+    <>
+      <div className="form-row">
+        <input name={name} value={value ?? ""} onChange={onChange} placeholder="~/.ssh/id_rsa" />
+        <button type="button" className="btn-browse" onClick={browse} title="Choose the key file">Browse</button>
+      </div>
+      {hint && <div className="key-hint">{hint}</div>}
+    </>
+  );
+}
+
 function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
   const isEdit = network !== null;
   const [form, setForm] = useState({
@@ -73,13 +99,13 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
     <div className="modal-overlay">
       <div className="modal">
         <h3>{isEdit ? "Edit Network" : "Add Network"}</h3>
-        <div className="form-group"><label>Name</label><input name="name" value={form.name} onChange={handleChange} placeholder="PDC-PRO" /></div>
+        <div className="form-group"><label>Name</label><input name="name" value={form.name} onChange={handleChange} placeholder="my-network-name" /></div>
         <div className="form-group"><label>Network CIDR</label><input name="network" value={form.network} onChange={handleChange} placeholder="192.168.1.0/24" /></div>
         <div className="form-group"><label>Username (leave empty for default)</label><input name="username" value={form.username} onChange={handleChange} placeholder="root" /></div>
         <div className="form-group"><label>Port (leave empty for default)</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
         <div className="form-group">
           <label>Identity file (SSH key)</label>
-          <input name="identity_file" value={form.identity_file} onChange={handleChange} placeholder="~/.ssh/id_rsa" />
+          <KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} />
         </div>
         <div className="form-group">
           <label>Scan timeout (seconds) {form.scan_timeout ? "" : "— not calibrated"}</label>
@@ -145,7 +171,7 @@ function HostModal({ host, networks, defaultNetworkIndex, onSave, onClose, onHea
         <div className="form-group"><label>Port (leave empty for network/default)</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
         <div className="form-group">
           <label>Identity file (SSH key)</label>
-          <input name="identity_file" value={form.identity_file} onChange={handleChange} placeholder="~/.ssh/id_rsa" />
+          <KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} />
         </div>
         <div className="form-group">
           <label>Post-connect command</label>
@@ -318,7 +344,7 @@ function SettingsModal({ config, onSave, onClose }) {
         <div className="form-group"><label>Default port</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
         <div className="form-group"><label>DNS server (for reverse lookup)</label><input name="dns_server" value={form.dns_server} onChange={handleChange} placeholder="10.0.0.1" /></div>
         <div className="form-group"><label>Terminal emulator</label><input name="terminal" value={form.terminal} onChange={handleChange} placeholder="terminator" /></div>
-        <div className="form-group"><label>Default identity file (SSH key)</label><input name="identity_file" value={form.identity_file} onChange={handleChange} placeholder="~/.ssh/id_rsa" /></div>
+        <div className="form-group"><label>Default identity file (SSH key)</label><KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} /></div>
 
         <div className="settings-section">Monitoring</div>
         <div className="form-group"><label>Check hosts automatically every (minutes, 0 = off)</label><input name="check_interval" value={form.check_interval} onChange={handleChange} placeholder="15" type="number" min="0" max="1440" /></div>

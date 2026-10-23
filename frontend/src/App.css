@@ -1522,3 +1522,6 @@ html, body, #root {
   color: var(--text3);
   margin: -2px 0 10px;
 }
+
+/* KEY FILE FIELD */
+.key-hint { font-size: 0.68rem; color: var(--yellow); }
