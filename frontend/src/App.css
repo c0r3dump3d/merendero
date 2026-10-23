@@ -1525,3 +1525,18 @@ html, body, #root {
 
 /* KEY FILE FIELD */
 .key-hint { font-size: 0.68rem; color: var(--yellow); }
+
+.btn-cancel-scan {
+  background: transparent;
+  color: var(--red);
+  border: 1px solid var(--border);
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  transition: all 0.1s;
+}
+.btn-cancel-scan:hover { border-color: var(--red); background: rgba(248,81,73,0.08); }
+.scan-note { color: var(--text2); font-size: 0.72rem; }

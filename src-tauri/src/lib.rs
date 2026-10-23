@@ -411,47 +411,163 @@ fn validate_cidr(value: &str) -> Result<(), String> {
         .map_err(|e| format!("Invalid network '{}': {}", value, e))
 }
 
+// ===== large networks: begin =====
+/// A scan of up to this many addresses (a /20) needs no warning.
+const SCAN_CONFIRM_ABOVE: u64 = 4_096;
+/// Above this many addresses (bigger than a /12) the scan is refused: it would run for hours.
+const SCAN_REFUSE_ABOVE: u64 = 1_048_576;
+
+#[derive(serde::Serialize, Debug, PartialEq)]
+struct ScanSize {
+    addresses: u64,
+    /// Worst case: every address drops the connection and waits for the whole timeout.
+    estimate_secs: u64,
+    /// "ok", "confirm" or "refuse".
+    level: &'static str,
+}
+
+fn scan_size_info(network: &str, timeout_secs: u64) -> Result<ScanSize, String> {
+    let net: ipnetwork::IpNetwork = network
+        .trim()
+        .parse()
+        .map_err(|e| format!("Invalid network '{}': {}", network, e))?;
+    let addresses: u64 = match net {
+        ipnetwork::IpNetwork::V4(n) => 1u64 << (32 - u32::from(n.prefix())),
+        ipnetwork::IpNetwork::V6(_) => return Err(String::from("Only IPv4 networks can be scanned")),
+    };
+    let estimate_secs = addresses.div_ceil(scanner::MAX_CONCURRENT as u64) * timeout_secs;
+    let level = if addresses > SCAN_REFUSE_ABOVE {
+        "refuse"
+    } else if addresses > SCAN_CONFIRM_ABOVE {
+        "confirm"
+    } else {
+        "ok"
+    };
+    Ok(ScanSize { addresses, estimate_secs, level })
+}
+
+/// Puts the result of a scan onto the networks as they are on disk NOW. A big scan takes minutes and
+/// the person may have edited hosts meanwhile, so the copy the window sent when the scan began is not used.
+/// Only a scan that covered the whole range (`complete`) can say that a known host is gone.
+fn apply_scan_results(
+    current: &mut NetworksFile,
+    name: &str,
+    cidr: &str,
+    discovered: Vec<host::Host>,
+    complete: bool,
+    calibrated: Option<u64>,
+) -> Result<(), String> {
+    let net = current
+        .networks
+        .iter_mut()
+        .find(|n| n.name == name && n.network == cidr)
+        .ok_or_else(|| String::from("The network was changed or removed while it was being scanned. Scan it again."))?;
+    if net.scan_timeout.is_none() {
+        net.scan_timeout = calibrated;
+    }
+    if discovered.is_empty() {
+        return Ok(());
+    }
+    if complete {
+        for h in net.hosts.iter_mut() {
+            h.active = false;
+        }
+    }
+    for new_host in discovered {
+        match net.hosts.iter_mut().find(|h| h.ip == new_host.ip) {
+            Some(existing) => {
+                existing.active = true;
+                if new_host.hostname.is_some() {
+                    existing.hostname = new_host.hostname;
+                }
+            }
+            None => net.hosts.push(new_host),
+        }
+    }
+    Ok(())
+}
+// ===== large networks: end =====
+
+#[derive(Default)]
+struct ScanControl {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(serde::Serialize)]
+struct ScanReply {
+    networks: Vec<host::Network>,
+    found: usize,
+    scanned: usize,
+    total: usize,
+    cancelled: bool,
+    dns_unresponsive: bool,
+}
+
+#[tauri::command]
+fn cancel_scan(control: tauri::State<'_, ScanControl>) {
+    control.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn network_scan_info(network: String, timeout: Option<u64>) -> Result<ScanSize, String> {
+    scan_size_info(&network, timeout.unwrap_or(3))
+}
+
 #[tauri::command]
 async fn scan_network(
     window: tauri::Window,
-    mut networks_file: NetworksFile,
+    networks_file: NetworksFile,
     network_index: usize,
     defaults: Defaults,
-) -> Result<NetworksFile, String> {
+    control: tauri::State<'_, ScanControl>,
+) -> Result<ScanReply, String> {
     if network_index >= networks_file.networks.len() {
         return Err(String::from("Invalid network index"));
     }
+    let target = networks_file.networks[network_index].clone();
 
-    validate_cidr(&networks_file.networks[network_index].network)?;
+    validate_cidr(&target.network)?;
 
-    // calibra si no tiene timeout
-    let timeout = if let Some(t) = networks_file.networks[network_index].scan_timeout {
-        t
-    } else {
-        let _ = window.emit("scan-status", "Calibrating network latency...");
-        let t = calibrate_timeout(&networks_file.networks[network_index], &defaults).await;
-        networks_file.networks[network_index].scan_timeout = Some(t);
-        let _ = window.emit("scan-status", format!("Timeout calibrated: {}s", t));
-        t
-    };
-
-    let network = networks_file.networks[network_index].clone();
-    let discovered = scanner::scan_network_with_progress(&network, &defaults, window, timeout).await;
-
-    if !discovered.is_empty() {
-        let existing = &mut networks_file.networks[network_index].hosts;
-        for host in existing.iter_mut() { host.active = false; }
-        for new_host in discovered {
-            match existing.iter_mut().find(|h| h.ip == new_host.ip) {
-                Some(existing_host) => { existing_host.active = true; if new_host.hostname.is_some() { existing_host.hostname = new_host.hostname; } }
-                None => { existing.push(new_host); }
-            }
-        }
+    // Safety net: the window asks for confirmation, but a hand-edited or imported file can bring any network.
+    let size = scan_size_info(&target.network, target.scan_timeout.unwrap_or(3))?;
+    if size.level == "refuse" {
+        return Err(format!(
+            "{} has {} addresses, too many to scan in one go. Add the subnets you actually use instead.",
+            target.network, size.addresses
+        ));
     }
 
+    control.cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // calibrates if the network has no timeout yet
+    let mut calibrated = None;
+    let timeout = match target.scan_timeout {
+        Some(t) => t,
+        None => {
+            let _ = window.emit("scan-status", "Calibrating network latency...");
+            let t = calibrate_timeout(&target, &defaults).await;
+            calibrated = Some(t);
+            let _ = window.emit("scan-status", format!("Timeout calibrated: {}s", t));
+            t
+        }
+    };
+
+    let outcome = scanner::scan_network_with_progress(&target, &defaults, window, timeout, control.cancel.clone()).await;
+    let found = outcome.hosts.len();
+
     let path = get_config_dir().join("networks.toml");
-    host::save_networks(path.to_str().unwrap(), &networks_file)?;
-    Ok(networks_file)
+    let mut current = host::load_networks(path.to_str().unwrap())?;
+    apply_scan_results(&mut current, &target.name, &target.network, outcome.hosts, !outcome.cancelled, calibrated)?;
+    host::save_networks(path.to_str().unwrap(), &current)?;
+
+    Ok(ScanReply {
+        networks: current.networks,
+        found,
+        scanned: outcome.scanned,
+        total: outcome.total,
+        cancelled: outcome.cancelled,
+        dns_unresponsive: outcome.dns_unresponsive,
+    })
 }
 
 #[tauri::command]
@@ -532,15 +648,22 @@ async fn check_hosts(
     let total = hosts_snapshot.len();
     let _ = window.emit("check-progress", serde_json::json!({ "total": total, "current": 0 }));
 
+    // At most MAX_CONCURRENT connections at a time: a big network has thousands of known hosts, and this
+    // process only has so many file descriptors.
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(scanner::MAX_CONCURRENT));
     let mut tasks = vec![];
     for (ip, p) in &hosts_snapshot {
         let ip = ip.clone();
         let p = *p;
+        let sem = semaphore.clone();
         tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
             let address = format!("{}:{}", ip, p);
+            // None = could not tell (this process ran out of file descriptors): the host keeps its state.
             let reachable = match tokio::time::timeout(Duration::from_secs(timeout_secs), TcpStream::connect(&address)).await {
-                Ok(Ok(_)) => true,
-                _ => false,
+                Ok(Ok(_)) => Some(true),
+                Ok(Err(e)) if matches!(e.raw_os_error(), Some(23) | Some(24)) => None,
+                _ => Some(false),
             };
             (ip, reachable)
         }));
@@ -550,7 +673,7 @@ async fn check_hosts(
     let mut results = std::collections::HashMap::new();
     for task in tasks {
         current += 1;
-        if let Ok((ip, status)) = task.await {
+        if let Ok((ip, Some(status))) = task.await {
             results.insert(ip, status);
         }
         let _ = window.emit("check-progress", serde_json::json!({ "total": total, "current": current }));
@@ -1644,6 +1767,7 @@ fn launch_broadcast(hosts: Vec<host::Host>, network: host::Network, defaults: De
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(ScanControl::default())
         .invoke_handler(tauri::generate_handler![
             get_networks,
             get_config,
@@ -1659,6 +1783,8 @@ pub fn run() {
             get_history,
             launch_ssh,
             scan_network,
+            cancel_scan,
+            network_scan_info,
             check_hosts,
             list_remote_dir,
             run_scp,

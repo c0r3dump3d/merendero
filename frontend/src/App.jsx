@@ -121,6 +121,17 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
   const [calibrating, setCalibrating] = useState(false);
   const [netError, setNetError] = useState(null);
   const [netWarn, setNetWarn] = useState(null);
+  const [scanInfo, setScanInfo] = useState(null);
+  useEffect(() => {
+    if (validateCidr(form.network)) { setScanInfo(null); return; }
+    let alive = true;
+    const timer = setTimeout(() => {
+      invoke("network_scan_info", { network: form.network, timeout: form.scan_timeout ? parseInt(form.scan_timeout, 10) : null })
+        .then(i => { if (alive) setScanInfo(i || null); })
+        .catch(() => { if (alive) setScanInfo(null); });
+    }, 300);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [form.network, form.scan_timeout]);
 
   function handleChange(e) { setForm({ ...form, [e.target.name]: e.target.value }); setNetError(null); setNetWarn(null); }
 
@@ -143,9 +154,10 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
     const prefix = parseInt(form.network.split("/")[1], 10);
     const warn = prefix === 32
       ? "A /32 network is a single host, so the scan will only check that one IP."
-      : prefix < 16
-        ? `/${prefix} has ${Math.pow(2, 32 - prefix).toLocaleString()} addresses. The scan opens one connection per address and will take very long.`
-        : null;
+      : null;
+    let size = null;
+    try { size = await invoke("network_scan_info", { network: form.network, timeout: form.scan_timeout ? parseInt(form.scan_timeout, 10) : null }); } catch (e) { size = null; }
+    if (size && size.level === "refuse") { setNetError(scanInfoText(form.network, size)); setNetWarn(null); return; }
     if (warn && netWarn !== warn) { setNetError(null); setNetWarn(warn); return; }
     setNetError(null);
     setNetWarn(null);
@@ -166,7 +178,7 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
       <div className="modal">
         <h3>{isEdit ? "Edit Network" : "Add Network"}</h3>
         <div className="form-group"><label>Name</label><input name="name" value={form.name} onChange={handleChange} placeholder="my-network-name" /></div>
-        <div className="form-group"><label>Network CIDR</label><input name="network" value={form.network} onChange={handleChange} placeholder="192.168.1.0/24" /></div>
+        <div className="form-group"><label>Network CIDR</label><input name="network" value={form.network} onChange={handleChange} placeholder="192.168.1.0/24" />{scanInfo && scanInfo.level === "confirm" && <div className="key-hint">{scanInfoText(form.network, scanInfo)}</div>}{scanInfo && scanInfo.level === "refuse" && <div className="scp-result error">{scanInfoText(form.network, scanInfo)}</div>}</div>
         <div className="form-group"><label>Username (leave empty for default)</label><input name="username" value={form.username} onChange={handleChange} placeholder="root" /></div>
         <div className="form-group"><label>Port (leave empty for default)</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
         <div className="form-group">
@@ -272,6 +284,48 @@ function TagModal({ count, onApply, onClose }) {
         <div className="modal-actions">
           <button className="btn-cancel" onClick={onClose}>Cancel</button>
           <button className="btn-primary" onClick={handleSubmit}>Apply</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- big networks ----------
+function fmtCount(n) { return Number(n).toLocaleString("en-US"); }
+function fmtDuration(secs) {
+  if (secs < 90) return `${Math.max(1, Math.round(secs))} s`;
+  if (secs < 5400) return `${Math.round(secs / 60)} min`;
+  if (secs < 172800) return `${(secs / 3600).toFixed(1).replace(/\.0$/, "")} hours`;
+  return `${(secs / 86400).toFixed(1).replace(/\.0$/, "")} days`;
+}
+function exampleSubnet(network) {
+  const m = /^(\d+)\.(\d+)\.(\d+)\.\d+/.exec(network);
+  return m ? `${m[1]}.${m[2]}.${m[3]}.0/24` : "10.0.0.0/24";
+}
+function scanInfoText(network, info) {
+  const n = fmtCount(info.addresses);
+  if (info.level === "refuse") {
+    return `${network} has ${n} addresses, too many to scan: in the worst case it would take ${fmtDuration(info.estimate_secs)}. Add the subnets you actually use instead, for example ${exampleSubnet(network)}.`;
+  }
+  return `${network} has ${n} addresses. In the worst case a scan takes about ${fmtDuration(info.estimate_secs)}, and it may set off IDS or firewall alerts.`;
+}
+function scanSummary(r) {
+  if (!r || typeof r.total !== "number") return null;
+  const hosts = `${fmtCount(r.found)} ${r.found === 1 ? "host" : "hosts"}`;
+  if (r.cancelled) return `Scan cancelled: ${hosts} found in ${fmtCount(r.scanned)} of ${fmtCount(r.total)} addresses`;
+  if (r.dns_unresponsive) return `Scan finished: ${hosts} found. The DNS server did not answer, so names were not looked up`;
+  return `Scan finished: ${hosts} found in ${fmtCount(r.total)} addresses`;
+}
+function ScanConfirmModal({ network, info, onConfirm, onClose }) {
+  return (
+    <div className="modal-overlay">
+      <div className="modal">
+        <h3>Scan {network.name}?</h3>
+        <div className="health-issue warning">⚠ {scanInfoText(network.network, info)}</div>
+        <div className="settings-hint">The scan opens a connection to every address, 200 at a time. You can cancel it at any moment and keep what it has found so far.</div>
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={onConfirm}>Scan anyway</button>
         </div>
       </div>
     </div>
@@ -1684,6 +1738,9 @@ function App() {
   const [lastAutoCheck, setLastAutoCheck] = useState(null);
   const [autoPaused, setAutoPaused] = useState(false);
   const [terminalPrompt, setTerminalPrompt] = useState(null);
+  const [scanConfirm, setScanConfirm] = useState(null);
+  const [scanNote, setScanNote] = useState(null);
+  useEffect(() => { setScanNote(null); }, [selectedNetwork]);
   const terminalPromptChecked = useRef(false);
   const autoCheckBusyRef = useRef(false);
   const autoStateRef = useRef({});
@@ -1708,7 +1765,7 @@ function App() {
   // It never runs while a dialog is open or another operation is in progress.
   const checkMinutes = config?.monitoring?.check_interval_minutes ?? 15;
   const configReady = !!config;
-  const modalOpen = !!(networkModal || hostModal || showTagModal || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal || terminalPrompt);
+  const modalOpen = !!(networkModal || hostModal || showTagModal || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal || terminalPrompt || scanConfirm);
   autoStateRef.current = { networks, config, paused: autoPaused, busy: scanning || checking || broadcasting || modalOpen };
 
   async function runAutoCheck() {
@@ -1861,14 +1918,32 @@ function App() {
 
   async function handleScan() {
     if (selectedNetwork === null || scanning || autoChecking) return;
+    const network = networks[selectedNetwork];
+    let info = null;
+    try {
+      info = await invoke("network_scan_info", { network: network.network, timeout: network.scan_timeout ?? null });
+    } catch (e) { alert("Scan failed: " + e); return; }
+    const level = info && info.level;
+    if (level === "refuse") { alert(scanInfoText(network.network, info)); return; }
+    if (level === "confirm") { setScanConfirm({ network, info }); return; }
+    await runScan();
+  }
+
+  async function runScan() {
+    setScanNote(null);
     setScanning(true);
     setScanProgress({ total: 0, current: 0 });
     const unlisten = await listen("scan-progress", e => setScanProgress(e.payload));
     try {
-      const updated = await invoke("scan_network", { networksFile: { networks }, networkIndex: selectedNetwork, defaults: config.defaults });
-      setNetworks(updated.networks);
+      const reply = await invoke("scan_network", { networksFile: { networks }, networkIndex: selectedNetwork, defaults: config.defaults });
+      setNetworks(reply.networks);
+      setScanNote(scanSummary(reply));
     } catch (e) { alert("Scan failed: " + e); }
     finally { unlisten(); setScanning(false); setScanProgress(null); }
+  }
+
+  async function handleCancelScan() {
+    try { await invoke("cancel_scan"); } catch (e) { console.error(e); }
   }
 
   async function handleCheck() {
@@ -1965,6 +2040,7 @@ function App() {
       {showScpBroadcast && <ScpBroadcastModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowScpBroadcast(false)} />}
       {showRunCommand && <RunCommandModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowRunCommand(false)} />}
       {showSettings && <SettingsModal config={config} onSave={handleSaveSettings} onClose={() => setShowSettings(false)} />}
+      {scanConfirm && <ScanConfirmModal network={scanConfirm.network} info={scanConfirm.info} onClose={() => setScanConfirm(null)} onConfirm={() => { setScanConfirm(null); runScan(); }} />}
       {terminalPrompt && <TerminalPromptModal terminals={terminalPrompt.terminals} autoId={terminalPrompt.autoId} onChoose={async (v) => { setTerminalPrompt(null); await handleSaveSettings({ ...config, defaults: { ...config.defaults, terminal: v } }); }} />}
       {hostModal && <HostModal host={hostModal.host} networks={networks} defaultNetworkIndex={selectedNetwork ?? 0} onSave={handleSaveHost} onClose={() => setHostModal(null)} onHealthCheck={(h) => { setHostModal(null); setHealthModal(h); }} />}
       {showTagModal && <TagModal count={selectedHosts.size} onApply={handleBulkTag} onClose={() => setShowTagModal(false)} />}
@@ -2018,10 +2094,11 @@ function App() {
                 {!globalMode && <button className="btn-add-host" onClick={() => setHostModal({ host: null })}>+ Host</button>}
                 {!globalMode && <button className="btn-check" onClick={handleCheck} disabled={checking || scanning || autoChecking}>{checking ? "Checking..." : "✓ Check"}</button>}
                 {!globalMode && <button className={`btn-scan ${scanning ? "scanning" : ""}`} onClick={handleScan} disabled={scanning || checking || autoChecking}>{scanning ? "Scanning..." : "⟳ Scan"}</button>}
+                {!globalMode && scanning && <button className="btn-cancel-scan" onClick={handleCancelScan}>✕ Cancel</button>}
               </div>
             </div>
 
-            {scanning && <ProgressBar progress={scanProgress} label="Scanning..." />}
+            {scanning && <ProgressBar progress={scanProgress} label={scanProgress && scanProgress.phase === "names" ? "Resolving names..." : "Scanning..."} />}
             {checking && <ProgressBar progress={checkProgress} label="Checking..." />}
 
             {globalMode ? (
@@ -2114,6 +2191,7 @@ function App() {
                 <span className="auto-check-label">{autoCheckLabel}</span>
                 {checkMinutes > 0 && <button className="btn-auto-toggle" onClick={() => setAutoPaused(p => !p)} title={autoPaused ? "Resume automatic checks" : "Pause automatic checks until you close Merendero (Settings: 0 turns them off for good)"}>{autoPaused ? "Resume" : "Pause"}</button>}
               </span>
+              {scanNote && !scanning && <span className="scan-note">{scanNote}</span>}
               {selectedHosts.size > 0 && <span className="footer-selected">{selectedHosts.size} selected</span>}
             </div>
 </>
