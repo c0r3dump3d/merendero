@@ -12,6 +12,8 @@ Most SSH managers are either too simple (just a list of hosts) or too complex (f
 
 Built by a sysadmin, for sysadmins.
 
+🙏 Thanks to [@jvir](https://github.com/jvir) and [@jabanos](https://github.com/jabanos), who took the time to test Merendero and found the problems fixed in 0.1.5.
+
 ## Screenshots
 
 The hosts in these screenshots are made up, except in the two Run cmd ones, which ran on lab virtual machines.
@@ -35,16 +37,17 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 
 **Discover and organize**
 
-- **Network scanning** — scan a CIDR range, find hosts with SSH open and resolve their FQDNs through reverse DNS. A prefix such as `/24` is required, so a typo can't silently scan a single host
+- **Network scanning** — scan a CIDR range, find hosts with SSH open and resolve their FQDNs through reverse DNS. A prefix such as `/24` is required, so a typo can't silently scan a single host. Big ranges are handled with care: it runs up to a `/20`, asks for confirmation from there up to a `/12` (with an estimate of how long it can take) and refuses anything larger, and a running scan can be cancelled and keeps what it found. See [Big networks](#big-networks)
 - **Timeout calibration** — measures latency per network and sets the scan timeout for you
 - **Automatic availability check** — while Merendero is open, it re-checks which known hosts answer every 15 minutes (you can change that or turn it off), and shows its state in the footer with a Pause button. Scans stay manual
 - **Global search** — one filter box searches every network and groups the matches by network. `:critical`, `:warning`, `:issues`, `:down`, `:up` and `:healthy` work as filters
-- **Tags, notes and history** — tag hosts one by one or in bulk, keep notes on each host and see when you last connected
+- **Tags, notes and history** — tag hosts one by one or in bulk, keep notes on each host and see when you last connected. If a filter hides hosts you had selected, the toolbar tells you how many
 
 **Connect and operate**
 
-- **SSH** — one click, with a per-host, per-network or global key and an optional command to run on connect (for example `sudo su -`)
-- **Broadcast SSH** — open synchronized tmux panes on the selected hosts, after a pre-flight check that skips hosts that don't answer. tmux broadcast is fire-and-forget: use Run cmd when you need to know what happened on each host
+- **SSH** — one click, with a per-host, per-network or global key (picked with a Browse button) and an optional command to run on connect (for example `sudo su -`)
+- **Your terminal** — Merendero detects the terminals installed on your system and lets you choose one in Settings, or leave it on Automatic. If you have several and haven't chosen, it asks once
+- **Broadcast SSH** — open synchronized tmux panes on the selected hosts, after a pre-flight check that skips hosts that don't answer. tmux broadcast is fire-and-forget: use Run cmd when you need to know what happened on each host. It opens in the terminal you chose, uses each host's SSH key, and starts maximized from 4 hosts up in the terminals that can do it
 - **Run cmd** — run one command on many hosts in parallel, with a result for each host and an execution receipt
 - **SCP** — upload or download files for one host, or send a file to many at once. There is a local file picker, and a remote file browser for single-host transfers
 
@@ -62,7 +65,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 **Records and backup**
 
 - **Audit log** of what you run from Merendero (SSH sessions, commands, transfers, broadcasts and AI requests), kept locally. It helps you keep track; it is not tamper-proof
-- **Backup and restore** of your configuration, including the audit log and the health history
+- **Backup and restore** of your configuration, including the audit log and the health history. The file is saved readable only by you, and it leaves out your AI API key unless you tick a checkbox
 - **Dark interface** — because sysadmins deserve nice things too
 
 ## Installation
@@ -70,8 +73,8 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 ### Prerequisites
 
 - Linux. Arch Linux is the only distribution it has been tested on
-- `ssh` and `scp` in your PATH, and `tmux` for broadcast
-- A terminal emulator. `terminator` is the default, and `alacritty` and `kitty` have their own support. Any other, such as `xterm` or `xfce4-terminal`, is started as `<terminal> -e "<command>"`; a terminal that expects the command as separate arguments may not work
+- `ssh` and `scp` in your PATH (Merendero also looks in `~/.local/bin`, `~/.cargo/bin` and the Nix, Guix and snap directories), and `tmux` for broadcast
+- A terminal emulator. Merendero knows how to start `terminator`, `alacritty`, `kitty`, `foot`, `gnome-terminal`, `mate-terminal`, `xfce4-terminal`, `tilix`, `konsole`, `qterminal`, `xterm`, `lxterminal`, `urxvt` and `sakura`, finds which of them are installed and lets you choose in Settings. On Automatic it prefers `terminator`, then your desktop's own. Broadcast opens maximized (from 4 hosts) in `terminator`, `alacritty`, `kitty`, `gnome-terminal`, `mate-terminal`, `xfce4-terminal`, `tilix` and `xterm`; in the others it uses the terminal's normal size. Any other terminal, by name or full path, is started as `<terminal> -e "<command>"`; one that expects the command as separate arguments may not work
 
 ### From release
 
@@ -143,9 +146,9 @@ The first build compiles hundreds of dependencies, so it takes a while. `tauri b
 ## Quick start
 
 1. Launch `merendero`. On a first run the window is empty
-2. Open **Settings** (⚙) and set what you need: the default SSH username (`root` until you change it), your terminal emulator (`terminator` is the default; type the name of the one you use, such as `alacritty`, `kitty`, `xterm` or `xfce4-terminal`) and, if you want, a DNS server for reverse lookups (by default Merendero uses your system's)
+2. Open **Settings** (⚙) and set what you need: the default SSH username (`root` until you change it), your terminal emulator (pick one of the terminals Merendero found, or leave it on Automatic) and, if you want, a DNS server for reverse lookups (by default Merendero uses your system's)
 3. Click **+ Network** and enter a name and a CIDR range with its prefix, such as `192.168.1.0/24`
-4. Click **⟳ Scan**. Merendero finds the hosts with the SSH port open and looks up their names with reverse DNS. The first scan of a network also measures its latency, so it takes a little longer. Later, **✓ Check** re-tests the hosts you already have
+4. Click **⟳ Scan**. Merendero finds the hosts with the SSH port open and looks up their names with reverse DNS. The first scan of a network also measures its latency, so it takes a little longer. Later, **✓ Check** re-tests the hosts you already have. On a big range it asks first and shows a **✕ Cancel** button while it runs
 5. Click **SSH** on a host to open a terminal with the session. It uses your normal SSH setup (agent and default keys) unless you set a key for the host, the network or globally
 6. Tick several hosts to get the toolbar: **Tag**, **Run cmd**, **Health**, **SCP** and **⚡ Broadcast**. The ⚕ button on a row runs a health check on that host
 
@@ -163,7 +166,7 @@ Merendero keeps its data in `~/.config/merendero/`:
 
 You normally don't edit these by hand: the defaults, the monitoring settings and the AI settings live in the Settings window (⚙), and networks and hosts are managed from the main window.
 
-`config.toml` can hold your AI API key in plain text, and the backup you export from Settings includes it, so keep both private: `chmod 600 ~/.config/merendero/config.toml`.
+`config.toml` can hold your AI API key in plain text, so keep it private: Merendero writes it readable only by you (`ls -l ~/.config/merendero/config.toml` should show `-rw-------`). The backup you export from Settings is saved in your Downloads folder (or your home), also readable only by you, and it leaves the API key out unless you tick *Include the AI API key*.
 
 ### config.toml example
 
@@ -172,7 +175,7 @@ You normally don't edit these by hand: the defaults, the monitoring settings and
 username = "root"
 port = 22
 dns_server = "10.0.0.1"               # optional, for reverse lookups; the system's DNS if unset
-terminal = "terminator"               # or alacritty, kitty, xterm...
+terminal = "auto"                     # "auto", the name of a terminal such as alacritty or kitty, or a full path
 identity_file = "~/.ssh/id_ed25519"   # optional default SSH key
 
 [monitoring]                          # optional
@@ -194,6 +197,23 @@ While Merendero is open, it checks the known hosts of every network every 15 min
 - The **Pause** button in the footer stops it until you close Merendero
 - It doesn't run while a dialog is open or another operation is in progress; it tries again a minute later
 - If every host of a network stops answering at once, it keeps the previous state, assuming this machine lost its connection (VPN, Wi-Fi). The ✓ Check button doesn't do this, so use it to confirm a real outage
+
+### Big networks
+
+A scan opens one TCP connection to every address of the range, 200 at a time, so how long it takes depends on how many addresses there are and on how the network answers. Merendero works out the worst case, in which every address silently drops the connection and waits for the whole timeout (3 seconds here), and acts on it:
+
+| Range | Addresses | Worst case | What Merendero does |
+|-------|-----------|------------|---------------------|
+| up to `/20` | 4,096 | about a minute | scans |
+| `/19` to `/12` | 8,192 to 1,048,576 | `/16`: about 16 minutes; `/12`: about 4.4 hours | shows the estimate and asks first |
+| larger than `/12` | more than 1,048,576 | `/8`: about 3 days | refuses: add the subnets you actually use |
+
+A range larger than a `/12` is also refused in the network form and, as a last check, when a network comes from a file you edited by hand.
+
+- **✕ Cancel** stops a running scan. The hosts it found are kept, and the hosts you already had are not marked as down, because the scan didn't look at all of them
+- Scanning thousands of addresses can set off your IDS or firewall. The confirmation says so
+- Names come from reverse DNS after the scan, 16 at a time. If the DNS server doesn't answer, Merendero stops asking after a few tries and tells you, instead of waiting for each host
+- The result is written to the file as it is when the scan ends, so what you edit during a long scan is kept
 
 ### AI settings (optional)
 
@@ -246,7 +266,7 @@ With Ollama on `localhost`, nothing leaves your machine.
 - **SSH/SCP**: OpenSSH system binaries
 - **Broadcast**: tmux with synchronize-panes
 - **DNS**: hickory-resolver
-- **Network scan**: tokio async with semaphore-limited concurrency
+- **Network scan**: tokio async, 200 connections at a time
 
 ## License
 
