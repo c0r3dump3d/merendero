@@ -4,6 +4,19 @@ All notable changes to Merendero are documented here.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-10-27
+
+### Added
+- Bulk-set the SSH username for several selected hosts at once, alongside the existing bulk tag
+- Export and import network definitions (range, username, port, key — no hosts) to share with a colleague; a network already defined locally (same range) is left untouched on import
+- The SSH banner of each host (e.g. `SSH-2.0-OpenSSH_9.6p1`) is captured during the regular health check and shown next to its name. It is searchable like everything else, including across networks with the global search
+- "Scan for hosts" button in the center of a network that doesn't have any yet
+- A small, dismissible notice when a newer release is published on GitHub. It checks once at startup and fails completely silently if it can't reach GitHub
+
+### Fixed
+- Deleting a network or a host could go through even after clicking Cancel, because of how the Linux WebView can mishandle the browser's native confirmation dialog. Replaced with Merendero's own confirmation, which doesn't depend on it
+- Error and validation messages now show as an in-app, dismissible notice instead of the browser's native alert box
+
 ## [0.1.6] - 2026-10-23
 
 Thanks again to [@jvir](https://github.com/jvir), who found and reported both issues fixed in this release.

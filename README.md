@@ -55,6 +55,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 
 - **Brendan Gregg's 60-second checklist** on any host or on a whole selection (8 at a time), with a local analysis and a status mark in the host table
 - **Health history** — each check is kept for 90 days by default (you can change that in Settings), and the host window shows what changed since the previous one
+- **SSH banner** — captured during the regular check and shown next to each host's name, so you can tell at a glance what's running where. Searchable too, including across networks
 
 **Optional AI** (Claude, OpenAI, Ollama or a custom endpoint)
 
@@ -66,6 +67,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 
 - **Audit log** of what you run from Merendero (SSH sessions, commands, transfers, broadcasts and AI requests), kept locally. It helps you keep track; it is not tamper-proof
 - **Backup and restore** of your configuration, including the audit log and the health history. The file is saved readable only by you, and it leaves out your AI API key unless you tick a checkbox
+- **Export and import networks** — share just the network definitions (range, username, port, key) with a colleague, without any hosts or your own configuration. A network they already have (same range) is left untouched
 - **Dark interface** — because sysadmins deserve nice things too
 
 ## Installation
