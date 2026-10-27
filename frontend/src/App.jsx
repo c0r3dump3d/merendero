@@ -270,6 +270,26 @@ function HostModal({ host, networks, defaultNetworkIndex, onSave, onClose, onHea
   );
 }
 
+function UsernameModal({ count, onApply, onClose }) {
+  const [username, setUsername] = useState("");
+  async function handleSubmit() { await onApply(username); onClose(); }
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-sm">
+        <h3>Set username for {count} host{count !== 1 ? "s" : ""}</h3>
+        <div className="form-group">
+          <label>Username (leave empty for network/default)</label>
+          <input value={username} onChange={e => setUsername(e.target.value)} placeholder="root" autoFocus onKeyDown={e => e.key === "Enter" && handleSubmit()} />
+        </div>
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" onClick={handleSubmit}>Apply</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TagModal({ count, onApply, onClose }) {
   const [tag, setTag] = useState("");
   async function handleSubmit() { await onApply(tag); onClose(); }
@@ -1720,6 +1740,7 @@ function App() {
   const [broadcasting, setBroadcasting] = useState(false);
   const [hostModal, setHostModal] = useState(null);
   const [showTagModal, setShowTagModal] = useState(false);
+  const [showUsernameModal, setShowUsernameModal] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showRunCommand, setShowRunCommand] = useState(false);
   const [showScpBroadcast, setShowScpBroadcast] = useState(false);
@@ -1760,7 +1781,7 @@ function App() {
   // It never runs while a dialog is open or another operation is in progress.
   const checkMinutes = config?.monitoring?.check_interval_minutes ?? 15;
   const configReady = !!config;
-  const modalOpen = !!(networkModal || hostModal || showTagModal || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal || terminalPrompt || scanConfirm);
+  const modalOpen = !!(networkModal || hostModal || showTagModal || showUsernameModal || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal || terminalPrompt || scanConfirm);
   autoStateRef.current = { networks, config, paused: autoPaused, busy: scanning || checking || broadcasting || modalOpen };
 
   async function runAutoCheck() {
@@ -1961,12 +1982,27 @@ function App() {
     } catch (e) { alert("Failed to tag: " + e); }
   }
 
+  async function handleBulkUsername(username) {
+    try {
+      const updated = await invoke("bulk_set_username", { networksFile: { networks }, networkIndex: selectedNetwork, hostIps: Array.from(selectedHosts), username });
+      setNetworks(updated.networks);
+      setSelectedHosts(new Set());
+    } catch (e) { alert("Failed to set username: " + e); }
+  }
+
   function toggleHost(ip) {
     setSelectedHosts(prev => { const next = new Set(prev); next.has(ip) ? next.delete(ip) : next.add(ip); return next; });
   }
 
   function toggleAll() {
-    setSelectedHosts(selectedHosts.size === filteredHosts.length ? new Set() : new Set(filteredHosts.map(h => h.ip)));
+    // Only the hosts that are visible: a selected host hidden by the filter stays selected either way.
+    const visible = filteredHosts.map(h => h.ip);
+    const everyVisibleSelected = visible.length > 0 && visible.every(ip => selectedHosts.has(ip));
+    setSelectedHosts(prev => {
+      const next = new Set(prev);
+      visible.forEach(ip => { if (everyVisibleSelected) next.delete(ip); else next.add(ip); });
+      return next;
+    });
   }
 
   async function handleBroadcast(reachableHosts) {
@@ -2019,7 +2055,12 @@ function App() {
     : [];
   const globalTotal = globalResults.reduce((n, r) => n + r.hosts.length, 0);
 
-  const allSelected = filteredHosts.length > 0 && selectedHosts.size === filteredHosts.length;
+  const allSelected = filteredHosts.length > 0 && filteredHosts.every(h => selectedHosts.has(h.ip));
+  const visibleIps = new Set(filteredHosts.map(h => h.ip));
+  const hiddenSelected = Array.from(selectedHosts).filter(ip => !visibleIps.has(ip)).length;
+  const hiddenNote = hiddenSelected > 0
+    ? <span className="selection-hidden" title="These hosts are hidden by the current filter, but they are still selected and will be included in Run cmd, Broadcast, SCP, Health, Tag and Username. Clear removes them.">{` (${hiddenSelected} hidden)`}</span>
+    : null;
   const currentNet = selectedNetwork !== null ? networks[selectedNetwork] : null;
   const activeCount = currentNet ? currentNet.hosts.filter(h => h.active).length : 0;
 
@@ -2039,6 +2080,7 @@ function App() {
       {terminalPrompt && <TerminalPromptModal terminals={terminalPrompt.terminals} autoId={terminalPrompt.autoId} onChoose={async (v) => { setTerminalPrompt(null); await handleSaveSettings({ ...config, defaults: { ...config.defaults, terminal: v } }); }} />}
       {hostModal && <HostModal host={hostModal.host} networks={networks} defaultNetworkIndex={selectedNetwork ?? 0} onSave={handleSaveHost} onClose={() => setHostModal(null)} onHealthCheck={(h) => { setHostModal(null); setHealthModal(h); }} />}
       {showTagModal && <TagModal count={selectedHosts.size} onApply={handleBulkTag} onClose={() => setShowTagModal(false)} />}
+      {showUsernameModal && <UsernameModal count={selectedHosts.size} onApply={handleBulkUsername} onClose={() => setShowUsernameModal(false)} />}
 
       <div className="sidebar">
         <div className="sidebar-header">
@@ -2134,10 +2176,11 @@ function App() {
 <>
 {selectedHosts.size > 0 && (
               <div className="broadcast-toolbar">
-                <span>{selectedHosts.size} hosts selected</span>
+                <span>{selectedHosts.size} hosts selected{hiddenNote}</span>
                 <div className="broadcast-actions">
                   <button className="btn-clear" onClick={() => setSelectedHosts(new Set())}>Clear</button>
                   <button className="btn-tag" onClick={() => setShowTagModal(true)}>🏷 Tag</button>
+                  <button className="btn-tag" onClick={() => setShowUsernameModal(true)}>👤 Username</button>
                   <button className="btn-run-cmd" onClick={() => setShowRunCommand(true)}>▶ Run cmd</button>
                   <button className="btn-run-cmd" onClick={() => setShowHealthBatch(true)}>⚕ Health</button>
                   <button className="btn-run-cmd" onClick={() => setShowScpBroadcast(true)}>📁 SCP</button>
@@ -2187,7 +2230,7 @@ function App() {
                 {checkMinutes > 0 && <button className="btn-auto-toggle" onClick={() => setAutoPaused(p => !p)} title={autoPaused ? "Resume automatic checks" : "Pause automatic checks until you close Merendero (Settings: 0 turns them off for good)"}>{autoPaused ? "Resume" : "Pause"}</button>}
               </span>
               {scanNote && !scanning && <span className="scan-note">{scanNote}</span>}
-              {selectedHosts.size > 0 && <span className="footer-selected">{selectedHosts.size} selected</span>}
+              {selectedHosts.size > 0 && <span className="footer-selected">{selectedHosts.size} selected{hiddenNote}</span>}
             </div>
 </>
 )}

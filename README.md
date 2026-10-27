@@ -24,7 +24,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 ### Global search — one filter box searches every network and groups the matches by network
 ![Global search](docs/screenshots/global-search.png)
 
-### Selection toolbar — tag, run a command, check health, copy files or broadcast to several hosts at once
+### Selection toolbar — tag, set a username, run a command, check health, copy files or broadcast to several hosts at once
 ![Selection toolbar](docs/screenshots/selection.png)
 
 ### Run cmd — a result for each host and an execution receipt of what was run and how it was approved
@@ -41,7 +41,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 - **Timeout calibration** — measures latency per network and sets the scan timeout for you
 - **Automatic availability check** — while Merendero is open, it re-checks which known hosts answer every 15 minutes (you can change that or turn it off), and shows its state in the footer with a Pause button. Scans stay manual
 - **Global search** — one filter box searches every network and groups the matches by network. `:critical`, `:warning`, `:issues`, `:down`, `:up` and `:healthy` work as filters
-- **Tags, notes and history** — tag hosts one by one or in bulk, keep notes on each host and see when you last connected. If a filter hides hosts you had selected, the toolbar tells you how many
+- **Tags, notes and history** — tag hosts (or set their SSH username) one by one or in bulk, keep notes on each host and see when you last connected. If a filter hides hosts you had selected, the toolbar tells you how many
 
 **Connect and operate**
 

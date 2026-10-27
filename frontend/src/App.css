@@ -1542,3 +1542,5 @@ html, body, #root {
 .scan-note { color: var(--text2); font-size: 0.72rem; }
 
 .backup-key-option { display: flex; align-items: center; gap: 6px; margin: 8px 0 2px; font-size: 0.78rem; color: var(--text2); cursor: pointer; }
+
+.selection-hidden { color: var(--yellow); cursor: help; }

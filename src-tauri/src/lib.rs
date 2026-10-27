@@ -107,6 +107,24 @@ fn delete_host(mut networks_file: NetworksFile, network_index: usize, host_index
 }
 
 #[tauri::command]
+fn bulk_set_username(mut networks_file: NetworksFile, network_index: usize, host_ips: Vec<String>, username: String) -> Result<NetworksFile, String> {
+    if network_index >= networks_file.networks.len() {
+        return Err(String::from("Invalid network index"));
+    }
+    // Trimmed, unlike bulk_tag: a username with stray leading/trailing spaces breaks the SSH login,
+    // while a tag with spaces is only cosmetic.
+    let username_opt = if username.trim().is_empty() { None } else { Some(username.trim().to_string()) };
+    for host in networks_file.networks[network_index].hosts.iter_mut() {
+        if host_ips.contains(&host.ip) {
+            host.username = username_opt.clone();
+        }
+    }
+    let path = get_config_dir().join("networks.toml");
+    host::save_networks(path.to_str().unwrap(), &networks_file)?;
+    Ok(networks_file)
+}
+
+#[tauri::command]
 fn bulk_tag(mut networks_file: NetworksFile, network_index: usize, host_ips: Vec<String>, tag: String) -> Result<NetworksFile, String> {
     if network_index >= networks_file.networks.len() {
         return Err(String::from("Invalid network index"));
@@ -1933,6 +1951,7 @@ pub fn run() {
             update_host,
             delete_host,
             bulk_tag,
+            bulk_set_username,
             save_config,
             get_history,
             launch_ssh,
