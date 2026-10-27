@@ -1544,3 +1544,73 @@ html, body, #root {
 .backup-key-option { display: flex; align-items: center; gap: 6px; margin: 8px 0 2px; font-size: 0.78rem; color: var(--text2); cursor: pointer; }
 
 .selection-hidden { color: var(--yellow); cursor: help; }
+
+.export-networks-list { max-height: 220px; overflow-y: auto; margin: 6px 0 2px; border: 1px solid var(--border); border-radius: 6px; }
+.export-networks-item { display: flex; align-items: center; gap: 8px; padding: 6px 10px; font-size: 0.8rem; cursor: pointer; }
+.export-networks-item:hover { background: rgba(255,255,255,0.03); }
+.export-networks-cidr { color: var(--text2); font-size: 0.72rem; }
+
+.btn-danger {
+  background: var(--red);
+  color: white;
+  border: none;
+  padding: 7px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.8rem;
+}
+.btn-danger:hover { background: #d93a30; }
+
+.toast {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  max-width: 420px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+  font-size: 0.82rem;
+  color: var(--text);
+  z-index: 200;
+}
+.toast-error { border-left: 3px solid var(--red); }
+.toast-success { border-left: 3px solid var(--green); }
+.toast span { flex: 1; word-break: break-word; }
+.toast-close {
+  background: transparent;
+  border: none;
+  color: var(--text2);
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 0;
+}
+.toast-close:hover { color: var(--text); }
+
+.hostname-cell { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+.ssh-banner { color: var(--text3); font-size: 0.65rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.update-notice {
+  position: fixed;
+  top: 16px;
+  right: 20px;
+  max-width: 360px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent2);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+  font-size: 0.8rem;
+  color: var(--text);
+  z-index: 200;
+}

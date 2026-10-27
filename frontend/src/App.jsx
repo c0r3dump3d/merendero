@@ -82,7 +82,7 @@ function TerminalPromptModal({ terminals, autoId, onChoose }) {
   );
 }
 
-function KeyFileField({ name, value, onChange }) {
+function KeyFileField({ name, value, onChange, showToast }) {
   const [hint, setHint] = useState("");
   async function browse() {
     setHint("");
@@ -94,7 +94,7 @@ function KeyFileField({ name, value, onChange }) {
       onChange({ target: { name, value: choice.path } });
       if (choice.note) setHint(choice.note);
     } catch (e) {
-      alert("Could not open the file picker: " + e);
+      showToast("Could not open the file picker: " + e);
     }
   }
   return (
@@ -108,7 +108,7 @@ function KeyFileField({ name, value, onChange }) {
   );
 }
 
-function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
+function NetworkModal({ network, index, onSave, onClose, onRecalibrate, showToast }) {
   const isEdit = network !== null;
   const [form, setForm] = useState({
     name: network?.name || "",
@@ -142,7 +142,7 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
       const timeout = await onRecalibrate(index);
       setForm(f => ({ ...f, scan_timeout: timeout.toString() }));
     } catch(e) {
-      alert("Calibration failed: " + e);
+      showToast("Calibration failed: " + e);
     } finally {
       setCalibrating(false);
     }
@@ -161,7 +161,7 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
     if (warn && netWarn !== warn) { setNetError(null); setNetWarn(warn); return; }
     setNetError(null);
     setNetWarn(null);
-    if (!form.name || !form.network) { alert("Name and CIDR are required"); return; }
+    if (!form.name || !form.network) { showToast("Name and CIDR are required"); return; }
     await onSave({
       name: form.name, network: form.network,
       username: form.username || null,
@@ -183,7 +183,7 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
         <div className="form-group"><label>Port (leave empty for default)</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
         <div className="form-group">
           <label>Identity file (SSH key)</label>
-          <KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} />
+          <KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} showToast={showToast} />
         </div>
         <div className="form-group">
           <label>Scan timeout (seconds) {form.scan_timeout ? "" : "— not calibrated"}</label>
@@ -208,7 +208,7 @@ function NetworkModal({ network, index, onSave, onClose, onRecalibrate }) {
   );
 }
 
-function HostModal({ host, networks, defaultNetworkIndex, onSave, onClose, onHealthCheck }) {
+function HostModal({ host, networks, defaultNetworkIndex, onSave, onClose, onHealthCheck, showToast }) {
   const isEdit = !!host;
   const [form, setForm] = useState({
     ip: host?.ip || "", hostname: host?.hostname || "", tag: host?.tag || "",
@@ -223,7 +223,7 @@ function HostModal({ host, networks, defaultNetworkIndex, onSave, onClose, onHea
     setForm({ ...form, [e.target.name]: val });
   }
   async function handleSubmit() {
-    if (!form.ip) { alert("IP is required"); return; }
+    if (!form.ip) { showToast("IP is required"); return; }
     await onSave({
       hostData: { ip: form.ip, hostname: form.hostname || null, tag: form.tag || null, username: form.username || null, port: form.port ? parseInt(form.port) : null, notes: form.notes || null, identity_file: form.identity_file || null, post_connect: form.post_connect || null, active: form.active },
       networkIndex: parseInt(form.networkIndex),
@@ -249,7 +249,7 @@ function HostModal({ host, networks, defaultNetworkIndex, onSave, onClose, onHea
         <div className="form-group"><label>Port (leave empty for network/default)</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
         <div className="form-group">
           <label>Identity file (SSH key)</label>
-          <KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} />
+          <KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} showToast={showToast} />
         </div>
         <div className="form-group">
           <label>Post-connect command</label>
@@ -264,6 +264,34 @@ function HostModal({ host, networks, defaultNetworkIndex, onSave, onClose, onHea
           <button className="btn-cancel" onClick={onClose}>Cancel</button>
           {isEdit && onHealthCheck && <button className="btn-check" onClick={() => onHealthCheck(host)}>⚕ Health</button>}
           <button className="btn-primary" onClick={handleSubmit}>{isEdit ? "Save" : "Add"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ExportNetworksModal({ networks, onExport, onClose }) {
+  const [selected, setSelected] = useState(() => new Set(networks.map((_, i) => i)));
+  const allOn = selected.size === networks.length;
+  function toggleOne(i) { setSelected(prev => { const next = new Set(prev); next.has(i) ? next.delete(i) : next.add(i); return next; }); }
+  function toggleAll() { setSelected(allOn ? new Set() : new Set(networks.map((_, i) => i))); }
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-sm">
+        <h3>Export networks</h3>
+        <div className="settings-hint">Just the network definitions (name, range, username, port, key) — no discovered hosts.</div>
+        <label className="backup-key-option"><input type="checkbox" checked={allOn} onChange={toggleAll} /> {allOn ? "Deselect all" : "Select all"}</label>
+        <div className="export-networks-list">
+          {networks.map((n, i) => (
+            <label key={i} className="export-networks-item">
+              <input type="checkbox" checked={selected.has(i)} onChange={() => toggleOne(i)} />
+              {n.name} <span className="export-networks-cidr">{n.network}</span>
+            </label>
+          ))}
+        </div>
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button className="btn-primary" disabled={selected.size === 0} onClick={() => { onExport(Array.from(selected)); onClose(); }}>Export</button>
         </div>
       </div>
     </div>
@@ -286,6 +314,40 @@ function UsernameModal({ count, onApply, onClose }) {
           <button className="btn-primary" onClick={handleSubmit}>Apply</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function ConfirmModal({ title, message, confirmLabel, danger, onConfirm, onClose }) {
+  async function handleConfirm() { await onConfirm(); onClose(); }
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-sm">
+        <h3>{title}</h3>
+        {message && <div className="settings-hint">{message}</div>}
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Cancel</button>
+          <button className={danger ? "btn-danger" : "btn-primary"} onClick={handleConfirm}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UpdateNotice({ version, onClose }) {
+  return (
+    <div className="update-notice">
+      <span>Merendero v{version} is available.</span>
+      <button className="toast-close" onClick={onClose} title="Dismiss">✕</button>
+    </div>
+  );
+}
+
+function Toast({ toast, onClose }) {
+  return (
+    <div className={`toast toast-${toast.type}`}>
+      <span>{toast.text}</span>
+      <button className="toast-close" onClick={onClose} title="Dismiss">✕</button>
     </div>
   );
 }
@@ -379,7 +441,7 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, n));
 }
 
-function SettingsModal({ config, onSave, onClose }) {
+function SettingsModal({ config, networks, onSave, onClose, showToast }) {
   const [form, setForm] = useState({
     username: config?.defaults?.username || "root",
     port: config?.defaults?.port?.toString() || "22",
@@ -395,9 +457,32 @@ function SettingsModal({ config, onSave, onClose }) {
   });
 
   const [backupMsg, setBackupMsg] = useState(null);
+  const [networksMsg, setNetworksMsg] = useState(null);
+  const [showExportNetworks, setShowExportNetworks] = useState(false);
   const [includeKey, setIncludeKey] = useState(false);
 
   function handleChange(e) { setForm({ ...form, [e.target.name]: e.target.value }); }
+
+  async function handleExportNetworks(indices) {
+    try {
+      const r = await invoke("export_networks", { networksFile: { networks }, indices });
+      setNetworksMsg({ type: "success", text: `${r.count} network${r.count !== 1 ? "s" : ""} saved to ${r.path}. Only you can read it.` });
+    } catch (e) { setNetworksMsg({ type: "error", text: `Export failed: ${e}` }); }
+  }
+
+  async function handleImportNetworks(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const content = await file.text();
+      const r = await invoke("import_networks", { content });
+      const parts = [];
+      if (r.added.length) parts.push(`Added: ${r.added.join(", ")}.`);
+      if (r.skipped.length) parts.push(`Already had: ${r.skipped.join(", ")}.`);
+      setNetworksMsg({ type: "success", text: parts.length ? parts.join(" ") : "Nothing new to add." });
+    } catch (e) { setNetworksMsg({ type: "error", text: `Import failed: ${e}` }); }
+    e.target.value = "";
+  }
 
   async function handleExport() {
     try {
@@ -477,7 +562,7 @@ function SettingsModal({ config, onSave, onClose }) {
         <div className="form-group"><label>Default port</label><input name="port" value={form.port} onChange={handleChange} placeholder="22" type="number" /></div>
         <div className="form-group"><label>DNS server (for reverse lookup)</label><input name="dns_server" value={form.dns_server} onChange={handleChange} placeholder="10.0.0.1" /></div>
         <div className="form-group"><label>Terminal emulator</label><TerminalSelect value={form.terminal} onChange={handleChange} /></div>
-        <div className="form-group"><label>Default identity file (SSH key)</label><KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} /></div>
+        <div className="form-group"><label>Default identity file (SSH key)</label><KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} showToast={showToast} /></div>
 
         <div className="settings-section">Monitoring</div>
         <div className="form-group"><label>Check hosts automatically every (minutes, 0 = off)</label><input name="check_interval" value={form.check_interval} onChange={handleChange} placeholder="15" type="number" min="0" max="1440" /></div>
@@ -497,6 +582,18 @@ function SettingsModal({ config, onSave, onClose }) {
         <div className="form-group"><label>API URL</label><input name="ai_api_url" value={form.ai_api_url} onChange={handleChange} placeholder="https://api.anthropic.com/v1/messages" /></div>
         <div className="form-group"><label>API Key{form.ai_provider === "ollama" ? " (not needed for Ollama)" : ""}</label><input name="ai_api_key" value={form.ai_api_key} onChange={handleChange} placeholder="sk-ant-..." type="password" /></div>
         <div className="form-group"><label>Model</label><input name="ai_model" value={form.ai_model} onChange={handleChange} placeholder="claude-haiku-4-5" /></div>
+
+        <div className="settings-section">Networks</div>
+        <div className="settings-hint">Share network definitions with a colleague — just the range, username, port and key, no discovered hosts. A network already in a colleague's list (same range) is left untouched on import.</div>
+        <div className="backup-actions">
+          <button className="btn-backup" onClick={() => setShowExportNetworks(true)}>⬇ Export networks...</button>
+          <label className="btn-backup btn-import">
+            ⬆ Import networks
+            <input type="file" accept=".toml" style={{display:"none"}} onChange={handleImportNetworks} />
+          </label>
+        </div>
+        {networksMsg && <div className={`backup-msg ${networksMsg.type}`}>{networksMsg.text}</div>}
+        {showExportNetworks && <ExportNetworksModal networks={networks} onExport={handleExportNetworks} onClose={() => setShowExportNetworks(false)} />}
 
         <div className="settings-section">Backup &amp; Restore</div>
         <div className="backup-actions">
@@ -896,7 +993,7 @@ function RunCommandModal({ hosts, network, config, onClose }) {
   );
 }
 
-function ScpBroadcastModal({ hosts, network, config, onClose }) {
+function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
   const [direction, setDirection] = useState("upload");
   const [localPath, setLocalPath] = useState("");
   const [remotePath, setRemotePath] = useState("");
@@ -910,7 +1007,7 @@ function ScpBroadcastModal({ hosts, network, config, onClose }) {
 
   async function handleRun() {
     if (!localPath.trim() || !remotePath.trim()) {
-      alert("Both paths are required");
+      showToast("Both paths are required");
       return;
     }
     setRunning(true);
@@ -926,7 +1023,7 @@ function ScpBroadcastModal({ hosts, network, config, onClose }) {
       });
       setResults(res);
     } catch(e) {
-      alert("Failed: " + e);
+      showToast("Failed: " + e);
     } finally {
       setRunning(false);
     }
@@ -1061,7 +1158,7 @@ function RemoteBrowserModal({ host, network, config, onSelect, onClose }) {
   );
 }
 
-function ScpModal({ host, network, config, onClose }) {
+function ScpModal({ host, network, config, onClose, showToast }) {
   const [direction, setDirection] = useState("upload");
   const [localPath, setLocalPath] = useState("");
   const [remotePath, setRemotePath] = useState("");
@@ -1085,7 +1182,7 @@ function ScpModal({ host, network, config, onClose }) {
 
   async function handleRun() {
     if (!localPath.trim() || !remotePath.trim()) {
-      alert("Both paths are required");
+      showToast("Both paths are required");
       return;
     }
     setRunning(true);
@@ -1727,6 +1824,7 @@ function App() {
   const [networks, setNetworks] = useState([]);
   const [config, setConfig] = useState(null);
   const [appVersion, setAppVersion] = useState("");
+  const [updateAvailable, setUpdateAvailable] = useState(null);
   const [selectedNetwork, setSelectedNetwork] = useState(null);
   const [networkScoped, setNetworkScoped] = useState(false);
   const [filter, setFilter] = useState("");
@@ -1740,6 +1838,9 @@ function App() {
   const [broadcasting, setBroadcasting] = useState(false);
   const [hostModal, setHostModal] = useState(null);
   const [showTagModal, setShowTagModal] = useState(false);
+  const [confirmState, setConfirmState] = useState(null);
+  const [toast, setToast] = useState(null);
+  function showToast(text, type = "error") { setToast({ text, type }); }
   const [showUsernameModal, setShowUsernameModal] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showRunCommand, setShowRunCommand] = useState(false);
@@ -1763,6 +1864,12 @@ function App() {
 
   useEffect(() => { loadData(); loadHistory(); }, []);
   useEffect(() => { invoke("app_version").then(setAppVersion).catch(() => {}); }, []);
+  useEffect(() => {
+    if (!appVersion) return;  // wait until the real version is known, not the initial ""
+    invoke("check_latest_release").then(latest => {
+      if (latest && latest !== appVersion) setUpdateAvailable(latest);
+    }).catch(() => {});
+  }, [appVersion]);
 
   // First run: if no terminal has been chosen and there are several installed, ask once which to use.
   useEffect(() => {
@@ -1781,7 +1888,7 @@ function App() {
   // It never runs while a dialog is open or another operation is in progress.
   const checkMinutes = config?.monitoring?.check_interval_minutes ?? 15;
   const configReady = !!config;
-  const modalOpen = !!(networkModal || hostModal || showTagModal || showUsernameModal || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal || terminalPrompt || scanConfirm);
+  const modalOpen = !!(networkModal || hostModal || showTagModal || showUsernameModal || !!confirmState || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal || terminalPrompt || scanConfirm);
   autoStateRef.current = { networks, config, paused: autoPaused, busy: scanning || checking || broadcasting || modalOpen };
 
   async function runAutoCheck() {
@@ -1839,7 +1946,7 @@ function App() {
       setNetworks(netsResult.networks);
       setConfig(cfgResult);
       if (netsResult.networks.length > 0) setSelectedNetwork(0);
-    } catch (e) { console.error(e); alert("Could not load your configuration: " + e); }
+    } catch (e) { console.error(e); showToast("Could not load your configuration: " + e); }
     finally { setLoading(false); }
   }
 
@@ -1864,7 +1971,7 @@ function App() {
   async function connectSSH(host, netIdx = selectedNetwork) {
     const network = networks[netIdx];
     try { await invoke("launch_ssh", { ip: host.ip, username: resolveUsername(host, network), port: resolvePort(host, network), terminal: config?.defaults?.terminal || null, hostname: host.hostname || null, networkName: network.name, identityFile: host.identity_file || network.identity_file || config?.defaults?.identity_file || null, postConnect: host.post_connect || null }); loadHistory(); }
-    catch (e) { alert("Failed to launch SSH: " + e); }
+    catch (e) { showToast("Failed to launch SSH: " + e); }
   }
 
   async function handleSaveNetwork(networkData, index) {
@@ -1877,14 +1984,14 @@ function App() {
         setSelectedNetwork(updated.networks.length - 1);
       }
       setNetworks(updated.networks);
-    } catch (e) { alert("Failed to save network: " + e); }
+    } catch (e) { showToast("Failed to save network: " + e); }
   }
 
   async function handleSaveSettings(newConfig) {
     try {
       await invoke("save_config", { config: newConfig });
       setConfig(newConfig);
-    } catch(e) { alert("Failed to save settings: " + e); }
+    } catch(e) { showToast("Failed to save settings: " + e); }
   }
 
   async function handleRecalibrate(index) {
@@ -1901,13 +2008,20 @@ function App() {
     }
   }
 
-  async function handleDeleteNetwork(index) {
-    if (!confirm(`Delete network [${networks[index].name}]?`)) return;
-    try {
-      const updated = await invoke("delete_network", { networksFile: { networks }, index });
-      setNetworks(updated.networks);
-      setSelectedNetwork(updated.networks.length > 0 ? 0 : null);
-    } catch (e) { alert("Failed to delete network: " + e); }
+  function handleDeleteNetwork(index) {
+    setConfirmState({
+      title: `Delete network "${networks[index].name}"?`,
+      message: "This removes the network and every host in it. This cannot be undone.",
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: async () => {
+        try {
+          const updated = await invoke("delete_network", { networksFile: { networks }, index });
+          setNetworks(updated.networks);
+          setSelectedNetwork(updated.networks.length > 0 ? 0 : null);
+        } catch (e) { showToast("Failed to delete network: " + e); }
+      },
+    });
   }
 
   async function handleSaveHost({ hostData, networkIndex }) {
@@ -1920,16 +2034,23 @@ function App() {
         setSelectedNetwork(networkIndex);
       }
       setNetworks(updated.networks);
-    } catch (e) { alert("Failed to save host: " + e); }
+    } catch (e) { showToast("Failed to save host: " + e); }
   }
 
-  async function handleDeleteHost(hostIndex) {
+  function handleDeleteHost(hostIndex) {
     const host = networks[selectedNetwork].hosts[hostIndex];
-    if (!confirm(`Delete host ${host.ip}?`)) return;
-    try {
-      const updated = await invoke("delete_host", { networksFile: { networks }, networkIndex: selectedNetwork, hostIndex });
-      setNetworks(updated.networks);
-    } catch (e) { alert("Failed to delete host: " + e); }
+    setConfirmState({
+      title: `Delete host ${host.ip}?`,
+      message: "This cannot be undone.",
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: async () => {
+        try {
+          const updated = await invoke("delete_host", { networksFile: { networks }, networkIndex: selectedNetwork, hostIndex });
+          setNetworks(updated.networks);
+        } catch (e) { showToast("Failed to delete host: " + e); }
+      },
+    });
   }
 
   async function handleScan() {
@@ -1938,9 +2059,9 @@ function App() {
     let info = null;
     try {
       info = await invoke("network_scan_info", { network: network.network, timeout: network.scan_timeout ?? null });
-    } catch (e) { alert("Scan failed: " + e); return; }
+    } catch (e) { showToast("Scan failed: " + e); return; }
     const level = info && info.level;
-    if (level === "refuse") { alert(scanInfoText(network.network, info)); return; }
+    if (level === "refuse") { showToast(scanInfoText(network.network, info)); return; }
     if (level === "confirm") { setScanConfirm({ network, info }); return; }
     await runScan();
   }
@@ -1954,7 +2075,7 @@ function App() {
       const reply = await invoke("scan_network", { networksFile: { networks }, networkIndex: selectedNetwork, defaults: config.defaults });
       setNetworks(reply.networks);
       setScanNote(scanSummary(reply));
-    } catch (e) { alert("Scan failed: " + e); }
+    } catch (e) { showToast("Scan failed: " + e); }
     finally { unlisten(); setScanning(false); setScanProgress(null); }
   }
 
@@ -1970,7 +2091,7 @@ function App() {
     try {
       const updated = await invoke("check_hosts", { networksFile: { networks }, networkIndex: selectedNetwork, defaults: config.defaults });
       setNetworks(updated.networks);
-    } catch (e) { alert("Check failed: " + e); }
+    } catch (e) { showToast("Check failed: " + e); }
     finally { unlisten(); setChecking(false); setCheckProgress(null); }
   }
 
@@ -1979,7 +2100,7 @@ function App() {
       const updated = await invoke("bulk_tag", { networksFile: { networks }, networkIndex: selectedNetwork, hostIps: Array.from(selectedHosts), tag });
       setNetworks(updated.networks);
       setSelectedHosts(new Set());
-    } catch (e) { alert("Failed to tag: " + e); }
+    } catch (e) { showToast("Failed to tag: " + e); }
   }
 
   async function handleBulkUsername(username) {
@@ -1987,7 +2108,7 @@ function App() {
       const updated = await invoke("bulk_set_username", { networksFile: { networks }, networkIndex: selectedNetwork, hostIps: Array.from(selectedHosts), username });
       setNetworks(updated.networks);
       setSelectedHosts(new Set());
-    } catch (e) { alert("Failed to set username: " + e); }
+    } catch (e) { showToast("Failed to set username: " + e); }
   }
 
   function toggleHost(ip) {
@@ -2020,7 +2141,7 @@ function App() {
         network, defaults: config.defaults,
         sessionName: `merendero-${network.name.toLowerCase().replace(/\s+/g, '-')}`,
       });
-    } catch (e) { ok = false; detail = String(e); alert("Broadcast failed: " + e); }
+    } catch (e) { ok = false; detail = String(e); showToast("Broadcast failed: " + e); }
     finally { setBroadcasting(false); }
     if (ok) setSelectedHosts(new Set());
     invoke("audit_event", { action: "broadcast", network: network.name, hosts: targets.map(h => h.ip), detail, success: ok }).catch(() => {});
@@ -2037,7 +2158,8 @@ function App() {
     if (f === ":up") return host.active;
     return host.ip.toLowerCase().includes(f) ||
       (host.hostname || "").toLowerCase().includes(f) ||
-      (host.tag || "").toLowerCase().includes(f);
+      (host.tag || "").toLowerCase().includes(f) ||
+      (host.ssh_banner || "").toLowerCase().includes(f);
   }
 
   const filteredHosts = selectedNetwork !== null
@@ -2068,18 +2190,21 @@ function App() {
 
   return (
     <div className="app">
-      {networkModal && <NetworkModal network={networkModal.network} index={networkModal.index} onSave={handleSaveNetwork} onClose={() => setNetworkModal(null)} onRecalibrate={handleRecalibrate} />}
+      {networkModal && <NetworkModal network={networkModal.network} index={networkModal.index} onSave={handleSaveNetwork} onClose={() => setNetworkModal(null)} onRecalibrate={handleRecalibrate} showToast={showToast} />}
       {showHealthBatch && <HealthBatchModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} networkIndex={selectedNetwork} config={config} networks={networks} setNetworks={setNetworks} onOpenHost={(h) => { const fresh = networks[selectedNetwork]?.hosts.find(x => x.ip === h.ip) || h; setHealthModal(fresh); }} onClose={() => setShowHealthBatch(false)} />}
       {healthModal && <HealthCheckModal host={healthModal} network={networks[selectedNetwork]} config={config} networks={networks} setNetworks={setNetworks} selectedNetworkIndex={selectedNetwork} onClose={() => setHealthModal(null)} />}
-      {scpModal && <ScpModal host={scpModal} network={networks[selectedNetwork]} config={config} onClose={() => setScpModal(null)} />}
+      {scpModal && <ScpModal host={scpModal} network={networks[selectedNetwork]} config={config} onClose={() => setScpModal(null)} showToast={showToast} />}
       {showBroadcastConfirm && <BroadcastConfirmModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onConfirm={(reachableHosts) => { setShowBroadcastConfirm(false); handleBroadcast(reachableHosts); }} onClose={() => setShowBroadcastConfirm(false)} />}
-      {showScpBroadcast && <ScpBroadcastModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowScpBroadcast(false)} />}
+      {showScpBroadcast && <ScpBroadcastModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowScpBroadcast(false)} showToast={showToast} />}
       {showRunCommand && <RunCommandModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowRunCommand(false)} />}
-      {showSettings && <SettingsModal config={config} onSave={handleSaveSettings} onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal config={config} networks={networks} onSave={handleSaveSettings} onClose={() => setShowSettings(false)} showToast={showToast} />}
       {scanConfirm && <ScanConfirmModal network={scanConfirm.network} info={scanConfirm.info} onClose={() => setScanConfirm(null)} onConfirm={() => { setScanConfirm(null); runScan(); }} />}
       {terminalPrompt && <TerminalPromptModal terminals={terminalPrompt.terminals} autoId={terminalPrompt.autoId} onChoose={async (v) => { setTerminalPrompt(null); await handleSaveSettings({ ...config, defaults: { ...config.defaults, terminal: v } }); }} />}
-      {hostModal && <HostModal host={hostModal.host} networks={networks} defaultNetworkIndex={selectedNetwork ?? 0} onSave={handleSaveHost} onClose={() => setHostModal(null)} onHealthCheck={(h) => { setHostModal(null); setHealthModal(h); }} />}
+      {hostModal && <HostModal host={hostModal.host} networks={networks} defaultNetworkIndex={selectedNetwork ?? 0} onSave={handleSaveHost} onClose={() => setHostModal(null)} showToast={showToast} onHealthCheck={(h) => { setHostModal(null); setHealthModal(h); }} />}
       {showTagModal && <TagModal count={selectedHosts.size} onApply={handleBulkTag} onClose={() => setShowTagModal(false)} />}
+      {confirmState && <ConfirmModal {...confirmState} onClose={() => setConfirmState(null)} />}
+      {toast && <Toast toast={toast} onClose={() => setToast(null)} />}
+      {updateAvailable && <UpdateNotice version={updateAvailable} onClose={() => setUpdateAvailable(null)} />}
       {showUsernameModal && <UsernameModal count={selectedHosts.size} onApply={handleBulkUsername} onClose={() => setShowUsernameModal(false)} />}
 
       <div className="sidebar">
@@ -2174,6 +2299,14 @@ function App() {
 </>
 ) : (
 <>
+{currentNet.hosts.length === 0 && (
+  <div className="empty-state">
+    <p>This network has no hosts yet.</p>
+    <button className="btn-primary" onClick={handleScan} disabled={scanning || checking || autoChecking}>⟳ Scan for hosts</button>
+  </div>
+)}
+{currentNet.hosts.length > 0 && (
+<>
 {selectedHosts.size > 0 && (
               <div className="broadcast-toolbar">
                 <span>{selectedHosts.size} hosts selected{hiddenNote}</span>
@@ -2208,7 +2341,10 @@ function App() {
                     {host.health_status === "warning" && <span title="Health: WARNING" style={{color:"var(--yellow)", fontSize:"0.65rem"}}>⚠</span>}
                   </span>
                   <span className="ip">{host.ip}</span>
-                  <span className="hostname" title={host.hostname || ""}>{host.hostname || ""}</span>
+                  <span className="hostname-cell">
+                    <span className="hostname" title={host.hostname || ""}>{host.hostname || ""}</span>
+                    {host.ssh_banner && <span className="ssh-banner" title={host.ssh_banner}>{host.ssh_banner}</span>}
+                  </span>
                   <span>{host.tag ? <span className="tag-badge">{host.tag}</span> : ""}</span>
                   <span className="last-seen">{lastSeen(host.ip) || ""}</span>
                   <span className="actions">
@@ -2232,6 +2368,8 @@ function App() {
               {scanNote && !scanning && <span className="scan-note">{scanNote}</span>}
               {selectedHosts.size > 0 && <span className="footer-selected">{selectedHosts.size} selected{hiddenNote}</span>}
             </div>
+</>
+)}
 </>
 )}
           </>

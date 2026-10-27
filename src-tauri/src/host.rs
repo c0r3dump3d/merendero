@@ -14,6 +14,7 @@ pub struct Defaults {
 pub struct Host {
     pub ip: String,
     pub hostname: Option<String>,
+    pub ssh_banner: Option<String>,
     pub username: Option<String>,
     pub port: Option<u16>,
     pub tag: Option<String>,

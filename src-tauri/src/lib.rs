@@ -621,21 +621,27 @@ fn apply_check_results(
     current: &mut NetworksFile,
     name: &str,
     cidr: &str,
-    results: &std::collections::HashMap<String, bool>,
+    results: &std::collections::HashMap<String, (bool, Option<String>)>,
     auto: bool,
 ) -> Result<CheckApply, String> {
     let idx = current.networks.iter()
         .position(|n| n.name == name && n.network == cidr)
         .ok_or_else(|| String::from("The network was edited while it was being checked. Run the check again."))?;
     let hosts = &mut current.networks[idx].hosts;
-    if auto && !results.is_empty() && !results.values().any(|&up| up) && hosts.iter().any(|h| h.active) {
+    if auto && !results.is_empty() && !results.values().any(|(up, _)| *up) && hosts.iter().any(|h| h.active) {
         return Ok(CheckApply::KeptOffline);
     }
     let mut changed = false;
     for host in hosts.iter_mut() {
-        if let Some(&status) = results.get(&host.ip) {
-            if host.active != status {
-                host.active = status;
+        if let Some((status, banner)) = results.get(&host.ip) {
+            if host.active != *status {
+                host.active = *status;
+                changed = true;
+            }
+            // A banner that could not be read this time (busy host, brief hiccup) does not erase one
+            // already known: the field only moves forward when a real banner is actually read.
+            if banner.is_some() && host.ssh_banner != *banner {
+                host.ssh_banner = banner.clone();
                 changed = true;
             }
         }
@@ -680,12 +686,16 @@ async fn check_hosts(
             let _permit = sem.acquire().await.unwrap();
             let address = format!("{}:{}", ip, p);
             // None = could not tell (this process ran out of file descriptors): the host keeps its state.
-            let reachable = match tokio::time::timeout(Duration::from_secs(timeout_secs), TcpStream::connect(&address)).await {
-                Ok(Ok(_)) => Some(true),
-                Ok(Err(e)) if matches!(e.raw_os_error(), Some(23) | Some(24)) => None,
-                _ => Some(false),
+            let (reachable, banner) = match tokio::time::timeout(Duration::from_secs(timeout_secs), TcpStream::connect(&address)).await {
+                Ok(Ok(mut stream)) => {
+                    // Reusing the same connection: no extra connect just to read the banner.
+                    let banner = scanner::read_ssh_banner(&mut stream, 2).await;
+                    (Some(true), banner)
+                }
+                Ok(Err(e)) if matches!(e.raw_os_error(), Some(23) | Some(24)) => (None, None),
+                _ => (Some(false), None),
             };
-            (ip, reachable)
+            (ip, reachable, banner)
         }));
     }
 
@@ -693,8 +703,8 @@ async fn check_hosts(
     let mut results = std::collections::HashMap::new();
     for task in tasks {
         current += 1;
-        if let Ok((ip, Some(status))) = task.await {
-            results.insert(ip, status);
+        if let Ok((ip, Some(status), banner)) = task.await {
+            results.insert(ip, (status, banner));
         }
         let _ = window.emit("check-progress", serde_json::json!({ "total": total, "current": current }));
     }
@@ -1229,6 +1239,28 @@ fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// The version tag of the latest GitHub release, without the leading "v" ("0.1.7"), or None on ANY
+/// failure - no internet, the site being blocked, GitHub being down, a malformed response. This is a
+/// nice-to-have, never something to bother the person about: a failed check looks exactly like "no
+/// update available".
+#[tauri::command]
+async fn check_latest_release() -> Option<String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.github.com/repos/c0r3dump3d/merendero/releases/latest")
+        .header("User-Agent", "Merendero")
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let tag = json.get("tag_name")?.as_str()?;
+    Some(tag.trim_start_matches('v').to_string())
+}
+
 #[tauri::command]
 fn audit_event(action: String, network: String, hosts: Vec<String>, detail: String, success: bool) {
     let entries: Vec<serde_json::Value> = hosts
@@ -1654,13 +1686,13 @@ fn backup_dir() -> std::path::PathBuf {
     dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
-/// Writes the backup as a NEW file that only its owner can read. It never overwrites an earlier backup:
-/// if the name is taken it uses -2, -3, ...
-fn write_backup_file(dir: &std::path::Path, date: &str, content: &str) -> Result<std::path::PathBuf, String> {
+/// Writes `content` as a NEW file that only its owner can read, named "<prefix>-<date>.<ext>" (or
+/// "...-2.<ext>", "...-3.<ext>"... if that name is taken). It never overwrites an existing file.
+fn write_private_file(dir: &std::path::Path, prefix: &str, date: &str, ext: &str, content: &str) -> Result<std::path::PathBuf, String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     for n in 1..=1000u32 {
-        let name = if n == 1 { format!("merendero-backup-{}.json", date) } else { format!("merendero-backup-{}-{}.json", date, n) };
+        let name = if n == 1 { format!("{}-{}.{}", prefix, date, ext) } else { format!("{}-{}-{}.{}", prefix, date, n, ext) };
         let path = dir.join(&name);
         match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
             Ok(mut f) => {
@@ -1671,22 +1703,89 @@ fn write_backup_file(dir: &std::path::Path, date: &str, content: &str) -> Result
                 return Ok(path);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("Could not save the backup in {}: {}", dir.display(), e)),
+            Err(e) => return Err(format!("Could not save it in {}: {}", dir.display(), e)),
         }
     }
-    Err(format!("There are too many backups for {} in {}", date, dir.display()))
+    Err(format!("There are too many files named {}-{} in {}", prefix, date, dir.display()))
 }
 
 fn save_backup_in(config_dir: &std::path::Path, out_dir: &std::path::Path, include_api_key: bool, now: u64) -> Result<serde_json::Value, String> {
     let backup = build_backup(config_dir, include_api_key, now)?;
     let content = serde_json::to_string_pretty(&backup).map_err(|e| format!("Could not build the backup: {}", e))?;
     let (y, m, d) = civil_date(now);
-    let path = write_backup_file(out_dir, &format!("{:04}-{:02}-{:02}", y, m, d), &content)?;
+    let path = write_private_file(out_dir, "merendero-backup", &format!("{:04}-{:02}-{:02}", y, m, d), "json", &content)?;
     Ok(serde_json::json!({
         "path": path.to_string_lossy(),
         "includes_api_key": backup["includes_api_key"],
     }))
 }
+
+// ===== networks export/import: begin =====
+/// Only the fields that describe the network itself, not what this machine has discovered or measured.
+fn network_definition_only(n: &host::Network) -> host::Network {
+    host::Network {
+        name: n.name.clone(),
+        network: n.network.clone(),
+        username: n.username.clone(),
+        port: n.port,
+        identity_file: n.identity_file.clone(),
+        scan_timeout: None,
+        hosts: vec![],
+    }
+}
+
+fn export_networks_in(networks_file: &NetworksFile, indices: &[usize], out_dir: &std::path::Path, now: u64) -> Result<serde_json::Value, String> {
+    if indices.is_empty() {
+        return Err(String::from("Select at least one network to export."));
+    }
+    let chosen: Vec<host::Network> = indices
+        .iter()
+        .map(|&i| networks_file.networks.get(i).map(network_definition_only).ok_or_else(|| String::from("Invalid network index")))
+        .collect::<Result<_, _>>()?;
+    let count = chosen.len();
+    let out = NetworksFile { networks: chosen };
+    let content = toml::to_string_pretty(&out).map_err(|e| format!("Could not build the file: {}", e))?;
+    let (y, m, d) = civil_date(now);
+    let path = write_private_file(out_dir, "merendero-networks", &format!("{:04}-{:02}-{:02}", y, m, d), "toml", &content)?;
+    Ok(serde_json::json!({ "path": path.to_string_lossy(), "count": count }))
+}
+
+/// Adds every incoming network whose CIDR ("network" field) does not already exist locally. A network
+/// that already exists (by CIDR, trimmed) is left completely untouched — name, hosts, everything.
+fn import_networks_into(config_dir: &std::path::Path, content: &str) -> Result<serde_json::Value, String> {
+    let incoming: NetworksFile = toml::from_str(content).map_err(|e| format!("That is not a valid networks file: {}", e))?;
+    let path = config_dir.join("networks.toml");
+    let mut current = host::load_networks(path.to_str().unwrap())?;
+    let existing: std::collections::HashSet<String> = current.networks.iter().map(|n| n.network.trim().to_string()).collect();
+
+    let mut added: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for n in incoming.networks {
+        let cidr = n.network.trim().to_string();
+        if existing.contains(&cidr) {
+            skipped.push(n.name);
+        } else {
+            added.push(n.name.clone());
+            current.networks.push(network_definition_only(&n));
+        }
+    }
+    if !added.is_empty() {
+        host::save_networks(path.to_str().unwrap(), &current)?;
+    }
+    Ok(serde_json::json!({ "networks": current.networks, "added": added, "skipped": skipped }))
+}
+
+#[tauri::command]
+fn export_networks(networks_file: NetworksFile, indices: Vec<usize>) -> Result<serde_json::Value, String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    export_networks_in(&networks_file, &indices, &backup_dir(), now)
+}
+
+#[tauri::command]
+fn import_networks(content: String) -> Result<serde_json::Value, String> {
+    import_networks_into(&get_config_dir(), &content)
+}
+// ===== networks export/import: end =====
 
 fn import_backup_into(config_dir: &std::path::Path, data: &serde_json::Value) -> Result<Vec<String>, String> {
     let mut notes: Vec<String> = Vec::new();
@@ -1965,9 +2064,12 @@ pub fn run() {
             run_command,
             health_check,
             save_backup,
+            export_networks,
+            import_networks,
             import_backup,
             ai_fleet_summary,
             app_version,
+            check_latest_release,
             key_picker_start,
             list_terminals,
             default_terminal,

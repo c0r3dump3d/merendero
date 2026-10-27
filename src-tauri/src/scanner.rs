@@ -306,6 +306,7 @@ pub async fn scan_network_with_progress(
         .into_iter()
         .map(|ip| Host {
             hostname: names.get(&ip).cloned(),
+            ssh_banner: None,  // this host was just discovered; it gets its banner on the next Check
             ip,
             username: None,
             port: None,
@@ -320,4 +321,30 @@ pub async fn scan_network_with_progress(
         .collect();
 
     ScanOutcome { hosts, scanned: range.scanned, total: range.total, cancelled: range.cancelled, dns_unresponsive }
+}
+
+
+/// Reads the SSH banner line from a TCP stream that has JUST connected, without sending anything: the
+/// server sends it unprompted, as the very first thing, before any authentication (RFC 4253). A few
+/// servers send a plain warning line or two first; up to 2 of those are skipped looking for the real
+/// "SSH-..." line. Reads at most 1024 bytes total (far more than the 255-byte line the RFC allows), so
+/// a server that floods data without a newline can't make this hang on to memory. Any failure (timeout,
+/// connection closed, a non-SSH service answering on that port) returns None: the host's stored banner,
+/// if it already had one, is left as it was.
+pub async fn read_ssh_banner(stream: &mut TcpStream, timeout_secs: u64) -> Option<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let mut reader = BufReader::new(stream.take(1024));
+    let mut line = String::new();
+    for _ in 0..3 {
+        line.clear();
+        let n = tokio::time::timeout(Duration::from_secs(timeout_secs), reader.read_line(&mut line)).await.ok()?.ok()?;
+        if n == 0 {
+            return None;
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.starts_with("SSH-") {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
 }
