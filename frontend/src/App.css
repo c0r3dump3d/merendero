@@ -1680,3 +1680,10 @@ html, body, #root {
 .filter-outputs:hover { color: var(--text2); }
 .filter-outputs.on { color: var(--accent2); border-color: var(--accent2); background: rgba(88,166,255,0.08); }
 .host-hit { color: var(--accent2); font-size: 0.65rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ===== AI review of a profile ===== */
+.pf-ai { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.pf-ai .btn-ai-analyze { align-self: flex-start; }
+.pf-ai-note { font-size: 0.7rem; color: var(--text3); }
+.cmd-output.pf-ai-preview { max-height: 260px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pf-ai .health-ai-text { overflow-wrap: anywhere; }

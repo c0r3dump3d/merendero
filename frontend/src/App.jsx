@@ -374,7 +374,7 @@ function ProfileCommandResult({ c }) {
   );
 }
 
-function ProfileHostResult({ label, ip, cur, prev }) {
+function ProfileHostResult({ label, ip, cur, prev, ai, networkName, profileName }) {
   const [open, setOpen] = useState(false);
   const s = profileHostSummary(cur, prev);
   const state = s.errors > 0 ? "bad" : s.changed > 0 ? "changed" : "same";
@@ -397,6 +397,7 @@ function ProfileHostResult({ label, ip, cur, prev }) {
               The previous run {prev.use_sudo ? "used" : "did not use"} sudo and this one {cur.use_sudo ? "did" : "did not"}: some of the differences may come from the privileges, not from the host.
             </div>
           )}
+          <ProfileAiReview ai={ai} networkName={networkName} profileName={profileName} label={label} ip={ip} cur={cur} prev={prev} cmds={s.cmds} />
           {s.cmds.map((c, i) => <ProfileCommandResult key={i} c={c} />)}
         </div>
       )}
@@ -603,7 +604,7 @@ function ProfileModal({ hosts, network, networkIndex, networks, config, showToas
             <input type="checkbox" checked={onlyAttention} onChange={e => setOnlyAttention(e.target.checked)} /> Only hosts with errors or changes
           </label>
           <div className="cmd-results pf-results">
-            {shown.map(r => <ProfileHostResult key={r.h.ip} label={r.h.hostname} ip={r.h.ip} cur={r.cur} prev={r.prev} />)}
+            {shown.map(r => <ProfileHostResult key={r.h.ip} label={r.h.hostname} ip={r.h.ip} cur={r.cur} prev={r.prev} ai={config && config.ai} networkName={network.name} profileName={runs.profileName} />)}
           </div>
           <div className="modal-actions">
             <button className="btn-cancel" onClick={() => setRuns(null)}>← Back</button>
@@ -698,6 +699,161 @@ function outputHit(searchOutputs, outputHits, netName, ip) {
   return <span className="host-hit" title={tip}>▣ {hs[0].label}: {hs[0].lines[0]}{total > 1 ? " (+" + (total - 1) + ")" : ""}</span>;
 }
 // ===== profile output search: end =====
+
+// ===== profile AI review: begin =====
+// Secrets that are obvious from their name (password=..., --api-key=..., "token": "...") are masked before
+// anything leaves the machine. A convenience, not a guarantee: the preview shows exactly what is sent.
+// Deliberately NOT touched: "NOPASSWD: ALL", "/etc/passwd: Permission denied", "passwordauthentication yes".
+// The text comes from a host, so every repeat that can see it is bounded ({0,40}): an unbounded prefix
+// made this quadratic and one huge line could freeze the window for a minute.
+const SECRET_EQ_RE = /((?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[A-Za-z0-9_-]{0,40})(=)("[^"]*"|'[^']*'|\S+)/gi;
+const SECRET_JSON_RE = /("[A-Za-z0-9_-]{0,40}(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[A-Za-z0-9_-]{0,40}"\s{0,8}:\s{0,8})("[^"]*")/gi;
+const KEEP_KEYS = ["passwordauthentication", "permitemptypasswords", "nopasswd"];
+
+function redactSecrets(text) {
+  let count = 0;
+  let out = text.replace(SECRET_EQ_RE, (m, key, eq, value, offset, whole) => {
+    // the full name of the setting, looking back a bounded number of characters (DB_PASSWORD, NO..., etc.)
+    let start = offset;
+    while (start > 0 && offset - start < 40 && /[A-Za-z0-9_-]/.test(whole[start - 1])) start--;
+    const full = whole.slice(start, offset + key.length).toLowerCase();
+    if (KEEP_KEYS.some(k => full.endsWith(k))) return m;
+    count += 1;
+    return key + eq + "***";
+  });
+  out = out.replace(SECRET_JSON_RE, (m, head) => { count += 1; return head + '"***"'; });
+  return { text: out, count };
+}
+
+const REVIEW_NL = String.fromCharCode(10);
+
+// Keeps whole lines up to a character budget; very long lines are cut. Says how many lines were left out.
+function clipOutput(text, maxChars) {
+  const lines = text.split(REVIEW_NL);
+  const kept = [];
+  let used = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i].length > 400 ? lines[i].slice(0, 400) + "…" : lines[i];
+    if (kept.length > 0 && used + l.length + 1 > maxChars) return { text: kept.join(REVIEW_NL), omitted: lines.length - i };
+    kept.push(l);
+    used += l.length + 1;
+  }
+  return { text: kept.join(REVIEW_NL), omitted: 0 };
+}
+
+const clipLine = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
+
+// The text sent to the AI for one host: what ran, the output of each command (clipped, with the secrets
+// masked), the errors that are real, and the lines that changed since the previous run.
+function buildReviewText({ profileName, label, ip, cur, prev, cmds }) {
+  const when = ts => new Date(ts * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  const sudoTxt = u => (u ? "with sudo" : "without sudo");
+  const n = cmds.length;
+  const budget = Math.max(1000, Math.min(5000, Math.floor(30000 / Math.max(n, 1))));
+  const parts = [];
+  parts.push("Host: " + (label || ip) + " (" + ip + ")");
+  parts.push("Profile: " + profileName);
+  parts.push("Run: " + (cur.ts ? when(cur.ts) : "unknown time") + ", " + sudoTxt(cur.use_sudo));
+  parts.push(prev ? "Previous run: " + (prev.ts ? when(prev.ts) : "unknown time") + ", " + sudoTxt(prev.use_sudo) : "Previous run: none, this is the first run");
+  cmds.forEach((c, i) => {
+    const r = c.r;
+    const out = (r.stdout || "").replace(/\s+$/, "");
+    const nLines = out === "" ? 0 : out.split(REVIEW_NL).length;
+    parts.push("");
+    parts.push("### [" + (i + 1) + "/" + n + "] " + clipLine(r.label || "", 200));
+    parts.push("command: " + clipLine(r.command || "", 500));
+    if (nLines === 0) {
+      parts.push("output: (empty)");
+    } else {
+      const clip = clipOutput(out, budget);
+      parts.push("output (" + nLines + " line" + (nLines !== 1 ? "s" : "") + "):");
+      parts.push(clip.text);
+      if (clip.omitted > 0) parts.push("[" + clip.omitted + " more lines not shown]");
+    }
+    const err = cleanStderr(r.stderr);
+    if (err) {
+      const eclip = clipOutput(err, 2000);
+      parts.push("stderr: " + eclip.text);
+      if (eclip.omitted > 0) parts.push("[" + eclip.omitted + " more stderr lines not shown]");
+    }
+    if (prev && c.isNew) parts.push("(this command did not exist in the previous run, nothing to compare)");
+    if (c.isChanged) {
+      parts.push("changes since the previous run:");
+      c.diff.removed.slice(0, 60).forEach(l => parts.push("- " + (l.length > 300 ? l.slice(0, 300) + "…" : l)));
+      c.diff.added.slice(0, 60).forEach(l => parts.push("+ " + (l.length > 300 ? l.slice(0, 300) + "…" : l)));
+      const more = Math.max(0, c.diff.removed.length - 60) + Math.max(0, c.diff.added.length - 60);
+      if (more > 0) parts.push("[" + more + " more changed lines not shown]");
+    }
+  });
+  const red = redactSecrets(parts.join(REVIEW_NL));
+  return { text: red.text, redactions: red.count, nCommands: n, kb: (red.text.length / 1024).toFixed(1) };
+}
+
+// What the AI writes is rendered as Markdown, but never as links or images: the output of a host is text
+// that whoever controls that host controls, and a link could take the window away from the app while an
+// image would make a request to a server of its choosing (with whatever the AI was tricked into putting
+// in the address).
+function SafeMarkdown({ children }) {
+  return <ReactMarkdown components={{ a: ({ children: c }) => <span>{c}</span>, img: () => null }}>{children}</ReactMarkdown>;
+}
+
+function ProfileAiReview({ ai, networkName, profileName, label, ip, cur, prev, cmds }) {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [preview, setPreview] = useState(false);
+  if (!aiReady(ai)) return null;
+  const built = buildReviewText({ profileName, label, ip, cur, prev, cmds });
+  const provider = ai.provider || "claude";
+  const plural = (k, w) => k + " " + w + (k !== 1 ? "s" : "");
+
+  async function run() {
+    if (loading) return;
+    setLoading(true); setError(null);
+    let ok = true;
+    try {
+      setResult(await invoke("ai_profile_review", { reviewText: built.text, apiUrl: ai.api_url, apiKey: ai.api_key || "", model: ai.model, provider }));
+    } catch (e) {
+      ok = false; setResult(null); setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+    invoke("audit_event", {
+      action: "ai_profile_review", network: networkName, hosts: [ip],
+      detail: "sent the output of " + plural(built.nCommands, "command") + ' of profile "' + profileName + '" (' + built.kb + " KB, " + plural(built.redactions, "value") + " masked) to " + provider + " / " + ai.model,
+      success: ok,
+    }).catch(() => {});
+  }
+
+  return (
+    <div className="pf-ai">
+      {!result && (
+        <>
+          <button className="btn-ai-analyze" onClick={run} disabled={loading}>{loading ? "AI reviewing…" : "🤖 Review with AI"}</button>
+          <div className="pf-ai-note">
+            Sends the output of this host's {plural(built.nCommands, "command")} ({built.kb} KB{built.redactions > 0 ? ", " + plural(built.redactions, "value") + " masked" : ""}) to {provider} · {ai.model}.{" "}
+            <button className="btn-link" onClick={() => setPreview(p => !p)}>{preview ? "Hide" : "Show"} exactly what is sent</button>
+          </div>
+          {preview && (
+            <>
+              <div className="pf-ai-note">Only obvious name=value secrets (password=, token=, api-key=…) are masked. Read it before sending.</div>
+              <pre className="cmd-output pf-ai-preview">{built.text}</pre>
+            </>
+          )}
+        </>
+      )}
+      {error && <div className="scp-result error">AI error: {error}</div>}
+      {result && (
+        <div className="health-ai">
+          <div className="health-ai-label">🤖 AI review <button className="btn-link" onClick={run} disabled={loading}>{loading ? "…" : "↻ Regenerate"}</button> <button className="btn-link" onClick={() => setResult(null)}>✕ Hide</button></div>
+          <div className="health-ai-text"><SafeMarkdown>{result}</SafeMarkdown></div>
+          <div className="pf-ai-note">AI can miss things or be wrong, and a host can lie in its own output. "Nothing notable" does not mean the host is clean.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+// ===== profile AI review: end =====
 
 function UsernameModal({ count, onApply, onClose }) {
   const [username, setUsername] = useState("");
