@@ -340,7 +340,7 @@ function profileHostSummary(cur, prev) {
     if (hasError) errors += 1;
     return { r, diff, isChanged, isNew: !p, hasError };
   });
-  return { cmds, changed, errors, sudoDiffers: !!prev && !!cur.use_sudo !== !!prev.use_sudo };
+  return { cmds, changed, errors, compared: cmds.filter(c => !c.isNew).length, sudoDiffers: !!prev && !!cur.use_sudo !== !!prev.use_sudo };
 }
 
 function ProfileCommandResult({ c }) {
@@ -387,7 +387,8 @@ function ProfileHostResult({ label, ip, cur, prev, ai, networkName, profileName 
         {s.errors > 0 && <span className="pf-chip pf-chip-bad">{s.errors} with errors</span>}
         {s.changed > 0 && <span className="pf-chip pf-chip-changed">{s.changed} changed</span>}
         {!prev && <span className="pf-chip">first run</span>}
-        {prev && s.changed === 0 && s.errors === 0 && <span className="pf-chip pf-chip-same">no changes</span>}
+        {prev && s.compared === 0 && <span className="pf-chip">no comparison</span>}
+        {prev && s.compared > 0 && s.changed === 0 && s.errors === 0 && <span className="pf-chip pf-chip-same">no changes</span>}
         <span className="cmd-result-preview">{cur.ts ? fmt(cur.ts) : ""}</span>
       </div>
       {open && (
@@ -727,9 +728,16 @@ function redactSecrets(text) {
 
 const REVIEW_NL = String.fromCharCode(10);
 
+// ss, ps and friends pad their columns with runs of spaces, sometimes thousands of them (ss pads an empty
+// Process column to the width of the longest one). They carry no information, but one such line used up
+// all 400 characters of its slot and cut off whatever came after the padding.
+function squeezeLine(l) {
+  return l.replace(/ {5,}/g, "    ").trimEnd();
+}
+
 // Keeps whole lines up to a character budget; very long lines are cut. Says how many lines were left out.
 function clipOutput(text, maxChars) {
-  const lines = text.split(REVIEW_NL);
+  const lines = text.split(REVIEW_NL).map(squeezeLine);
   const kept = [];
   let used = 0;
   for (let i = 0; i < lines.length; i++) {
@@ -743,18 +751,44 @@ function clipOutput(text, maxChars) {
 
 const clipLine = (s, n) => (s.length > n ? s.slice(0, n) + "…" : s);
 
+// How many characters an output takes once its lines are cut to 400 (what clipOutput would keep of it).
+function outputSize(stdout) {
+  const t = (stdout || "").trimEnd();
+  if (t === "") return 0;
+  return t.split(REVIEW_NL).reduce((n, l) => n + Math.min(squeezeLine(l).length, 401) + 1, 0);
+}
+
+// Gives every output what it needs when everything fits in the total. When it does not, the short ones
+// keep all of theirs and the long ones share what is left (an equal slice for each cut the long ones
+// short while the short ones left their share unused). Nothing gets less than 300 characters.
+function allocBudgets(sizes, total) {
+  const out = sizes.map(() => 0);
+  const order = sizes.map((s, i) => i).sort((a, b) => sizes[a] - sizes[b]);
+  let left = total;
+  order.forEach((i, k) => {
+    const share = Math.floor(left / (order.length - k));
+    out[i] = Math.max(Math.min(sizes[i], share), Math.min(sizes[i], 300));
+    left -= out[i];
+  });
+  return out;
+}
+
 // The text sent to the AI for one host: what ran, the output of each command (clipped, with the secrets
 // masked), the errors that are real, and the lines that changed since the previous run.
 function buildReviewText({ profileName, label, ip, cur, prev, cmds }) {
   const when = ts => new Date(ts * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
   const sudoTxt = u => (u ? "with sudo" : "without sudo");
   const n = cmds.length;
-  const budget = Math.max(1000, Math.min(5000, Math.floor(30000 / Math.max(n, 1))));
+  const budgets = allocBudgets(cmds.map(c => outputSize(c.r.stdout)), 30000);
   const parts = [];
   parts.push("Host: " + (label || ip) + " (" + ip + ")");
   parts.push("Profile: " + profileName);
   parts.push("Run: " + (cur.ts ? when(cur.ts) : "unknown time") + ", " + sudoTxt(cur.use_sudo));
   parts.push(prev ? "Previous run: " + (prev.ts ? when(prev.ts) : "unknown time") + ", " + sudoTxt(prev.use_sudo) : "Previous run: none, this is the first run");
+  if (prev && cmds.some(c => !c.isNew) && !cmds.some(c => c.isChanged)) {
+    const compared = cmds.filter(c => !c.isNew).length;
+    parts.push("Changes since the previous run: none in the " + compared + " command" + (compared !== 1 ? "s" : "") + " that were also in that run");
+  }
   cmds.forEach((c, i) => {
     const r = c.r;
     const out = (r.stdout || "").replace(/\s+$/, "");
@@ -765,7 +799,7 @@ function buildReviewText({ profileName, label, ip, cur, prev, cmds }) {
     if (nLines === 0) {
       parts.push("output: (empty)");
     } else {
-      const clip = clipOutput(out, budget);
+      const clip = clipOutput(out, budgets[i]);
       parts.push("output (" + nLines + " line" + (nLines !== 1 ? "s" : "") + "):");
       parts.push(clip.text);
       if (clip.omitted > 0) parts.push("[" + clip.omitted + " more lines not shown]");
