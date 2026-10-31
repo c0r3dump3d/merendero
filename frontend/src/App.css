@@ -1614,3 +1614,63 @@ html, body, #root {
   color: var(--text);
   z-index: 200;
 }
+
+/* ===== profiles UI ===== */
+.pf-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.pf-item { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+.pf-item:hover { background: rgba(255,255,255,0.03); }
+.pf-item.selected { border-color: var(--accent2); background: rgba(88,166,255,0.06); }
+.pf-item-name { flex: 1; }
+.pf-item-meta { color: var(--text3); font-size: 0.72rem; }
+.pf-cmds { margin: 4px 0 8px; font-size: 0.78rem; color: var(--text2); }
+.pf-cmds summary, .pf-full summary { cursor: pointer; color: var(--text2); }
+.pf-cmd-def { margin-top: 8px; }
+.pf-summary { color: var(--text2); font-size: 0.8rem; margin: 4px 0 8px; }
+.pf-host > .cmd-result-header { cursor: pointer; }
+.pf-host.bad { border-color: rgba(248,81,73,0.45); }
+.pf-host.changed { border-color: rgba(210,153,34,0.45); }
+.pf-chip { font-size: 0.68rem; padding: 1px 7px; border-radius: 10px; background: rgba(255,255,255,0.06); color: var(--text2); }
+.pf-chip-bad { background: rgba(248,81,73,0.15); color: var(--red); }
+.pf-chip-changed { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.pf-chip-same { background: rgba(63,185,80,0.12); color: var(--green); }
+.pf-body { padding: 8px 12px 10px; border-top: 1px solid var(--border); }
+.pf-note { font-size: 0.74rem; color: var(--yellow); margin-bottom: 8px; }
+.pf-cmd { margin-bottom: 12px; }
+.pf-cmd-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.pf-cmd-label { font-size: 0.8rem; font-weight: 600; color: var(--text); }
+.pf-cmd-lines { margin-left: auto; font-size: 0.68rem; color: var(--text3); }
+.pf-empty { font-size: 0.74rem; color: var(--text3); font-style: italic; }
+.pf-diff .pf-add { color: var(--green); }
+.pf-diff .pf-del { color: var(--red); }
+.pf-full { margin-top: 4px; font-size: 0.74rem; }
+
+/* results list: takes the height left in the modal and scrolls inside it. Host blocks have overflow
+   hidden, so without flex-shrink 0 they get squashed to fit instead of overflowing and there is
+   nothing to scroll. */
+.cmd-results.pf-results { flex: 1 1 auto; min-height: 0; max-height: none; }
+.pf-results > .pf-host { flex-shrink: 0; }
+/* outputs and diffs of a profile are meant to be read, not glanced at: more height than the 120px the
+   command box of Run cmd allows (each one still scrolls inside when it is longer). */
+.pf-full .cmd-output, .cmd-output.pf-diff { max-height: 360px; }
+
+/* ===== profile management ===== */
+.pf-item-pick { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; cursor: pointer; }
+.pf-item-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pf-item-meta { flex-shrink: 0; }
+.pf-item-actions { display: flex; align-items: center; gap: 10px; flex-shrink: 0; font-size: 0.72rem; color: var(--text3); }
+.pf-item-actions .btn-link:disabled { opacity: 0.4; cursor: default; text-decoration: none; }
+.btn-link.pf-danger { color: var(--red); }
+.pf-new-row { margin: 2px 0 8px; }
+.pf-editor-list { display: flex; flex-direction: column; gap: 10px; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding-right: 4px; }
+.pf-editor-cmd { flex-shrink: 0; display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+.pf-editor-cmd-head { display: flex; align-items: center; gap: 8px; }
+.pf-editor-num { width: 18px; color: var(--text3); font-size: 0.72rem; }
+.pf-editor-label { flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 6px 9px; border-radius: 6px; font-family: inherit; font-size: 0.8rem; outline: none; }
+.pf-editor-label:focus, .pf-editor-command:focus { border-color: var(--accent2); }
+.pf-editor-tools { display: flex; gap: 10px; flex-shrink: 0; }
+.pf-editor-tools .btn-link:disabled { opacity: 0.4; cursor: default; text-decoration: none; }
+.form-textarea.pf-editor-command { font-family: monospace; font-size: 0.76rem; }
+.pf-editor-warn { font-size: 0.72rem; color: var(--yellow); }
+.pf-editor-note { font-size: 0.72rem; color: var(--text3); }
+.pf-editor-hint { margin-right: auto; align-self: center; font-size: 0.74rem; color: var(--text3); }
+.pf-add-cmd { align-self: flex-start; flex-shrink: 0; }

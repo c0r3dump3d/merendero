@@ -298,6 +298,392 @@ function ExportNetworksModal({ networks, onExport, onClose }) {
   );
 }
 
+// ===== profiles UI: begin =====
+// Line-level comparison of two outputs: lines that appeared and lines that are gone. Order, repeats
+// and trailing spaces do not count: a list that only came back in a different order is not a change.
+function lineDiff(prevText, curText) {
+  const lines = t => (t || "").split("\n").map(l => l.replace(/\s+$/, "")).filter(l => l !== "");
+  const prev = lines(prevText), cur = lines(curText);
+  const prevSet = new Set(prev), curSet = new Set(cur);
+  return {
+    added: [...new Set(cur.filter(l => !prevSet.has(l)))],
+    removed: [...new Set(prev.filter(l => !curSet.has(l)))],
+  };
+}
+
+// The local ssh client prints these on every connection whatever the remote command did. They are not
+// errors of the command, and left in they make every single result look broken. Only these exact
+// messages are dropped (matched by how the line starts): any other stderr, including a WARNING that
+// comes from the host itself, is still shown as an error.
+const SSH_NOISE = [
+  "** WARNING: connection is not using a post-quantum key exchange algorithm",
+  "** This session may be vulnerable to",
+  "** The server may need to be upgraded",
+  "Warning: Permanently added ",
+];
+function cleanStderr(text) {
+  const NL = String.fromCharCode(10);
+  return (text || "").split(NL).filter(l => !SSH_NOISE.some(n => l.startsWith(n))).join(NL).trim();
+}
+
+// One host, one run, compared command by command with the run before it (matched by label).
+function profileHostSummary(cur, prev) {
+  const prevByLabel = {};
+  ((prev && prev.results) || []).forEach(r => { prevByLabel[r.label] = r; });
+  let changed = 0, errors = 0;
+  const cmds = (cur.results || []).map(r => {
+    const p = prevByLabel[r.label];
+    const diff = p ? lineDiff(p.stdout, r.stdout) : null;
+    const isChanged = !!diff && (diff.added.length > 0 || diff.removed.length > 0);
+    const hasError = cleanStderr(r.stderr) !== "";
+    if (isChanged) changed += 1;
+    if (hasError) errors += 1;
+    return { r, diff, isChanged, isNew: !p, hasError };
+  });
+  return { cmds, changed, errors, sudoDiffers: !!prev && !!cur.use_sudo !== !!prev.use_sudo };
+}
+
+function ProfileCommandResult({ c }) {
+  const { r, diff } = c;
+  const out = (r.stdout || "").replace(/\s+$/, "");
+  const nLines = out === "" ? 0 : out.split("\n").length;
+  return (
+    <div className="pf-cmd">
+      <div className="pf-cmd-head">
+        <span className="pf-cmd-label">{r.label}</span>
+        {c.isNew && <span className="pf-chip">new</span>}
+        {c.isChanged && <span className="pf-chip pf-chip-changed">changed</span>}
+        {c.hasError && <span className="pf-chip pf-chip-bad">error</span>}
+        <span className="pf-cmd-lines">{nLines} line{nLines !== 1 ? "s" : ""}</span>
+      </div>
+      {c.isChanged && (
+        <pre className="cmd-output pf-diff">
+          {diff.removed.map((l, i) => <div key={"r" + i} className="pf-del">− {l}</div>)}
+          {diff.added.map((l, i) => <div key={"a" + i} className="pf-add">+ {l}</div>)}
+        </pre>
+      )}
+      {c.hasError && <pre className="cmd-output cmd-stderr">{cleanStderr(r.stderr)}</pre>}
+      {nLines === 0 && !c.hasError && <div className="pf-empty">(no output)</div>}
+      {nLines > 0 && (
+        <details className="pf-full">
+          <summary>full output</summary>
+          <pre className="cmd-output">{out}</pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function ProfileHostResult({ label, ip, cur, prev }) {
+  const [open, setOpen] = useState(false);
+  const s = profileHostSummary(cur, prev);
+  const state = s.errors > 0 ? "bad" : s.changed > 0 ? "changed" : "same";
+  const fmt = ts => new Date(ts * 1000).toLocaleString("en-GB", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return (
+    <div className={`cmd-result pf-host ${state}`}>
+      <div className="cmd-result-header" onClick={() => setOpen(o => !o)}>
+        <span className="cmd-result-host">{label || ip}</span>
+        <span className="cmd-result-ip">{ip}</span>
+        {s.errors > 0 && <span className="pf-chip pf-chip-bad">{s.errors} with errors</span>}
+        {s.changed > 0 && <span className="pf-chip pf-chip-changed">{s.changed} changed</span>}
+        {!prev && <span className="pf-chip">first run</span>}
+        {prev && s.changed === 0 && s.errors === 0 && <span className="pf-chip pf-chip-same">no changes</span>}
+        <span className="cmd-result-preview">{cur.ts ? fmt(cur.ts) : ""}</span>
+      </div>
+      {open && (
+        <div className="pf-body">
+          {s.sudoDiffers && (
+            <div className="pf-note">
+              The previous run {prev.use_sudo ? "used" : "did not use"} sudo and this one {cur.use_sudo ? "did" : "did not"}: some of the differences may come from the privileges, not from the host.
+            </div>
+          )}
+          {s.cmds.map((c, i) => <ProfileCommandResult key={i} c={c} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function isStockProfile(p) { return p.id.startsWith("stock-"); }
+
+// Name for a copy of a profile: "X (copy)", then "X (copy 2)", ... whichever is free.
+function copyName(base, taken) {
+  const lower = new Set(taken.map(n => n.trim().toLowerCase()));
+  let name = base + " (copy)";
+  for (let i = 2; lower.has(name.toLowerCase()); i++) name = base + " (copy " + i + ")";
+  return name;
+}
+
+// What stops a draft from being saved, in the order the person would fix it. Empty list: it can be saved.
+function profileProblems(draft, otherNames) {
+  const problems = [];
+  const name = draft.name.trim();
+  if (name === "") problems.push("Give the profile a name.");
+  else if (otherNames.some(n => n.trim().toLowerCase() === name.toLowerCase())) problems.push("Another profile already has this name.");
+  if (draft.commands.some(c => c.label.trim() === "")) problems.push("Every command needs a label.");
+  if (draft.commands.some(c => c.command.trim() === "")) problems.push("Every command needs a command.");
+  const labels = draft.commands.map(c => c.label.trim().toLowerCase()).filter(l => l !== "");
+  if (new Set(labels).size !== labels.length) problems.push("Two commands have the same label: results are matched to the previous run by label.");
+  return problems;
+}
+
+function ProfileModal({ hosts, network, networkIndex, networks, config, showToast, onClose }) {
+  const [profiles, setProfiles] = useState([]);
+  const [profileId, setProfileId] = useState("");
+  const [useSudo, setUseSudo] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const [runs, setRuns] = useState(null);
+  const [msg, setMsg] = useState(null);
+  const [confirming, setConfirming] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [onlyAttention, setOnlyAttention] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState(null);
+
+  useEffect(() => {
+    invoke("list_profiles")
+      .then(list => { setProfiles(list); if (list.length) setProfileId(list[0].id); })
+      .catch(e => showToast("Could not load the profiles: " + e));
+  }, []);
+
+  const profile = profiles.find(p => p.id === profileId);
+  const ips = hosts.map(h => h.ip);
+  const needed = String(hosts.length);
+  // The commands of the built-in profiles are known read-only checks. A command that is character for
+  // character one of them is trusted (so a clone of a built-in profile does not ask for confirmation just
+  // because the classifier is cautious). Anything else the person wrote goes through the same classifier
+  // and typed confirmation as Run cmd: with sudo on by default it is just as dangerous.
+  const trusted = new Set(profiles.filter(isStockProfile).flatMap(p => p.commands.map(c => c.command)));
+  const needsConfirm = cmd => !trusted.has(cmd) && classifyCommand(cmd).level === "write";
+  const risky = !!profile && !isStockProfile(profile) && profile.commands.some(c => needsConfirm(c.command));
+
+  function startNew() { setDeletingId(null); setEditing({ id: "", name: "", commands: [{ label: "", command: "" }] }); }
+  function startClone(p) { setDeletingId(null); setEditing({ id: "", name: copyName(p.name, profiles.map(x => x.name)), commands: p.commands.map(c => ({ ...c })) }); }
+  function startEdit(p) { setDeletingId(null); setEditing({ id: p.id, name: p.name, commands: p.commands.map(c => ({ ...c })) }); }
+  const setName = v => setEditing(e => ({ ...e, name: v }));
+  const setCmd = (i, k, v) => setEditing(e => ({ ...e, commands: e.commands.map((c, j) => (j === i ? { ...c, [k]: v } : c)) }));
+  const addCmd = () => setEditing(e => ({ ...e, commands: [...e.commands, { label: "", command: "" }] }));
+  const removeCmd = i => setEditing(e => ({ ...e, commands: e.commands.filter((_, j) => j !== i) }));
+  const moveCmd = (i, d) => setEditing(e => {
+    const a = [...e.commands];
+    const j = i + d;
+    if (j < 0 || j >= a.length) return e;
+    [a[i], a[j]] = [a[j], a[i]];
+    return { ...e, commands: a };
+  });
+
+  async function saveEditing() {
+    const others = profiles.filter(p => p.id !== editing.id).map(p => p.name);
+    if (saving || profileProblems(editing, others).length > 0) return;
+    setSaving(true);
+    try {
+      const before = new Set(profiles.map(p => p.id));
+      const list = await invoke("save_profile", { p: { id: editing.id, name: editing.name.trim(), commands: editing.commands.map(c => ({ label: c.label.trim(), command: c.command.trim() })) } });
+      const saved = editing.id ? list.find(p => p.id === editing.id) : list.find(p => !before.has(p.id));
+      setProfiles(list);
+      if (saved) setProfileId(saved.id);
+      setEditing(null); setMsg(null);
+    } catch (e) {
+      showToast("Could not save the profile: " + e);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeProfile(p) {
+    setDeletingId(null);
+    try {
+      const list = await invoke("delete_profile", { id: p.id });
+      setProfiles(list);
+      if (profileId === p.id) setProfileId(list.length ? list[0].id : "");
+    } catch (e) {
+      showToast("Could not delete the profile: " + e);
+    }
+  }
+
+  async function loadRuns() {
+    return invoke("get_profile_runs", { network: network.name, ips, profileId, limit: 2 });
+  }
+
+  async function execute() {
+    if (!profile || running) return;
+    setRunning(true); setConfirming(false); setMsg(null);
+    setProgress({ total: hosts.length, current: 0 });
+    const unlisten = await listen("profile-progress", e => setProgress(e.payload));
+    try {
+      await invoke("run_profile", { profileId, hostIps: ips, networksFile: { networks }, networkIndex, defaults: config.defaults, useSudo });
+      setRuns({ profileName: profile.name, byIp: await loadRuns() });
+    } catch (e) {
+      showToast("Profile failed: " + e);
+    } finally {
+      unlisten(); setRunning(false); setProgress(null);
+    }
+  }
+
+  function handleRun() {
+    if (!profile || running) return;
+    if (risky) { setConfirming(true); setConfirmText(""); return; }
+    execute();
+  }
+
+  async function viewLast() {
+    if (!profile) return;
+    setMsg(null);
+    try {
+      const byIp = await loadRuns();
+      if (Object.keys(byIp).length === 0) { setMsg("This profile has not been run on the selected hosts yet."); return; }
+      setRuns({ profileName: profile.name, byIp });
+    } catch (e) {
+      showToast("Could not load the results: " + e);
+    }
+  }
+
+  if (editing) {
+    const others = profiles.filter(p => p.id !== editing.id).map(p => p.name);
+    const problems = profileProblems(editing, others);
+    return (
+      <div className="modal-overlay">
+        <div className="modal modal-wide">
+          <h3>▣ {editing.id ? "Edit profile" : "New profile"}</h3>
+          <div className="form-group">
+            <label>Name</label>
+            <input value={editing.name} maxLength={80} placeholder="e.g. Performance" autoFocus onChange={e => setName(e.target.value)} />
+          </div>
+          <div className="pf-editor-list">
+            {editing.commands.map((c, i) => (
+              <div key={i} className="pf-editor-cmd">
+                <div className="pf-editor-cmd-head">
+                  <span className="pf-editor-num">{i + 1}</span>
+                  <input className="pf-editor-label" value={c.label} maxLength={80} placeholder="Label (what you will see in the results)" onChange={e => setCmd(i, "label", e.target.value)} />
+                  <span className="pf-editor-tools">
+                    <button className="btn-link" disabled={i === 0} title="Move up" onClick={() => moveCmd(i, -1)}>↑</button>
+                    <button className="btn-link" disabled={i === editing.commands.length - 1} title="Move down" onClick={() => moveCmd(i, 1)}>↓</button>
+                    <button className="btn-link" disabled={editing.commands.length === 1} onClick={() => removeCmd(i)}>Remove</button>
+                  </span>
+                </div>
+                <textarea className="form-textarea pf-editor-command" rows={2} value={c.command} spellCheck={false} placeholder="Shell command, e.g. df -h" onChange={e => setCmd(i, "command", e.target.value)} />
+                {c.command.trim() !== "" && needsConfirm(c.command.trim()) && (
+                  <div className="pf-editor-warn">This looks like it could change the system, or is too complex for the check to be sure it does not. Running this profile will ask you to type the number of hosts to confirm.</div>
+                )}
+              </div>
+            ))}
+          </div>
+          <button className="btn-tag pf-add-cmd" onClick={addCmd}>+ Add command</button>
+          {editing.id && <div className="pf-editor-note">Results are compared with the previous run by label: if you rename a label, that command starts a new comparison.</div>}
+          <div className="modal-actions">
+            <span className="pf-editor-hint">{problems[0] || ""}</span>
+            <button className="btn-cancel" onClick={() => setEditing(null)} disabled={saving}>Cancel</button>
+            <button className="btn-primary" onClick={saveEditing} disabled={problems.length > 0 || saving}>{saving ? "Saving..." : "Save"}</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (runs) {
+    const rows = hosts.filter(h => runs.byIp[h.ip]).map(h => {
+      const [cur, prev] = runs.byIp[h.ip];
+      return { h, cur, prev, s: profileHostSummary(cur, prev) };
+    });
+    const rank = r => (r.s.errors > 0 ? 0 : r.s.changed > 0 ? 1 : 2);
+    const sorted = [...rows].sort((a, b) => rank(a) - rank(b));
+    const shown = onlyAttention ? sorted.filter(r => rank(r) < 2) : sorted;
+    const nBad = rows.filter(r => rank(r) === 0).length;
+    const nChanged = rows.filter(r => rank(r) === 1).length;
+    const nFirst = rows.filter(r => !r.prev).length;
+    const missing = hosts.length - rows.length;
+    return (
+      <div className="modal-overlay">
+        <div className="modal modal-wide">
+          <h3>▣ {runs.profileName} — {rows.length} host{rows.length !== 1 ? "s" : ""}</h3>
+          <div className="pf-summary">{nBad} with errors · {nChanged} with changes · {nFirst} first run{missing > 0 ? ` · ${missing} never run` : ""}</div>
+          <label className="backup-key-option">
+            <input type="checkbox" checked={onlyAttention} onChange={e => setOnlyAttention(e.target.checked)} /> Only hosts with errors or changes
+          </label>
+          <div className="cmd-results pf-results">
+            {shown.map(r => <ProfileHostResult key={r.h.ip} label={r.h.hostname} ip={r.h.ip} cur={r.cur} prev={r.prev} />)}
+          </div>
+          <div className="modal-actions">
+            <button className="btn-cancel" onClick={() => setRuns(null)}>← Back</button>
+            <button className="btn-primary" onClick={onClose}>Close</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-wide">
+        <h3>▣ Profile — {hosts.length} host{hosts.length !== 1 ? "s" : ""}</h3>
+        <div className="pf-list">
+          {profiles.map(p => (
+            <div key={p.id} className={`pf-item ${p.id === profileId ? "selected" : ""}`}>
+              <label className="pf-item-pick">
+                <input type="radio" name="profile" checked={p.id === profileId} disabled={running}
+                  onChange={() => { setProfileId(p.id); setMsg(null); setConfirming(false); setDeletingId(null); }} />
+                <span className="pf-item-name">{p.name}</span>
+                <span className="pf-item-meta">{p.commands.length} command{p.commands.length !== 1 ? "s" : ""}{isStockProfile(p) ? " · built in" : ""}</span>
+              </label>
+              <span className="pf-item-actions">
+                {deletingId === p.id ? (
+                  <>
+                    <span>Delete?</span>
+                    <button className="btn-link pf-danger" onClick={() => removeProfile(p)}>Yes</button>
+                    <button className="btn-link" onClick={() => setDeletingId(null)}>No</button>
+                  </>
+                ) : (
+                  <>
+                    <button className="btn-link" disabled={running} onClick={() => startClone(p)}>Clone</button>
+                    {!isStockProfile(p) && <button className="btn-link" disabled={running} onClick={() => startEdit(p)}>Edit</button>}
+                    {!isStockProfile(p) && <button className="btn-link pf-danger" disabled={running} onClick={() => setDeletingId(p.id)}>Delete</button>}
+                  </>
+                )}
+              </span>
+            </div>
+          ))}
+        </div>
+        <div className="pf-new-row"><button className="btn-tag" disabled={running} onClick={startNew}>+ New profile</button></div>
+        {profile && (
+          <details className="pf-cmds">
+            <summary>Show the {profile.commands.length} commands</summary>
+            {profile.commands.map((c, i) => (
+              <div key={i} className="pf-cmd-def">
+                <div className="pf-cmd-label">{c.label}</div>
+                <pre className="cmd-output">{c.command}</pre>
+              </div>
+            ))}
+          </details>
+        )}
+        <label className="backup-key-option">
+          <input type="checkbox" checked={useSudo} disabled={running} onChange={e => setUseSudo(e.target.checked)} /> Run with sudo (non-interactive)
+        </label>
+        <div className="settings-hint">Most of these checks only see everything as root. If sudo asks for a password on a host you will see that error instead of an empty result. If you connect as root this changes nothing.</div>
+        {confirming && (
+          <div className="cmd-confirm">
+            <div className="cmd-confirm-title">This profile has commands that may change the system. It will run on {hosts.length} host{hosts.length !== 1 ? "s" : ""}. Type {needed} to confirm.</div>
+            <div className="cmd-input-row">
+              <input className="cmd-input" value={confirmText} onChange={e => setConfirmText(e.target.value)} placeholder={needed} autoFocus />
+              <button className="btn-primary" disabled={confirmText.trim() !== needed} onClick={execute}>Run on {needed}</button>
+              <button className="btn-cancel" onClick={() => setConfirming(false)}>Cancel</button>
+            </div>
+          </div>
+        )}
+        {progress && <ProgressBar progress={progress} label="Running..." />}
+        {msg && <div className="scan-note">{msg}</div>}
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose} disabled={running}>Close</button>
+          <button className="btn-tag" onClick={viewLast} disabled={running || !profile}>View last results</button>
+          <button className="btn-primary" onClick={handleRun} disabled={running || !profile}>{running ? "Running..." : "Run"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+// ===== profiles UI: end =====
+
 function UsernameModal({ count, onApply, onClose }) {
   const [username, setUsername] = useState("");
   async function handleSubmit() { await onApply(username); onClose(); }
@@ -1842,6 +2228,7 @@ function App() {
   const [toast, setToast] = useState(null);
   function showToast(text, type = "error") { setToast({ text, type }); }
   const [showUsernameModal, setShowUsernameModal] = useState(false);
+  const [showProfileModal, setShowProfileModal] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showRunCommand, setShowRunCommand] = useState(false);
   const [showScpBroadcast, setShowScpBroadcast] = useState(false);
@@ -1888,7 +2275,7 @@ function App() {
   // It never runs while a dialog is open or another operation is in progress.
   const checkMinutes = config?.monitoring?.check_interval_minutes ?? 15;
   const configReady = !!config;
-  const modalOpen = !!(networkModal || hostModal || showTagModal || showUsernameModal || !!confirmState || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal || terminalPrompt || scanConfirm);
+  const modalOpen = !!(networkModal || hostModal || showTagModal || showUsernameModal || showProfileModal || !!confirmState || showSettings || showRunCommand || showScpBroadcast || showBroadcastConfirm || showHealthBatch || scpModal || healthModal || terminalPrompt || scanConfirm);
   autoStateRef.current = { networks, config, paused: autoPaused, busy: scanning || checking || broadcasting || modalOpen };
 
   async function runAutoCheck() {
@@ -2206,6 +2593,7 @@ function App() {
       {toast && <Toast toast={toast} onClose={() => setToast(null)} />}
       {updateAvailable && <UpdateNotice version={updateAvailable} onClose={() => setUpdateAvailable(null)} />}
       {showUsernameModal && <UsernameModal count={selectedHosts.size} onApply={handleBulkUsername} onClose={() => setShowUsernameModal(false)} />}
+      {showProfileModal && <ProfileModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} networkIndex={selectedNetwork} networks={networks} config={config} showToast={showToast} onClose={() => setShowProfileModal(false)} />}
 
       <div className="sidebar">
         <div className="sidebar-header">
@@ -2314,6 +2702,7 @@ function App() {
                   <button className="btn-clear" onClick={() => setSelectedHosts(new Set())}>Clear</button>
                   <button className="btn-tag" onClick={() => setShowTagModal(true)}>🏷 Tag</button>
                   <button className="btn-tag" onClick={() => setShowUsernameModal(true)}>👤 Username</button>
+                  <button className="btn-tag" onClick={() => setShowProfileModal(true)}>▣ Profile</button>
                   <button className="btn-run-cmd" onClick={() => setShowRunCommand(true)}>▶ Run cmd</button>
                   <button className="btn-run-cmd" onClick={() => setShowHealthBatch(true)}>⚕ Health</button>
                   <button className="btn-run-cmd" onClick={() => setShowScpBroadcast(true)}>📁 SCP</button>

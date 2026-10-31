@@ -1,5 +1,6 @@
 mod host;
 mod scanner;
+mod profile;
 
 use std::path::PathBuf;
 use host::{NetworksFile, Config, Defaults};
@@ -1198,6 +1199,240 @@ fn get_health_history(network: String, ip: String, limit: usize) -> Vec<serde_js
     rows
 }
 
+// ===== profiles: begin =====
+const PROFILE_RETENTION_DAYS: u64 = 90;
+const PROFILE_CONCURRENCY: usize = 20;
+
+/// Every profile command runs under POSIX sh, whatever the remote login shell is. With use_sudo it
+/// goes through `sudo -n` unless the SSH user is already root. The -n matters: if sudo would ask for
+/// a password it fails right away with its own message in stderr, instead of hanging or, worse, the
+/// command running unprivileged and coming back empty, which reads as "nothing found".
+fn profile_wrap(cmd: &str, use_sudo: bool) -> String {
+    let q = sh_quote(cmd);
+    if !use_sudo {
+        return format!("sh -c {q}");
+    }
+    let script = format!(r#"if [ "$(id -u)" -eq 0 ]; then sh -c {q}; else sudo -n sh -c {q}; fi"#);
+    format!("sh -c {}", sh_quote(&script))
+}
+
+fn profiles_path() -> std::path::PathBuf {
+    get_config_dir().join("profiles.toml")
+}
+
+fn profile_history_path() -> std::path::PathBuf {
+    get_config_dir().join("profile_history.jsonl")
+}
+
+/// Same shape as health_history_record: read, drop anything older than retention, append the fresh
+/// rows, rewrite only if something was pruned (otherwise a plain append, cheaper for the common case).
+fn profile_history_record(entries: Vec<serde_json::Value>) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let retention_days: u64 = host::load_config(get_config_dir().join("config.toml").to_str().unwrap())
+        .ok()
+        .and_then(|c| c.monitoring)
+        .and_then(|m| m.history_days)
+        .map(|d| d as u64)
+        .unwrap_or(PROFILE_RETENTION_DAYS);
+    let cutoff = if retention_days == 0 { 0 } else { now.saturating_sub(retention_days * 86400) };
+    let path = profile_history_path();
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut pruned = false;
+    for line in existing.lines() {
+        if line.trim().is_empty() { continue; }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => { pruned = true; continue; }
+        };
+        if v["ts"].as_u64().unwrap_or(0) < cutoff { pruned = true; continue; }
+        kept.push(line.to_string());
+    }
+
+    let fresh: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+    if fresh.is_empty() && !pruned { return; }
+
+    if pruned {
+        let tmp = path.with_extension("jsonl.tmp");
+        let _ = (|| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp)?;
+            for l in kept.iter().chain(fresh.iter()) { writeln!(f, "{}", l)?; }
+            std::fs::rename(&tmp, &path)
+        })();
+    } else if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&path) {
+        for l in &fresh { let _ = writeln!(f, "{}", l); }
+    }
+}
+
+#[tauri::command]
+fn get_profile_history(network: String, ip: String, profile_id: String, limit: usize) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(profile_history_path()).unwrap_or_default();
+    let mut rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["network"].as_str() == Some(network.as_str()) && v["ip"].as_str() == Some(ip.as_str()) && v["profile_id"].as_str() == Some(profile_id.as_str()))
+        .collect();
+    rows.reverse();
+    rows.truncate(limit);
+    rows
+}
+
+/// The newest `limit` runs of one profile for each of the given hosts, newest first, grouped by ip.
+/// One pass over the file for all of them: calling get_profile_history per host would re-read the whole
+/// file once per host, which with hundreds of hosts and a history of hundreds of MB is not workable.
+#[tauri::command]
+fn get_profile_runs(network: String, ips: Vec<String>, profile_id: String, limit: usize) -> std::collections::HashMap<String, Vec<serde_json::Value>> {
+    let want: std::collections::HashSet<&str> = ips.iter().map(|s| s.as_str()).collect();
+    let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
+    if limit == 0 || want.is_empty() {
+        return out;
+    }
+    let text = std::fs::read_to_string(profile_history_path()).unwrap_or_default();
+    let mut full = 0usize;
+    for line in text.lines().rev() {
+        if !line.contains(profile_id.as_str()) { continue; }
+        let v: serde_json::Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
+        if v["network"].as_str() != Some(network.as_str()) || v["profile_id"].as_str() != Some(profile_id.as_str()) { continue; }
+        let ip = match v["ip"].as_str() { Some(ip) if want.contains(ip) => ip.to_string(), _ => continue };
+        let rows = out.entry(ip).or_default();
+        if rows.len() < limit {
+            rows.push(v);
+            if rows.len() == limit {
+                full += 1;
+                if full == want.len() { break; }
+            }
+        }
+    }
+    out
+}
+
+#[tauri::command]
+fn list_profiles() -> Result<Vec<profile::Profile>, String> {
+    let custom = profile::load_custom_profiles(profiles_path().to_str().unwrap())?;
+    Ok(profile::all_profiles(&custom))
+}
+
+/// Upsert: an empty id, or one starting with "stock-" (cloning a stock profile), creates a brand new
+/// custom profile with a fresh id. Any other id updates the matching custom profile in place. Stock
+/// profiles are never written here - they live only in code (profile::stock_profiles).
+#[tauri::command]
+fn save_profile(mut p: profile::Profile) -> Result<Vec<profile::Profile>, String> {
+    let path = profiles_path();
+    let mut custom = profile::load_custom_profiles(path.to_str().unwrap())?;
+    if p.id.is_empty() || p.id.starts_with("stock-") {
+        let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+        p.id = format!("custom-{}", now_ns);
+        custom.profiles.push(p);
+    } else if let Some(existing) = custom.profiles.iter_mut().find(|x| x.id == p.id) {
+        *existing = p;
+    } else {
+        return Err(String::from("Profile not found."));
+    }
+    profile::save_custom_profiles(path.to_str().unwrap(), &custom)?;
+    Ok(profile::all_profiles(&custom))
+}
+
+#[tauri::command]
+fn delete_profile(id: String) -> Result<Vec<profile::Profile>, String> {
+    if id.starts_with("stock-") {
+        return Err(String::from("Stock profiles can't be deleted."));
+    }
+    let path = profiles_path();
+    let mut custom = profile::load_custom_profiles(path.to_str().unwrap())?;
+    let before = custom.profiles.len();
+    custom.profiles.retain(|x| x.id != id);
+    if custom.profiles.len() == before {
+        return Err(String::from("Profile not found."));
+    }
+    profile::save_custom_profiles(path.to_str().unwrap(), &custom)?;
+    Ok(profile::all_profiles(&custom))
+}
+
+/// Runs the profile on each selected host: at most PROFILE_CONCURRENCY hosts at a time, each host
+/// running its commands in order through run_command_inner (the same primitive Run cmd uses), then
+/// appends one history entry per host. Emits "profile-progress" as hosts finish. No diffing here -
+/// that stays client-side, same as health.
+#[tauri::command]
+async fn run_profile(
+    window: tauri::Window,
+    profile_id: String,
+    host_ips: Vec<String>,
+    networks_file: NetworksFile,
+    network_index: usize,
+    defaults: host::Defaults,
+    use_sudo: bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    if network_index >= networks_file.networks.len() {
+        return Err(String::from("Invalid network index"));
+    }
+    let network = networks_file.networks[network_index].clone();
+    let hosts: Vec<host::Host> = network.hosts.iter().filter(|h| host_ips.contains(&h.ip)).cloned().collect();
+    if hosts.is_empty() {
+        return Err(String::from("No matching hosts selected."));
+    }
+
+    let custom = profile::load_custom_profiles(profiles_path().to_str().unwrap())?;
+    let prof = profile::all_profiles(&custom).into_iter().find(|p| p.id == profile_id)
+        .ok_or_else(|| String::from("Profile not found."))?;
+
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(PROFILE_CONCURRENCY));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let total = hosts.len();
+    let mut tasks = Vec::new();
+    for h in hosts.iter().cloned() {
+        let (sem, done, window) = (sem.clone(), done.clone(), window.clone());
+        let (network, defaults, prof) = (network.clone(), defaults.clone(), prof.clone());
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let mut results = Vec::new();
+            for cmd in &prof.commands {
+                let wrapped = profile_wrap(&cmd.command, use_sudo);
+                let r = run_command_inner(vec![h.clone()], network.clone(), defaults.clone(), wrapped).await
+                    .into_iter().next().unwrap_or(serde_json::Value::Null);
+                results.push(serde_json::json!({
+                    "label": cmd.label,
+                    "command": cmd.command,
+                    "stdout": r["stdout"],
+                    "stderr": r["stderr"],
+                    "success": r["success"],
+                }));
+            }
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let _ = window.emit("profile-progress", serde_json::json!({ "total": total, "current": n }));
+            (h.ip.clone(), results)
+        }));
+    }
+    let mut per_host: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
+    for t in tasks {
+        if let Ok((ip, results)) = t.await {
+            per_host.insert(ip, results);
+        }
+    }
+
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut entries = Vec::new();
+    for h in &hosts {
+        let results = per_host.remove(&h.ip).unwrap_or_default();
+        entries.push(serde_json::json!({
+            "ts": now,
+            "time": iso_utc(now),
+            "network": network.name,
+            "ip": h.ip,
+            "profile_id": prof.id,
+            "profile_name": prof.name,
+            "use_sudo": use_sudo,
+            "results": results,
+        }));
+    }
+    profile_history_record(entries.clone());
+    Ok(entries)
+}
+// ===== profiles: end =====
+
 // Where the SSH key picker opens: ~/.ssh if it exists, otherwise the home directory.
 #[tauri::command]
 fn key_picker_start() -> String {
@@ -2077,6 +2312,12 @@ pub fn run() {
             ai_suggest_command,
             health_history_record,
             get_health_history,
+            list_profiles,
+            save_profile,
+            delete_profile,
+            run_profile,
+            get_profile_history,
+            get_profile_runs,
             audit_event,
             save_health_batch,
             save_health_status,
