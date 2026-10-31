@@ -1285,7 +1285,11 @@ fn get_profile_history(network: String, ip: String, profile_id: String, limit: u
 /// One pass over the file for all of them: calling get_profile_history per host would re-read the whole
 /// file once per host, which with hundreds of hosts and a history of hundreds of MB is not workable.
 #[tauri::command]
-fn get_profile_runs(network: String, ips: Vec<String>, profile_id: String, limit: usize) -> std::collections::HashMap<String, Vec<serde_json::Value>> {
+async fn get_profile_runs(network: String, ips: Vec<String>, profile_id: String, limit: usize) -> std::collections::HashMap<String, Vec<serde_json::Value>> {
+    tokio::task::spawn_blocking(move || profile_runs_blocking(network, ips, profile_id, limit)).await.unwrap_or_default()
+}
+
+fn profile_runs_blocking(network: String, ips: Vec<String>, profile_id: String, limit: usize) -> std::collections::HashMap<String, Vec<serde_json::Value>> {
     let want: std::collections::HashSet<&str> = ips.iter().map(|s| s.as_str()).collect();
     let mut out: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
     if limit == 0 || want.is_empty() {
@@ -1308,6 +1312,146 @@ fn get_profile_runs(network: String, ips: Vec<String>, profile_id: String, limit
         }
     }
     out
+}
+
+// ---- search over the stored outputs ----
+#[derive(serde::Deserialize)]
+struct HistResult {
+    label: String,
+    #[serde(default)]
+    stdout: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct HistLine {
+    ts: u64,
+    network: String,
+    ip: String,
+    profile_id: String,
+    profile_name: String,
+    results: Vec<HistResult>,
+}
+
+struct LatestRun {
+    ts: u64,
+    profile_name: String,
+    results: Vec<(String, String)>,
+}
+
+type LatestKey = (String, String, String);
+type LatestSig = (std::path::PathBuf, u64, Option<std::time::SystemTime>);
+
+#[derive(Default)]
+struct LatestCache {
+    sig: Option<LatestSig>,
+    runs: std::collections::HashMap<LatestKey, LatestRun>,
+}
+
+static PROFILE_LATEST: std::sync::OnceLock<std::sync::Mutex<LatestCache>> = std::sync::OnceLock::new();
+static PROFILE_LATEST_REBUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+const PROFILE_SEARCH_MIN_CHARS: usize = 3;
+const PROFILE_SEARCH_MAX_HITS: usize = 20000;
+const PROFILE_SEARCH_LINES: usize = 3;
+const PROFILE_SEARCH_LINE_CHARS: usize = 300;
+
+#[derive(serde::Serialize)]
+struct ProfileHit {
+    network: String,
+    ip: String,
+    profile_name: String,
+    label: String,
+    ts: u64,
+    matches: usize,
+    lines: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ProfileSearch {
+    hits: Vec<ProfileHit>,
+    truncated: bool,
+}
+
+/// Runs the closure over the latest run of every (network, ip, profile). The map is built from the
+/// history file and kept in memory; it is rebuilt only when the file changed (path, size or mtime), so
+/// searching while typing does not re-read a history that can be hundreds of MB.
+fn with_latest_runs<R>(f: impl FnOnce(&std::collections::HashMap<LatestKey, LatestRun>) -> R) -> R {
+    let path = profile_history_path();
+    let sig: Option<LatestSig> = std::fs::metadata(&path).ok().map(|m| (path.clone(), m.len(), m.modified().ok()));
+    let mut cache = PROFILE_LATEST
+        .get_or_init(|| std::sync::Mutex::new(LatestCache::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.sig != sig {
+        PROFILE_LATEST_REBUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut runs: std::collections::HashMap<LatestKey, LatestRun> = std::collections::HashMap::new();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        for line in text.lines() {
+            if let Ok(h) = serde_json::from_str::<HistLine>(line) {
+                let key = (h.network, h.ip, h.profile_id);
+                if runs.get(&key).map_or(false, |old| old.ts > h.ts) {
+                    continue;
+                }
+                let results = h.results.into_iter().map(|r| (r.label, r.stdout.unwrap_or_default())).collect();
+                runs.insert(key, LatestRun { ts: h.ts, profile_name: h.profile_name, results });
+            }
+        }
+        cache.runs = runs;
+        cache.sig = sig;
+    }
+    f(&cache.runs)
+}
+
+fn search_latest(query: &str) -> ProfileSearch {
+    let q = query.trim().to_lowercase();
+    let mut out = ProfileSearch { hits: Vec::new(), truncated: false };
+    if q.chars().count() < PROFILE_SEARCH_MIN_CHARS {
+        return out;
+    }
+    with_latest_runs(|runs| {
+        let mut keys: Vec<&LatestKey> = runs.keys().collect();
+        keys.sort();
+        'all: for key in keys {
+            let run = &runs[key];
+            for (label, stdout) in &run.results {
+                let lower = stdout.to_lowercase();
+                if !lower.contains(&q) {
+                    continue;
+                }
+                let mut matches = 0usize;
+                let mut lines: Vec<String> = Vec::new();
+                for (orig, low) in stdout.lines().zip(lower.lines()) {
+                    if low.contains(&q) {
+                        matches += 1;
+                        if lines.len() < PROFILE_SEARCH_LINES {
+                            let t = orig.trim();
+                            let mut s: String = t.chars().take(PROFILE_SEARCH_LINE_CHARS).collect();
+                            if t.chars().count() > PROFILE_SEARCH_LINE_CHARS {
+                                s.push('…');
+                            }
+                            lines.push(s);
+                        }
+                    }
+                }
+                if matches == 0 {
+                    continue;
+                }
+                if out.hits.len() >= PROFILE_SEARCH_MAX_HITS {
+                    out.truncated = true;
+                    break 'all;
+                }
+                out.hits.push(ProfileHit { network: key.0.clone(), ip: key.1.clone(), profile_name: run.profile_name.clone(), label: label.clone(), ts: run.ts, matches, lines });
+            }
+        }
+    });
+    out
+}
+
+/// Finds, in the latest stored output of every profile on every host, the lines that contain `query`
+/// (case-insensitive, at least 3 characters). Only stdout is searched, never labels or stderr.
+#[tauri::command]
+async fn search_profile_outputs(query: String) -> Result<ProfileSearch, String> {
+    tokio::task::spawn_blocking(move || search_latest(&query)).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2318,6 +2462,7 @@ pub fn run() {
             run_profile,
             get_profile_history,
             get_profile_runs,
+            search_profile_outputs,
             audit_event,
             save_health_batch,
             save_health_status,

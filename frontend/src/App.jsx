@@ -684,6 +684,21 @@ function ProfileModal({ hosts, network, networkIndex, networks, config, showToas
 }
 // ===== profiles UI: end =====
 
+// ===== profile output search: begin =====
+// The line under a host's name that says why it matched when the "▣" toggle is on: the first matching
+// line of the stored output, how many lines matched in all, and in the tooltip where and when.
+function outputHit(searchOutputs, outputHits, netName, ip) {
+  if (!searchOutputs) return null;
+  const hs = outputHits[netName] && outputHits[netName][ip];
+  if (!hs || hs.length === 0) return null;
+  const NL = String.fromCharCode(10);
+  const total = hs.reduce((n, x) => n + x.matches, 0);
+  const when = ts => new Date(ts * 1000).toLocaleString("en-GB", { day: "2-digit", month: "2-digit", year: "2-digit", hour: "2-digit", minute: "2-digit" });
+  const tip = hs.map(x => x.profile_name + " › " + x.label + " (run of " + when(x.ts) + ", " + x.matches + " line" + (x.matches !== 1 ? "s" : "") + ")" + NL + x.lines.join(NL)).join(NL + NL);
+  return <span className="host-hit" title={tip}>▣ {hs[0].label}: {hs[0].lines[0]}{total > 1 ? " (+" + (total - 1) + ")" : ""}</span>;
+}
+// ===== profile output search: end =====
+
 function UsernameModal({ count, onApply, onClose }) {
   const [username, setUsername] = useState("");
   async function handleSubmit() { await onApply(username); onClose(); }
@@ -2214,6 +2229,9 @@ function App() {
   const [selectedNetwork, setSelectedNetwork] = useState(null);
   const [networkScoped, setNetworkScoped] = useState(false);
   const [filter, setFilter] = useState("");
+  const [searchOutputs, setSearchOutputs] = useState(false);
+  const [outputHits, setOutputHits] = useState({});
+  const [outputsSearching, setOutputsSearching] = useState(false);
   const [loading, setLoading] = useState(true);
   const [networkModal, setNetworkModal] = useState(null);
   const [scanning, setScanning] = useState(false);
@@ -2534,7 +2552,7 @@ function App() {
     invoke("audit_event", { action: "broadcast", network: network.name, hosts: targets.map(h => h.ip), detail, success: ok }).catch(() => {});
   }
 
-  function matchesFilter(host, filter) {
+  function matchesFilter(host, filter, netName) {
     if (!filter) return true;
     const f = filter.toLowerCase().trim();
     if (f === ":critical") return host.health_status === "critical";
@@ -2546,20 +2564,55 @@ function App() {
     return host.ip.toLowerCase().includes(f) ||
       (host.hostname || "").toLowerCase().includes(f) ||
       (host.tag || "").toLowerCase().includes(f) ||
-      (host.ssh_banner || "").toLowerCase().includes(f);
+      (host.ssh_banner || "").toLowerCase().includes(f) ||
+      (searchOutputs && !!(outputHits[netName] && outputHits[netName][host.ip]));
   }
 
   const filteredHosts = selectedNetwork !== null
-    ? networks[selectedNetwork]?.hosts.filter(host => matchesFilter(host, filter)) : [];
+    ? networks[selectedNetwork]?.hosts.filter(host => matchesFilter(host, filter, networks[selectedNetwork].name)) : [];
 
   const filteredHostsWithIndex = selectedNetwork !== null
-    ? networks[selectedNetwork]?.hosts.map((host, index) => ({ host, index })).filter(({ host }) => matchesFilter(host, filter)) : [];
+    ? networks[selectedNetwork]?.hosts.map((host, index) => ({ host, index })).filter(({ host }) => matchesFilter(host, filter, networks[selectedNetwork].name)) : [];
 
   useEffect(() => { if (filter.trim() === "") setNetworkScoped(false); }, [filter]);
+
+  // Optional search inside the stored output of the profiles (the "▣" toggle next to the filter). Only
+  // for 3+ characters and never for the ":" shortcuts. Debounced, and a slower answer to an older query
+  // is ignored.
+  const outputQuery = filter.trim();
+  const outputSearchOn = searchOutputs && outputQuery.length >= 3 && !outputQuery.startsWith(":");
+  useEffect(() => {
+    if (!outputSearchOn) {
+      setOutputHits(prev => (Object.keys(prev).length > 0 ? {} : prev));
+      setOutputsSearching(false);
+      return undefined;
+    }
+    let stale = false;
+    setOutputsSearching(true);
+    const timer = setTimeout(async () => {
+      try {
+        const res = await invoke("search_profile_outputs", { query: outputQuery });
+        if (stale) return;
+        const map = {};
+        res.hits.forEach(h => {
+          if (!map[h.network]) map[h.network] = {};
+          if (!map[h.network][h.ip]) map[h.network][h.ip] = [];
+          map[h.network][h.ip].push(h);
+        });
+        setOutputHits(map);
+        if (res.truncated) showToast("Too many matches in the profile outputs: showing the first ones. Make the search more specific.");
+      } catch (e) {
+        if (!stale) { setOutputHits({}); showToast("Could not search the profile outputs: " + e); }
+      } finally {
+        if (!stale) setOutputsSearching(false);
+      }
+    }, 300);
+    return () => { stale = true; clearTimeout(timer); };
+  }, [outputSearchOn, outputQuery]);
   const globalMode = filter.trim() !== "" && !networkScoped;
   const globalResults = globalMode
     ? networks
-        .map((net, netIdx) => ({ net, netIdx, hosts: net.hosts.filter(h => matchesFilter(h, filter)) }))
+        .map((net, netIdx) => ({ net, netIdx, hosts: net.hosts.filter(h => matchesFilter(h, filter, net.name)) }))
         .filter(r => r.hosts.length > 0)
     : [];
   const globalTotal = globalResults.reduce((n, r) => n + r.hosts.length, 0);
@@ -2638,6 +2691,7 @@ function App() {
               </div>
               <div className="main-actions">
                 <div className="filter-wrap"><input onKeyDown={e => { if (e.key === "Escape") setFilter(""); }} className="filter-input" type="text" placeholder="Filter: ip, fqdn, tag, :critical, :warning, :issues, :down, :up" value={filter} onChange={e => setFilter(e.target.value)} disabled={scanning || checking} />{filter && <button className="filter-clear" onClick={() => setFilter("")} title="Clear filter (Esc)">✕</button>}</div>
+                <button className={`filter-outputs ${searchOutputs ? "on" : ""}`} onClick={() => setSearchOutputs(s => !s)} title="Also search the stored output of the profiles (3+ characters)">{outputsSearching ? "…" : "▣"}</button>
                 <button className="btn-settings" onClick={() => setShowSettings(true)}>⚙</button>
                 <button className="btn-add-network-main" onClick={() => setNetworkModal({ network: null, index: undefined })}>+ Network</button>
                 {globalMode && <button className="btn-clear" onClick={() => setFilter("")}>✕ Clear search</button>}
@@ -2670,7 +2724,10 @@ function App() {
               {host.health_status === "warning" && <span title="Health: WARNING" style={{color:"var(--yellow)", fontSize:"0.65rem"}}>⚠</span>}
             </span>
             <span className="ip">{host.ip}</span>
-            <span className="hostname" title={host.hostname || ""}>{host.hostname || ""}</span>
+            <span className="hostname-cell">
+              <span className="hostname" title={host.hostname || ""}>{host.hostname || ""}</span>
+              {outputHit(searchOutputs, outputHits, net.name, host.ip)}
+            </span>
             <span>{host.tag ? <span className="tag-badge">{host.tag}</span> : ""}</span>
             <span className="last-seen">{lastSeen(host.ip) || ""}</span>
             <span className="actions">
@@ -2733,6 +2790,7 @@ function App() {
                   <span className="hostname-cell">
                     <span className="hostname" title={host.hostname || ""}>{host.hostname || ""}</span>
                     {host.ssh_banner && <span className="ssh-banner" title={host.ssh_banner}>{host.ssh_banner}</span>}
+                    {outputHit(searchOutputs, outputHits, currentNet.name, host.ip)}
                   </span>
                   <span>{host.tag ? <span className="tag-badge">{host.tag}</span> : ""}</span>
                   <span className="last-seen">{lastSeen(host.ip) || ""}</span>

@@ -1674,3 +1674,9 @@ html, body, #root {
 .pf-editor-note { font-size: 0.72rem; color: var(--text3); }
 .pf-editor-hint { margin-right: auto; align-self: center; font-size: 0.74rem; color: var(--text3); }
 .pf-add-cmd { align-self: flex-start; flex-shrink: 0; }
+
+/* ===== search in profile outputs ===== */
+.filter-outputs { margin-left: 4px; background: var(--bg); border: 1px solid var(--border); color: var(--text3); border-radius: 6px; padding: 4px 8px; cursor: pointer; font-size: 0.8rem; line-height: 1.2; }
+.filter-outputs:hover { color: var(--text2); }
+.filter-outputs.on { color: var(--accent2); border-color: var(--accent2); background: rgba(88,166,255,0.08); }
+.host-hit { color: var(--accent2); font-size: 0.65rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
