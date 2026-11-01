@@ -366,6 +366,9 @@ function ProfileCommandResult({ c }) {
         </pre>
       )}
       {c.hasError && <pre className="cmd-output cmd-stderr">{cleanStderr(r.stderr)}</pre>}
+      {c.hasError && /Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/.test(r.stderr || "") && (
+        <div className="pf-hostkey-hint">The host key does not match the one saved in known_hosts, so nothing was run. If this host was reinstalled on purpose, remove the old key with <code>ssh-keygen -R &lt;address&gt;</code> and run again; if it was not, treat it as a possible impersonation.</div>
+      )}
       {nLines === 0 && !c.hasError && <div className="pf-empty">(no output)</div>}
       {nLines > 0 && (
         <details className="pf-full">
