@@ -1207,6 +1207,12 @@ const PROFILE_CONCURRENCY: usize = 20;
 /// slots forever and the run would never finish. When it expires the local ssh is killed; the process on
 /// the host may keep running.
 const PROFILE_COMMAND_TIMEOUT_SECS: u64 = 120;
+/// Most stdout kept per command. What a host sends back is outside our control (a compromised host can
+/// stream gigabytes), so it is cut here instead of being held in memory: 4 MiB for profile commands,
+/// 16 MiB for Run cmd and Broadcast. Stderr is cut at 256 KiB.
+const PROFILE_COMMAND_MAX_OUTPUT: usize = 4 * 1024 * 1024;
+const RUN_COMMAND_MAX_OUTPUT: usize = 16 * 1024 * 1024;
+const COMMAND_MAX_STDERR: usize = 256 * 1024;
 
 /// Every profile command runs under POSIX sh, whatever the remote login shell is. With use_sudo it
 /// goes through `sudo -n` unless the SSH user is already root. The -n matters: if sudo would ask for
@@ -1470,6 +1476,7 @@ fn list_profiles() -> Result<Vec<profile::Profile>, String> {
 /// profiles are never written here - they live only in code (profile::stock_profiles).
 #[tauri::command]
 fn save_profile(mut p: profile::Profile) -> Result<Vec<profile::Profile>, String> {
+    profile::validate_profile(&p)?;
     let path = profiles_path();
     let mut custom = profile::load_custom_profiles(path.to_str().unwrap())?;
     if p.id.is_empty() || p.id.starts_with("stock-") {
@@ -1543,6 +1550,7 @@ async fn run_profile_core(
     let custom = profile::load_custom_profiles(profiles_path().to_str().unwrap())?;
     let prof = profile::all_profiles(&custom).into_iter().find(|p| p.id == profile_id)
         .ok_or_else(|| String::from("Profile not found."))?;
+    profile::validate_profile(&prof).map_err(|e| format!("Profile '{}' is not valid: {}", prof.name, e))?;
 
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(PROFILE_CONCURRENCY));
     let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1556,7 +1564,7 @@ async fn run_profile_core(
             let mut results = Vec::new();
             for cmd in &prof.commands {
                 let wrapped = profile_wrap(&cmd.command, use_sudo);
-                let r = run_command_timed(vec![h.clone()], network.clone(), defaults.clone(), wrapped, Some(timeout_secs)).await
+                let r = run_command_timed(vec![h.clone()], network.clone(), defaults.clone(), wrapped, Some(timeout_secs), PROFILE_COMMAND_MAX_OUTPUT).await
                     .into_iter().next().unwrap_or(serde_json::Value::Null);
                 results.push(serde_json::json!({
                     "label": cmd.label,
@@ -1815,7 +1823,58 @@ async fn run_command_inner(
     command: String,
 ) -> Vec<serde_json::Value> {
     // No time limit: Run cmd and Broadcast can start long operations on purpose.
-    run_command_timed(hosts, network, defaults, command, None).await
+    run_command_timed(hosts, network, defaults, command, None, RUN_COMMAND_MAX_OUTPUT).await
+}
+
+/// Like Command::output(), but it keeps at most max_out bytes of stdout and max_err of stderr. What a
+/// host sends back is outside our control (a compromised host can stream gigabytes) and output() would
+/// hold all of it in memory. As soon as either limit is exceeded the local ssh is killed. The last value
+/// of the result is true when that happened.
+async fn ssh_output_capped(
+    mut cmd: tokio::process::Command,
+    max_out: usize,
+    max_err: usize,
+) -> std::io::Result<(Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>, bool)> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncRead, AsyncReadExt};
+
+    async fn read_capped<R: AsyncRead + Unpin>(mut r: R, cap: usize, over: std::sync::Arc<tokio::sync::Notify>) -> (Vec<u8>, bool) {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; 16 * 1024];
+        loop {
+            match r.read(&mut chunk).await {
+                Ok(0) | Err(_) => return (buf, false),
+                Ok(n) => {
+                    let room = cap.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..n.min(room)]);
+                    if n > room {
+                        over.notify_one();
+                        return (buf, true);
+                    }
+                }
+            }
+        }
+    }
+
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut child = cmd.spawn()?;
+    let (so, se) = match (child.stdout.take(), child.stderr.take()) {
+        (Some(o), Some(e)) => (o, e),
+        _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, "could not capture the output of ssh")),
+    };
+    let over = std::sync::Arc::new(tokio::sync::Notify::new());
+    let t_out = tokio::spawn(read_capped(so, max_out, over.clone()));
+    let t_err = tokio::spawn(read_capped(se, max_err, over.clone()));
+    let status = tokio::select! {
+        s = child.wait() => s.ok(),
+        _ = over.notified() => {
+            let _ = child.start_kill();
+            child.wait().await.ok()
+        }
+    };
+    let (out, out_cut) = t_out.await.unwrap_or_default();
+    let (err, err_cut) = t_err.await.unwrap_or_default();
+    Ok((status, out, err, out_cut || err_cut))
 }
 
 /// Runs one command per host over ssh, all hosts in parallel. With Some(secs) the whole ssh invocation
@@ -1826,6 +1885,7 @@ async fn run_command_timed(
     defaults: host::Defaults,
     command: String,
     timeout_secs: Option<u64>,
+    max_output: usize,
 ) -> Vec<serde_json::Value> {
     use tokio::process::Command;
 
@@ -1862,10 +1922,9 @@ async fn run_command_timed(
             let mut ssh = Command::new(program("ssh"));
             ssh.env("PATH", user_path()).args(&args);
             let output = match timeout_secs {
-                None => ssh.output().await,
+                None => ssh_output_capped(ssh, max_output, COMMAND_MAX_STDERR).await,
                 Some(secs) => {
-                    ssh.kill_on_drop(true);
-                    match tokio::time::timeout(std::time::Duration::from_secs(secs), ssh.output()).await {
+                    match tokio::time::timeout(std::time::Duration::from_secs(secs), ssh_output_capped(ssh, max_output, COMMAND_MAX_STDERR)).await {
                         Ok(r) => r,
                         Err(_) => {
                             return serde_json::json!({
@@ -1881,15 +1940,21 @@ async fn run_command_timed(
             };
 
             match output {
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                Ok((status, out_b, err_b, cut)) => {
+                    let stdout = String::from_utf8_lossy(&out_b).to_string();
+                    let mut stderr = String::from_utf8_lossy(&err_b).to_string();
+                    if cut {
+                        if !stderr.is_empty() && !stderr.ends_with(char::from(10u8)) {
+                            stderr.push(char::from(10u8));
+                        }
+                        stderr.push_str(&format!("Output exceeded the size limit ({} MB of stdout, {} KB of stderr) and was cut: the command was stopped.", max_output / (1024 * 1024), COMMAND_MAX_STDERR / 1024));
+                    }
                     serde_json::json!({
                         "ip": ip,
                         "hostname": hostname,
                         "stdout": stdout,
                         "stderr": stderr,
-                        "success": out.status.success(),
+                        "success": !cut && status.map_or(false, |s| s.success()),
                     })
                 }
                 Err(e) => serde_json::json!({

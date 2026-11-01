@@ -23,6 +23,7 @@ pub struct Profile {
 
 #[derive(Deserialize, Serialize, Clone, Default)]
 pub struct ProfilesFile {
+    #[serde(default)]
     pub profiles: Vec<Profile>,
 }
 
@@ -114,22 +115,94 @@ pub fn stock_profiles() -> Vec<Profile> {
     ]
 }
 
+const MAX_PROFILES_FILE_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_COMMANDS: usize = 100;
+pub const MAX_NAME_CHARS: usize = 80;
+pub const MAX_LABEL_CHARS: usize = 80;
+pub const MAX_COMMAND_CHARS: usize = 8000;
+
+/// What a profile must satisfy to be saved or run. The interface already checks most of this, but the
+/// backend is the one that runs commands on the hosts, so it must not rely on that: profiles.toml can be
+/// edited by hand (or be hostile), and nothing else would stop it from asking for 100000 commands.
+pub fn validate_profile(p: &Profile) -> Result<(), String> {
+    let (lf, tab, cr) = (char::from(10u8), char::from(9u8), char::from(13u8));
+    let name = p.name.trim();
+    if name.is_empty() {
+        return Err(String::from("Give the profile a name."));
+    }
+    if name.chars().count() > MAX_NAME_CHARS || name.chars().any(|c| c.is_control()) {
+        return Err(format!("The profile name must be one line of at most {} characters.", MAX_NAME_CHARS));
+    }
+    if p.commands.len() > MAX_COMMANDS {
+        return Err(format!("A profile can have at most {} commands.", MAX_COMMANDS));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for c in &p.commands {
+        let label = c.label.trim();
+        if label.is_empty() {
+            return Err(String::from("Every command needs a label."));
+        }
+        if label.chars().count() > MAX_LABEL_CHARS || label.chars().any(|ch| ch.is_control()) {
+            return Err(format!("Labels must be one line of at most {} characters.", MAX_LABEL_CHARS));
+        }
+        if c.command.trim().is_empty() {
+            return Err(String::from("Every command needs a command."));
+        }
+        if c.command.chars().count() > MAX_COMMAND_CHARS {
+            return Err(format!("A command can have at most {} characters.", MAX_COMMAND_CHARS));
+        }
+        if c.command.chars().any(|ch| ch.is_control() && ch != lf && ch != tab && ch != cr) {
+            return Err(String::from("Commands cannot contain control characters (other than line breaks and tabs)."));
+        }
+        if !seen.insert(label.to_lowercase()) {
+            return Err(String::from("Two commands have the same label: results are matched to the previous run by label."));
+        }
+    }
+    Ok(())
+}
+
 pub fn load_custom_profiles(path: &str) -> Result<ProfilesFile, String> {
     if !std::path::Path::new(path).exists() {
         return Ok(ProfilesFile::default());
+    }
+    let size = std::fs::metadata(path).map(|m| m.len()).map_err(|e| format!("Could not read {}: {}", path, e))?;
+    if size > MAX_PROFILES_FILE_BYTES {
+        return Err(format!("{} is too large ({} MB): profiles are small text files, so this is not a valid profiles file.", path, size / (1024 * 1024)));
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("Could not read {}: {}", path, e))?;
     toml::from_str(&text).map_err(|e| format!("Could not parse {}: {}", path, e))
 }
 
 pub fn save_custom_profiles(path: &str, file: &ProfilesFile) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let text = toml::to_string_pretty(file).map_err(|e| format!("Could not build profiles.toml: {}", e))?;
-    std::fs::write(path, text).map_err(|e| format!("Could not save {}: {}", path, e))
+    // Written to a temporary file with mode 0600 and then renamed over the real one: a crash half way
+    // cannot leave profiles.toml truncated, and the file is never readable by other users.
+    let tmp = format!("{}.tmp", path);
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("Could not save {}: {}", path, e)
+    })
 }
 
 /// Stock profiles first, then whatever the user has saved.
 pub fn all_profiles(custom: &ProfilesFile) -> Vec<Profile> {
     let mut out = stock_profiles();
-    out.extend(custom.profiles.iter().cloned());
+    // A hand-edited or hostile profiles.toml cannot pass a profile off as a built-in one (ids starting
+    // with "stock-") nor repeat an id: the first one wins, as run_profile and save_profile assume.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in &custom.profiles {
+        if p.id.starts_with("stock-") || !seen.insert(p.id.clone()) {
+            continue;
+        }
+        out.push(p.clone());
+    }
     out
 }
