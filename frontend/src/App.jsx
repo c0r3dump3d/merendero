@@ -338,7 +338,7 @@ function profileHostSummary(cur, prev) {
     const hasError = cleanStderr(r.stderr) !== "";
     if (isChanged) changed += 1;
     if (hasError) errors += 1;
-    return { r, diff, isChanged, isNew: !p, hasError };
+    return { r, diff, isChanged, isNew: !p, hasError, cmdChanged: !!p && (p.command || "") !== (r.command || "") };
   });
   return { cmds, changed, errors, compared: cmds.filter(c => !c.isNew).length, sudoDiffers: !!prev && !!cur.use_sudo !== !!prev.use_sudo };
 }
@@ -353,6 +353,7 @@ function ProfileCommandResult({ c }) {
         <span className="pf-cmd-label">{r.label}</span>
         {c.isNew && <span className="pf-chip">new</span>}
         {c.isChanged && <span className="pf-chip pf-chip-changed">changed</span>}
+        {c.cmdChanged && <span className="pf-chip" title="The command itself changed since the previous run: differences may come from the command and not from the host">command changed</span>}
         {c.hasError && <span className="pf-chip pf-chip-bad">error</span>}
         <span className="pf-cmd-lines">{nLines} line{nLines !== 1 ? "s" : ""}</span>
       </div>
@@ -811,6 +812,7 @@ function buildReviewText({ profileName, label, ip, cur, prev, cmds }) {
       if (eclip.omitted > 0) parts.push("[" + eclip.omitted + " more stderr lines not shown]");
     }
     if (prev && c.isNew) parts.push("(this command did not exist in the previous run, nothing to compare)");
+    if (c.cmdChanged) parts.push("(the command itself changed since the previous run, so differences may come from the command and not from the host)");
     if (c.isChanged) {
       parts.push("changes since the previous run:");
       c.diff.removed.slice(0, 60).forEach(l => parts.push("- " + (l.length > 300 ? l.slice(0, 300) + "…" : l)));
