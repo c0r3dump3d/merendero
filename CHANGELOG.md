@@ -21,6 +21,7 @@ All notable changes to Merendero are documented here.
 - ssh's own messages (the server's login banner and OpenSSH's post-quantum key exchange warning) no longer show up as errors in Run cmd and in profile results. Real errors still do
 
 ### Security
+- The window now has a Content Security Policy that only allows the application's own code and styles, images embedded in the page and the communication with its Rust backend. Even if some text from a host ever slipped into the page, it couldn't run scripts or send data out
 - A host can no longer exhaust this machine's memory by returning a huge output: the output of each command is cut at 4 MiB in profiles (16 MiB in Run cmd) and its error output at 256 KiB, and the ssh process is stopped as soon as the limit is exceeded
 - Every profile command has a 120 second limit, so a command that hangs (for example `df` on a stale NFS mount) can't hold a host slot forever
 - Profiles are validated by the backend too, before they are saved and before they run. A hand-edited or hostile `profiles.toml` can't pass a profile off as a built-in one or ask for hundreds of commands per host, and `profiles.toml` is written atomically and readable only by you
