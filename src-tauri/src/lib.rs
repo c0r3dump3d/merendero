@@ -1564,7 +1564,7 @@ async fn run_profile_core(
             let mut results = Vec::new();
             for cmd in &prof.commands {
                 let wrapped = profile_wrap(&cmd.command, use_sudo);
-                let r = run_command_timed(vec![h.clone()], network.clone(), defaults.clone(), wrapped, Some(timeout_secs), PROFILE_COMMAND_MAX_OUTPUT).await
+                let r = run_command_timed(vec![h.clone()], network.clone(), defaults.clone(), wrapped, Some(timeout_secs), PROFILE_COMMAND_MAX_OUTPUT, true).await
                     .into_iter().next().unwrap_or(serde_json::Value::Null);
                 results.push(serde_json::json!({
                     "label": cmd.label,
@@ -1823,7 +1823,7 @@ async fn run_command_inner(
     command: String,
 ) -> Vec<serde_json::Value> {
     // No time limit: Run cmd and Broadcast can start long operations on purpose.
-    run_command_timed(hosts, network, defaults, command, None, RUN_COMMAND_MAX_OUTPUT).await
+    run_command_timed(hosts, network, defaults, command, None, RUN_COMMAND_MAX_OUTPUT, false).await
 }
 
 /// Like Command::output(), but it keeps at most max_out bytes of stdout and max_err of stderr. What a
@@ -1878,7 +1878,9 @@ async fn ssh_output_capped(
 }
 
 /// Runs one command per host over ssh, all hosts in parallel. With Some(secs) the whole ssh invocation
-/// (connection included) is stopped after that many seconds and reported as a failure.
+/// (connection included) is stopped after that many seconds and reported as a failure. With
+/// strict_hostkeys, ssh uses StrictHostKeyChecking=accept-new: new hosts are accepted, but a host that
+/// presents a DIFFERENT key from the saved one is refused (with "no" ssh would only warn and go on).
 async fn run_command_timed(
     hosts: Vec<host::Host>,
     network: host::Network,
@@ -1886,6 +1888,7 @@ async fn run_command_timed(
     command: String,
     timeout_secs: Option<u64>,
     max_output: usize,
+    strict_hostkeys: bool,
 ) -> Vec<serde_json::Value> {
     use tokio::process::Command;
 
@@ -1906,7 +1909,7 @@ async fn run_command_timed(
         let task = tokio::spawn(async move {
             let mut args = vec![
                 "-p".to_string(), port.to_string(),
-                "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
+                "-o".to_string(), String::from(if strict_hostkeys { "StrictHostKeyChecking=accept-new" } else { "StrictHostKeyChecking=no" }),
                 "-o".to_string(), "ConnectTimeout=5".to_string(),
                 "-o".to_string(), "BatchMode=yes".to_string(),
                 // ssh prints its own informational messages (the server's login banner, the post-quantum
