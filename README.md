@@ -51,6 +51,13 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 - **Run cmd** — run one command on many hosts in parallel, with a result for each host and an execution receipt
 - **SCP** — upload or download files for one host, or send a file to many at once. There is a local file picker, and a remote file browser for single-host transfers
 
+**Profiles**
+
+- **Run a set of checks on many hosts** — a profile is a named, ordered list of commands. Four are built in (`Basic hardening`, `Indicators of compromise`, `Basic performance` and `System information`), and you can clone, edit or create your own. It runs on up to 20 hosts at a time, optionally with `sudo -n`, with a time limit and an output limit per command, and it shows what changed on each host since the previous run. The built-in commands only read; your own go through the same confirmation as Run cmd
+- **Search inside the results** — the ▣ toggle next to the filter searches the saved output of the last run on every host (3 characters or more)
+- **Volatile commands** — mark a command whose output changes on every run (top processes, free memory) so it isn't compared with the previous run
+- **Run history** — kept for 90 days by default
+
 **Health checks**
 
 - **Brendan Gregg's 60-second checklist** on any host or on a whole selection (8 at a time), with a local analysis and a status mark in the host table
@@ -62,6 +69,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 - **Host report** with a diagnosis and suggested fix commands for the issues it finds. Review them before running anything
 - **Fleet summary** that groups the hosts flagged in a batch check, built from the local findings and not from the raw output
 - **Command suggestions** in Run cmd: describe what you want and it proposes a command. It never runs it by itself, and commands that aren't clearly read-only need you to type the number of hosts to confirm
+- **Profile review** of one host's results, after a preview of exactly what will be sent. It describes what it sees and what looks routine; it never says a host is clean or compromised
 
 **Records and backup**
 
@@ -75,7 +83,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 ### Prerequisites
 
 - Linux. Arch Linux is the only distribution it has been tested on
-- `ssh` and `scp` in your PATH (Merendero also looks in `~/.local/bin`, `~/.cargo/bin` and the Nix, Guix and snap directories), and `tmux` for broadcast
+- `ssh` and `scp` in your PATH (Merendero also looks in `~/.local/bin`, `~/.cargo/bin` and the Nix, Guix and snap directories), and `tmux` for broadcast. Profiles use `StrictHostKeyChecking=accept-new`, which needs OpenSSH 7.6 or later
 - A terminal emulator. Merendero knows how to start `terminator`, `alacritty`, `kitty`, `foot`, `gnome-terminal`, `mate-terminal`, `xfce4-terminal`, `tilix`, `konsole`, `qterminal`, `xterm`, `lxterminal`, `urxvt` and `sakura`, finds which of them are installed and lets you choose in Settings. On Automatic it prefers `terminator`, then your desktop's own. Broadcast opens maximized (from 4 hosts) in `terminator`, `alacritty`, `kitty`, `gnome-terminal`, `mate-terminal`, `xfce4-terminal`, `tilix` and `xterm`; in the others it uses the terminal's normal size. Any other terminal, by name or full path, is started as `<terminal> -e "<command>"`; one that expects the command as separate arguments may not work
 
 ### From release
@@ -165,6 +173,8 @@ Merendero keeps its data in `~/.config/merendero/`:
 - `history.toml` — when you last connected to each host
 - `audit.jsonl` — what you ran from Merendero, one JSON object per line. Commands are stored as typed, so don't put passwords in them
 - `health_history.jsonl` — the health check history, kept for 90 days by default
+- `profiles.toml` — the profiles you created or cloned (the built-in ones are part of Merendero and aren't stored here)
+- `profile_history.jsonl` — the results of profile runs, kept for 90 days by default. It holds what the commands printed on your hosts, so it is written readable only by you
 
 You normally don't edit these by hand: the defaults, the monitoring settings and the AI settings live in the Settings window (⚙), and networks and hosts are managed from the main window.
 
@@ -246,6 +256,7 @@ Nothing is sent until you press an AI button.
 - **Host report:** the host name and the raw output of the health checklist (processes, mounts, kernel messages, OS release), plus the local findings
 - **Fleet summary:** host names, IPs and the local findings of the flagged hosts, not the raw output
 - **Command suggestions:** only the text you type in the description box
+- **Profile review:** the host name and the output of that host's profile commands (clipped to a size budget, with obvious `name=value` secrets masked), plus what changed since the previous run. A preview shows the exact text before anything is sent
 
 With Ollama on `localhost`, nothing leaves your machine.
 

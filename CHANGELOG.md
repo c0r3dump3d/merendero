@@ -4,6 +4,27 @@ All notable changes to Merendero are documented here.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-01
+
+### Added
+- **Profiles** (▣ Profile): run a named, ordered set of read-only checks on many hosts at once and see, for each host, the result of every command and what changed since the previous run. Four are built in (Basic hardening, Indicators of compromise, Basic performance and System information) and you can clone, edit or create your own. Hosts are processed 20 at a time, optionally with `sudo -n` for the checks that need root
+- Search inside the saved results of the last run of each host: the ▣ toggle next to the filter (3 characters or more)
+- Commands whose output changes on every run (top processes, free memory) can be marked **Volatile**, so they aren't compared with the previous run. A command that was itself changed since the previous run is flagged too, so a different result isn't mistaken for a change in the host
+- **Review with AI** of one host's profile results. It shows exactly what will be sent before sending anything, masks obvious `name=value` secrets, and shows the reply as plain text, without links or images. The output of the host is treated as data, never as instructions
+- Profile run history, kept for 90 days by default in `profile_history.jsonl`
+
+### Changed
+- Profile runs use `StrictHostKeyChecking=accept-new`: a host that presents a different key from the one saved is refused and nothing runs on it (before, ssh only warned and went on). If a host was reinstalled on purpose, remove its old key with `ssh-keygen -R <address>`. It needs OpenSSH 7.6 or later. Run cmd, Broadcast, health check and SCP are unchanged
+- Run cmd and Broadcast cut the output of each host at 16 MiB, with a notice
+
+### Fixed
+- ssh's own messages (the server's login banner and OpenSSH's post-quantum key exchange warning) no longer show up as errors in Run cmd and in profile results. Real errors still do
+
+### Security
+- A host can no longer exhaust this machine's memory by returning a huge output: the output of each command is cut at 4 MiB in profiles (16 MiB in Run cmd) and its error output at 256 KiB, and the ssh process is stopped as soon as the limit is exceeded
+- Every profile command has a 120 second limit, so a command that hangs (for example `df` on a stale NFS mount) can't hold a host slot forever
+- Profiles are validated by the backend too, before they are saved and before they run. A hand-edited or hostile `profiles.toml` can't pass a profile off as a built-in one or ask for hundreds of commands per host, and `profiles.toml` is written atomically and readable only by you
+
 ## [0.1.7] - 2026-10-27
 
 ### Added
