@@ -333,14 +333,15 @@ function profileHostSummary(cur, prev) {
   let changed = 0, errors = 0;
   const cmds = (cur.results || []).map(r => {
     const p = prevByLabel[r.label];
-    const diff = p ? lineDiff(p.stdout, r.stdout) : null;
+    const volatile = !!r.volatile;
+    const diff = p && !volatile ? lineDiff(p.stdout, r.stdout) : null;
     const isChanged = !!diff && (diff.added.length > 0 || diff.removed.length > 0);
     const hasError = cleanStderr(r.stderr) !== "";
     if (isChanged) changed += 1;
     if (hasError) errors += 1;
-    return { r, diff, isChanged, isNew: !p, hasError, cmdChanged: !!p && (p.command || "") !== (r.command || "") };
+    return { r, diff, isChanged, isNew: !p, hasError, volatile, cmdChanged: !!p && !volatile && (p.command || "") !== (r.command || "") };
   });
-  return { cmds, changed, errors, compared: cmds.filter(c => !c.isNew).length, sudoDiffers: !!prev && !!cur.use_sudo !== !!prev.use_sudo };
+  return { cmds, changed, errors, compared: cmds.filter(c => !c.isNew && !c.volatile).length, sudoDiffers: !!prev && !!cur.use_sudo !== !!prev.use_sudo };
 }
 
 function ProfileCommandResult({ c }) {
@@ -352,6 +353,7 @@ function ProfileCommandResult({ c }) {
       <div className="pf-cmd-head">
         <span className="pf-cmd-label">{r.label}</span>
         {c.isNew && <span className="pf-chip">new</span>}
+        {c.volatile && <span className="pf-chip" title="This output changes on every run, so it is not compared with the previous run">volatile</span>}
         {c.isChanged && <span className="pf-chip pf-chip-changed">changed</span>}
         {c.cmdChanged && <span className="pf-chip" title="The command itself changed since the previous run: differences may come from the command and not from the host">command changed</span>}
         {c.hasError && <span className="pf-chip pf-chip-bad">error</span>}
@@ -483,7 +485,7 @@ function ProfileModal({ hosts, network, networkIndex, networks, config, showToas
     setSaving(true);
     try {
       const before = new Set(profiles.map(p => p.id));
-      const list = await invoke("save_profile", { p: { id: editing.id, name: editing.name.trim(), commands: editing.commands.map(c => ({ label: c.label.trim(), command: c.command.trim() })) } });
+      const list = await invoke("save_profile", { p: { id: editing.id, name: editing.name.trim(), commands: editing.commands.map(c => ({ label: c.label.trim(), command: c.command.trim(), volatile: !!c.volatile })) } });
       const saved = editing.id ? list.find(p => p.id === editing.id) : list.find(p => !before.has(p.id));
       setProfiles(list);
       if (saved) setProfileId(saved.id);
@@ -567,6 +569,10 @@ function ProfileModal({ hosts, network, networkIndex, networks, config, showToas
                   </span>
                 </div>
                 <textarea className="form-textarea pf-editor-command" rows={2} value={c.command} spellCheck={false} placeholder="Shell command, e.g. df -h" onChange={e => setCmd(i, "command", e.target.value)} />
+                <label className="pf-editor-volatile" title="The output changes on every run (top processes, free memory...): it will not be compared with the previous run">
+                  <input type="checkbox" checked={!!c.volatile} onChange={e => setCmd(i, "volatile", e.target.checked)} />
+                  Volatile output (do not compare with the previous run)
+                </label>
                 {c.command.trim() !== "" && needsConfirm(c.command.trim()) && (
                   <div className="pf-editor-warn">This looks like it could change the system, or is too complex for the check to be sure it does not. Running this profile will ask you to type the number of hosts to confirm.</div>
                 )}
@@ -786,8 +792,8 @@ function buildReviewText({ profileName, label, ip, cur, prev, cmds }) {
   parts.push("Profile: " + profileName);
   parts.push("Run: " + (cur.ts ? when(cur.ts) : "unknown time") + ", " + sudoTxt(cur.use_sudo));
   parts.push(prev ? "Previous run: " + (prev.ts ? when(prev.ts) : "unknown time") + ", " + sudoTxt(prev.use_sudo) : "Previous run: none, this is the first run");
-  if (prev && cmds.some(c => !c.isNew) && !cmds.some(c => c.isChanged)) {
-    const compared = cmds.filter(c => !c.isNew).length;
+  if (prev && cmds.some(c => !c.isNew && !c.volatile) && !cmds.some(c => c.isChanged)) {
+    const compared = cmds.filter(c => !c.isNew && !c.volatile).length;
     parts.push("Changes since the previous run: none in the " + compared + " command" + (compared !== 1 ? "s" : "") + " that were also in that run");
   }
   cmds.forEach((c, i) => {
@@ -812,6 +818,7 @@ function buildReviewText({ profileName, label, ip, cur, prev, cmds }) {
       if (eclip.omitted > 0) parts.push("[" + eclip.omitted + " more stderr lines not shown]");
     }
     if (prev && c.isNew) parts.push("(this command did not exist in the previous run, nothing to compare)");
+    if (c.volatile) parts.push("(volatile output: it changes on every run, so it is not compared with the previous run)");
     if (c.cmdChanged) parts.push("(the command itself changed since the previous run, so differences may come from the command and not from the host)");
     if (c.isChanged) {
       parts.push("changes since the previous run:");

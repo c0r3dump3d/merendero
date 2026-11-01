@@ -1561,6 +1561,7 @@ async fn run_profile_core(
                 results.push(serde_json::json!({
                     "label": cmd.label,
                     "command": cmd.command,
+                    "volatile": cmd.volatile,
                     "stdout": r["stdout"],
                     "stderr": r["stderr"],
                     "success": r["success"],

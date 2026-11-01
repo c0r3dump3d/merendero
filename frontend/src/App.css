@@ -1671,6 +1671,8 @@ html, body, #root {
 .pf-editor-tools .btn-link:disabled { opacity: 0.4; cursor: default; text-decoration: none; }
 .form-textarea.pf-editor-command { font-family: monospace; font-size: 0.76rem; }
 .pf-editor-warn { font-size: 0.72rem; color: var(--yellow); }
+.pf-editor-volatile { display: flex; align-items: center; gap: 6px; font-size: 0.72rem; color: var(--text3); cursor: pointer; }
+.pf-editor-volatile input { margin: 0; }
 .pf-editor-note { font-size: 0.72rem; color: var(--text3); }
 .pf-editor-hint { margin-right: auto; align-self: center; font-size: 0.74rem; color: var(--text3); }
 .pf-add-cmd { align-self: flex-start; flex-shrink: 0; }
