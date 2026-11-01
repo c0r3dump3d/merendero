@@ -1202,6 +1202,11 @@ fn get_health_history(network: String, ip: String, limit: usize) -> Vec<serde_js
 // ===== profiles: begin =====
 const PROFILE_RETENTION_DAYS: u64 = 90;
 const PROFILE_CONCURRENCY: usize = 20;
+/// Longest a single profile command may take on one host, connection included. Without a limit a command
+/// that hangs (a `df` on a stale NFS mount, a link that dies) would hold one of the PROFILE_CONCURRENCY
+/// slots forever and the run would never finish. When it expires the local ssh is killed; the process on
+/// the host may keep running.
+const PROFILE_COMMAND_TIMEOUT_SECS: u64 = 120;
 
 /// Every profile command runs under POSIX sh, whatever the remote login shell is. With use_sudo it
 /// goes through `sudo -n` unless the SSH user is already root. The -n matters: if sudo would ask for
@@ -1497,7 +1502,8 @@ fn delete_profile(id: String) -> Result<Vec<profile::Profile>, String> {
 }
 
 /// Runs the profile on each selected host: at most PROFILE_CONCURRENCY hosts at a time, each host
-/// running its commands in order through run_command_inner (the same primitive Run cmd uses), then
+/// running its commands in order through run_command_timed (the same ssh primitive Run cmd uses, but
+/// with a time limit per command, PROFILE_COMMAND_TIMEOUT_SECS), then
 /// appends one history entry per host. Emits "profile-progress" as hosts finish. No diffing here -
 /// that stays client-side, same as health.
 #[tauri::command]
@@ -1509,6 +1515,21 @@ async fn run_profile(
     network_index: usize,
     defaults: host::Defaults,
     use_sudo: bool,
+) -> Result<Vec<serde_json::Value>, String> {
+    run_profile_core(window, profile_id, host_ips, networks_file, network_index, defaults, use_sudo, PROFILE_COMMAND_TIMEOUT_SECS).await
+}
+
+/// The body of run_profile, with the per-command time limit as a parameter so that it can be tested
+/// with a short one against a real sshd.
+async fn run_profile_core(
+    window: tauri::Window,
+    profile_id: String,
+    host_ips: Vec<String>,
+    networks_file: NetworksFile,
+    network_index: usize,
+    defaults: host::Defaults,
+    use_sudo: bool,
+    timeout_secs: u64,
 ) -> Result<Vec<serde_json::Value>, String> {
     if network_index >= networks_file.networks.len() {
         return Err(String::from("Invalid network index"));
@@ -1535,7 +1556,7 @@ async fn run_profile(
             let mut results = Vec::new();
             for cmd in &prof.commands {
                 let wrapped = profile_wrap(&cmd.command, use_sudo);
-                let r = run_command_inner(vec![h.clone()], network.clone(), defaults.clone(), wrapped).await
+                let r = run_command_timed(vec![h.clone()], network.clone(), defaults.clone(), wrapped, Some(timeout_secs)).await
                     .into_iter().next().unwrap_or(serde_json::Value::Null);
                 results.push(serde_json::json!({
                     "label": cmd.label,
@@ -1792,6 +1813,19 @@ async fn run_command_inner(
     defaults: host::Defaults,
     command: String,
 ) -> Vec<serde_json::Value> {
+    // No time limit: Run cmd and Broadcast can start long operations on purpose.
+    run_command_timed(hosts, network, defaults, command, None).await
+}
+
+/// Runs one command per host over ssh, all hosts in parallel. With Some(secs) the whole ssh invocation
+/// (connection included) is stopped after that many seconds and reported as a failure.
+async fn run_command_timed(
+    hosts: Vec<host::Host>,
+    network: host::Network,
+    defaults: host::Defaults,
+    command: String,
+    timeout_secs: Option<u64>,
+) -> Vec<serde_json::Value> {
     use tokio::process::Command;
 
     let mut tasks = vec![];
@@ -1824,10 +1858,26 @@ async fn run_command_inner(
             args.push(format!("{}@{}", username, ip));
             args.push(cmd);
 
-            let output = Command::new(program("ssh")).env("PATH", user_path())
-                .args(&args)
-                .output()
-                .await;
+            let mut ssh = Command::new(program("ssh"));
+            ssh.env("PATH", user_path()).args(&args);
+            let output = match timeout_secs {
+                None => ssh.output().await,
+                Some(secs) => {
+                    ssh.kill_on_drop(true);
+                    match tokio::time::timeout(std::time::Duration::from_secs(secs), ssh.output()).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            return serde_json::json!({
+                                "ip": ip,
+                                "hostname": hostname,
+                                "stdout": "",
+                                "stderr": format!("Timed out after {} s: the command did not finish and was stopped. The remote process may still be running on the host.", secs),
+                                "success": false,
+                            });
+                        }
+                    }
+                }
+            };
 
             match output {
                 Ok(out) => {
