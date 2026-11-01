@@ -92,6 +92,25 @@ pub fn stock_profiles() -> Vec<Profile> {
                 pc("Failed systemd units", "systemctl --failed --no-pager --plain"),
             ],
         },
+        Profile {
+            id: "stock-sysinfo".into(),
+            name: "System information".into(),
+            commands: vec![
+                pc("OS release", "if [ -r /etc/os-release ]; then grep -E '^(PRETTY_NAME|VERSION_ID|ID|ID_LIKE)=' /etc/os-release; else cat /etc/redhat-release 2>/dev/null || echo 'no /etc/os-release'; fi"),
+                pc("Kernel and architecture", "uname -srvm"),
+                pc("Virtualization", "if command -v systemd-detect-virt >/dev/null 2>&1; then systemd-detect-virt; else echo 'systemd-detect-virt not installed'; fi"),
+                pc("CPU (lscpu)", "lscpu | grep -vE '^(CPU MHz|CPU[(]s[)] scaling MHz):'"),
+                pc("CPU microcode", "grep -m1 microcode /proc/cpuinfo || echo 'no microcode field (not x86, or hidden by the hypervisor)'"),
+                pc("Memory totals", "grep -E '^(MemTotal|SwapTotal|HugePages_Total|Hugepagesize):' /proc/meminfo"),
+                pc("Memory modules (DMI)", "dmidecode -t memory | awk '/^Memory Device$/ {if (loc != empty && size !~ /No Module|Not Inst/) print loc, size, type, speed, mfr, pn; loc = size = type = speed = mfr = pn = empty} /^[[:space:]]*Locator:/ {loc = $2} /^[[:space:]]*Size:/ {size = $2 OFS $3} /^[[:space:]]*Type:/ {type = $2} /^[[:space:]]*Speed:/ {speed = $2 OFS $3} /^[[:space:]]*Manufacturer:/ {mfr = $2} /^[[:space:]]*Part Number:/ {pn = $3} END {if (loc != empty && size !~ /No Module|Not Inst/) print loc, size, type, speed, mfr, pn}'"),
+                pc("DMI: system, baseboard, chassis and BIOS", "dmidecode -t system -t baseboard -t chassis -t bios"),
+                pc("Block devices", "lsblk -e 7 -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT"),
+                pc("PCI devices", "lspci"),
+                pc("Network interfaces", "ip -br addr 2>/dev/null || ip addr"),
+                pc("Boot mode and Secure Boot", "if [ -d /sys/firmware/efi ]; then echo 'boot mode: UEFI'; else echo 'boot mode: legacy BIOS (or no firmware info)'; fi; if command -v mokutil >/dev/null 2>&1; then mokutil --sb-state; else echo 'mokutil not installed'; fi"),
+                pc("Time zone and clock sync", "timedatectl 2>/dev/null | grep -E 'Time zone|synchronized|NTP service' || echo 'timedatectl not available'"),
+            ],
+        },
     ]
 }
 
