@@ -207,6 +207,18 @@ body {
 }
 .broadcast-actions { display: flex; gap: 6px; }
 
+/* The bar is always there: without a selection it is neutral and its buttons are switched off. */
+.broadcast-toolbar { height: 36px; box-sizing: border-box; gap: 12px; }
+.broadcast-toolbar > span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.broadcast-actions { flex-shrink: 0; }
+.broadcast-toolbar.empty { background: transparent; border-bottom-color: var(--border); }
+.broadcast-toolbar .toolbar-hint { color: var(--text3); }
+.broadcast-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+.broadcast-actions .btn-clear:disabled:hover { color: var(--text3); }
+.broadcast-actions .btn-tag:disabled:hover,
+.broadcast-actions .btn-run-cmd:disabled:hover { border-color: var(--border); background: transparent; }
+.broadcast-actions .btn-broadcast:disabled:hover { background: var(--accent); }
+
 .btn-clear {
   background: transparent;
   color: var(--text3);

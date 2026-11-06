@@ -3098,6 +3098,7 @@ function App() {
   const hiddenNote = hiddenSelected > 0
     ? <span className="selection-hidden" title="These hosts are hidden by the current filter, but they are still selected and will be included in Run cmd, Broadcast, SCP, Health, Tag and Username. Clear removes them.">{` (${hiddenSelected} hidden)`}</span>
     : null;
+  const noneSelected = selectedHosts.size === 0;
   const currentNet = selectedNetwork !== null ? networks[selectedNetwork] : null;
   const activeCount = currentNet ? currentNet.hosts.filter(h => h.active).length : 0;
 
@@ -3227,21 +3228,21 @@ function App() {
 )}
 {currentNet.hosts.length > 0 && (
 <>
-{selectedHosts.size > 0 && (
-              <div className="broadcast-toolbar">
-                <span>{selectedHosts.size} hosts selected{hiddenNote}</span>
-                <div className="broadcast-actions">
-                  <button className="btn-clear" onClick={() => setSelectedHosts(new Set())}>Clear</button>
-                  <button className="btn-tag" onClick={() => setShowTagModal(true)}>🏷 Tag</button>
-                  <button className="btn-tag" onClick={() => setShowUsernameModal(true)}>👤 Username</button>
-                  <button className="btn-tag" onClick={() => setShowProfileModal(true)}>▣ Profile</button>
-                  <button className="btn-run-cmd" onClick={() => setShowRunCommand(true)}>▶ Run cmd</button>
-                  <button className="btn-run-cmd" onClick={() => setShowHealthBatch(true)}>⚕ Health</button>
-                  <button className="btn-run-cmd" onClick={() => setShowScpBroadcast(true)}>📁 SCP</button>
-                  <button className={`btn-broadcast ${broadcasting ? "disabled" : ""}`} onClick={() => setShowBroadcastConfirm(true)} disabled={broadcasting}>⚡ Broadcast ({selectedHosts.size})</button>
-                </div>
+<div className={`broadcast-toolbar${noneSelected ? " empty" : ""}`}>
+              {noneSelected
+                ? <span className="toolbar-hint" title="Tick the boxes on the left to act on several hosts at once">No hosts selected — tick the boxes</span>
+                : <span>{selectedHosts.size} {selectedHosts.size === 1 ? "host" : "hosts"} selected{hiddenNote}</span>}
+              <div className="broadcast-actions" title={noneSelected ? "Select one or more hosts first" : undefined}>
+                <button className="btn-clear" disabled={noneSelected} onClick={() => setSelectedHosts(new Set())}>Clear</button>
+                <button className="btn-tag" disabled={noneSelected} onClick={() => setShowTagModal(true)}>🏷 Tag</button>
+                <button className="btn-tag" disabled={noneSelected} onClick={() => setShowUsernameModal(true)}>👤 Username</button>
+                <button className="btn-tag" disabled={noneSelected} onClick={() => setShowProfileModal(true)}>▣ Profile</button>
+                <button className="btn-run-cmd" disabled={noneSelected} onClick={() => setShowRunCommand(true)}>▶ Run cmd</button>
+                <button className="btn-run-cmd" disabled={noneSelected} onClick={() => setShowHealthBatch(true)}>⚕ Health</button>
+                <button className="btn-run-cmd" disabled={noneSelected} onClick={() => setShowScpBroadcast(true)}>📁 SCP</button>
+                <button className={`btn-broadcast ${broadcasting ? "disabled" : ""}`} onClick={() => setShowBroadcastConfirm(true)} disabled={noneSelected || broadcasting}>⚡ Broadcast{noneSelected ? "" : ` (${selectedHosts.size})`}</button>
               </div>
-            )}
+            </div>
 
             <div className="host-table">
               <div className="host-table-header">
