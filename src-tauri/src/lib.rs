@@ -741,19 +741,29 @@ async fn list_remote_dir(
         "-o".to_string(), "BatchMode=yes".to_string(),
     ];
     args.extend(identity_arg);
+    // '--' before the destination: without it, a username starting with '-' (e.g. from an imported backup)
+    // would be read by ssh as an OPTION, and -oProxyCommand=... runs a local command.
+    args.push(String::from("--"));
     args.push(format!("{}@{}", username, ip));
     // ls -la con formato parseable
     // The path goes through the remote shell: quote it, or a folder named  x$(command)  would run that command.
     // The * and .* stay outside the quotes so the shell still expands them.
     args.push(format!("for f in {}/* {}/.*; do [ -e \"$f\" ] || continue; n=$(basename \"$f\"); [ \"$n\" = \".\" ] || [ \"$n\" = \"..\" ] && continue; if [ -d \"$f\" ]; then echo \"d:$n\"; else echo \"f:$n\"; fi; done 2>/dev/null", sh_quote(&path), sh_quote(&path)));
 
-    let output = Command::new(program("ssh")).env("PATH", user_path())
-        .args(&args)
-        .output()
+    let mut cmd = Command::new(program("ssh"));
+    cmd.env("PATH", user_path()).args(&args);
+    let (_status, out, _err, truncated) = ssh_output_capped(cmd, REMOTE_DIR_MAX_OUTPUT, COMMAND_MAX_STDERR)
         .await
         .map_err(|e| format!("SSH error: {}", e))?;
+    if truncated {
+        return Err(format!(
+            "{} has too many entries to list here (the listing went over {} MiB).",
+            path,
+            REMOTE_DIR_MAX_OUTPUT / (1024 * 1024)
+        ));
+    }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stdout = String::from_utf8_lossy(&out).to_string();
     let mut entries = vec![];
 
     for line in stdout.lines() {
@@ -925,7 +935,6 @@ async fn remote_file_size(
     identity_file: &Option<String>,
     remote_path: &str,
 ) -> Option<u64> {
-    use std::process::Stdio;
     let mut args = vec![
         "-p".to_string(), port.to_string(),
         "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
@@ -946,22 +955,19 @@ async fn remote_file_size(
         None => sh_quote(remote_path),
     };
     args.push(format!("stat -c %s -- {} 2>/dev/null", quoted));
-    let out = tokio::time::timeout(
+    let mut cmd = tokio::process::Command::new(program("ssh"));
+    cmd.env("PATH", user_path()).args(&args);
+    let (status, out, _err, truncated) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new(program("ssh"))
-            .env("PATH", user_path())
-            .args(&args)
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
+        ssh_output_capped(cmd, FILE_SIZE_MAX_OUTPUT, FILE_SIZE_MAX_OUTPUT),
     )
     .await
     .ok()?
     .ok()?;
-    if !out.status.success() {
+    if truncated || !status.map_or(false, |s| s.success()) {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+    String::from_utf8_lossy(&out).trim().parse::<u64>().ok()
 }
 
 /// Reads up to `cap` bytes and then keeps draining, so the child never blocks on a full pipe.
@@ -1556,6 +1562,10 @@ const PROFILE_COMMAND_TIMEOUT_SECS: u64 = 120;
 const PROFILE_COMMAND_MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const RUN_COMMAND_MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const COMMAND_MAX_STDERR: usize = 256 * 1024;
+/// Output limits of the other ssh calls (not Run cmd / profiles). What a host answers is not trusted.
+const REMOTE_DIR_MAX_OUTPUT: usize = 4 * 1024 * 1024; // a folder listing: names only
+const HEALTH_MAX_OUTPUT: usize = 1024 * 1024; // the health check script prints a few KB
+const FILE_SIZE_MAX_OUTPUT: usize = 4096; // stat prints one number
 
 /// Every profile command runs under POSIX sh, whatever the remote login shell is. With use_sudo it
 /// goes through `sudo -n` unless the SSH user is already root. The -n matters: if sudo would ask for
@@ -2405,16 +2415,22 @@ echo "=== END ==="
     let mut args = base_args.clone();
     args.push(script.to_string());
 
-    let output = Command::new(program("ssh")).env("PATH", user_path())
-        .args(&args)
-        .output()
+    let mut cmd = Command::new(program("ssh"));
+    cmd.env("PATH", user_path()).args(&args);
+    let (status, out, err, truncated) = ssh_output_capped(cmd, HEALTH_MAX_OUTPUT, COMMAND_MAX_STDERR)
         .await
         .map_err(|e| format!("SSH error: {}", e))?;
+    if truncated {
+        return Err(format!(
+            "The health check output went over {} KiB, far more than expected, so it was cut. The host may be misbehaving.",
+            HEALTH_MAX_OUTPUT / 1024
+        ));
+    }
 
-    let raw = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let raw = String::from_utf8_lossy(&out).to_string();
+    let stderr = String::from_utf8_lossy(&err).to_string();
 
-    if !output.status.success() && raw.is_empty() {
+    if !status.map_or(false, |s| s.success()) && raw.is_empty() {
         return Err(format!("Connection failed: {}", stderr));
     }
 

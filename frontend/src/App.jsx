@@ -1841,6 +1841,7 @@ function RemoteBrowserModal({ host, network, config, onSelect, onClose, mode = "
       });
       setEntries(res);
     } catch(e) {
+      setEntries([]);
       setError(e.toString());
     } finally {
       setLoading(false);
