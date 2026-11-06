@@ -1603,9 +1603,25 @@ function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState([]);
 
+  const upload = direction === "upload";
+
+  // The local path means something different in each direction (a file to send, a folder to receive in),
+  // so it is not carried over when the direction changes.
+  function changeDirection(d) {
+    if (d === direction) return;
+    setDirection(d);
+    setLocalPath("");
+    setResults([]);
+  }
+
   async function browseLocal() {
-    const selected = await open({ multiple: false, title: "Select file" });
-    if (selected) setLocalPath(selected);
+    if (upload) {
+      const selected = await open({ multiple: false, title: "Select file to upload" });
+      if (selected) setLocalPath(selected);
+    } else {
+      const selected = await open({ directory: true, multiple: false, title: "Select destination folder" });
+      if (selected) setLocalPath(selected);
+    }
   }
 
   async function handleRun() {
@@ -1632,51 +1648,69 @@ function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
     }
   }
 
+  const okCount = results.filter(r => r.success).length;
+
+  const localField = (
+    <div className="form-group">
+      <label>{upload ? "Local file (source)" : "Local destination folder"}</label>
+      <div className="form-row">
+        <input
+          value={localPath}
+          onChange={e => setLocalPath(e.target.value)}
+          placeholder={upload ? "/home/user/script.sh" : "/home/user/Downloads/"}
+        />
+        <button className="btn-browse" onClick={browseLocal}>Browse</button>
+      </div>
+      {!upload && <div className="scp-hint">Each host's file goes into its own folder inside this one, named after the host and its IP.</div>}
+    </div>
+  );
+
+  const remoteField = (
+    <div className="form-group">
+      <label>{upload ? "Remote destination" : "Remote file (source)"} — the same path on every host</label>
+      <input value={remotePath} onChange={e => setRemotePath(e.target.value)} placeholder={upload ? "/tmp/script.sh" : "/var/log/syslog"} />
+    </div>
+  );
+
   return (
     <div className="modal-overlay">
       <div className="modal modal-wide">
         <h3>📁 SCP Broadcast — {hosts.length} hosts</h3>
 
-        <div className="scp-direction">
-          <button className={`scp-dir-btn ${direction === "upload" ? "active" : ""}`} onClick={() => setDirection("upload")}>↑ Upload (local → remote)</button>
-          <button className={`scp-dir-btn ${direction === "download" ? "active" : ""}`} onClick={() => setDirection("download")}>↓ Download (remote → local)</button>
-        </div>
-
-        <div className="form-group">
-          <label>Local path</label>
-          <div className="form-row">
-            <input value={localPath} onChange={e => setLocalPath(e.target.value)} placeholder="/home/user/script.sh" />
-            <button className="btn-browse" onClick={browseLocal}>Browse</button>
+        <fieldset className="scp-fieldset" disabled={running}>
+          <div className="scp-direction">
+            <button className={`scp-dir-btn ${upload ? "active" : ""}`} onClick={() => changeDirection("upload")}>↑ Upload (local → remote)</button>
+            <button className={`scp-dir-btn ${!upload ? "active" : ""}`} onClick={() => changeDirection("download")}>↓ Download (remote → local)</button>
           </div>
-        </div>
 
-        <div className="form-group">
-          <label>Remote path</label>
-          <input value={remotePath} onChange={e => setRemotePath(e.target.value)} placeholder="/tmp/script.sh" />
-        </div>
+          {upload ? <>{localField}{remoteField}</> : <>{remoteField}{localField}</>}
+        </fieldset>
 
         {results.length > 0 && (
-          <div className="cmd-results">
-            {results.map((r, i) => (
-              <div key={i} className={`cmd-result ${r.success ? "success" : "error"}`}>
-                <div className="cmd-result-header">
-                  <span className={`cmd-status-dot ${r.success ? "up" : "down"}`} />
-                  <span className="cmd-result-host">{r.hostname || r.ip}</span>
-                  <span className="cmd-result-ip">{r.ip}</span>
-                  <span style={{marginLeft:"auto", fontSize:"0.72rem", color: r.success ? "var(--green)" : "var(--red)"}}>
-                    {r.success ? "✓ OK" : "✗ Failed"}
-                  </span>
+          <>
+            <div className="scp-hint">{okCount} of {results.length} hosts OK</div>
+            <div className="cmd-results">
+              {results.map((r, i) => (
+                <div key={i} className={`cmd-result ${r.success ? "success" : "error"}`}>
+                  <div className="cmd-result-header">
+                    <span className={`cmd-status-dot ${r.success ? "up" : "down"}`} />
+                    <span className="cmd-result-host">{r.hostname || r.ip}</span>
+                    <span className="cmd-result-ip">{r.ip}</span>
+                    <span style={{marginLeft:"auto", fontSize:"0.72rem", color: r.success ? "var(--green)" : "var(--red)"}}>
+                      {r.success ? "✓ OK" : "✗ Failed"}
+                    </span>
+                  </div>
+                  {r.message && <pre className="cmd-output">{r.message}</pre>}
                 </div>
-                {r.message && <pre className="cmd-output">{r.message}</pre>}
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          </>
         )}
 
         <div className="modal-actions">
           <button className="btn-cancel" onClick={onClose}>Close</button>
           <button className="btn-primary" onClick={handleRun} disabled={running}>
-            {running ? "Transferring..." : direction === "upload" ? "↑ Upload to all" : "↓ Download from all"}
+            {running ? "Transferring..." : upload ? "↑ Upload to all" : "↓ Download from all"}
           </button>
         </div>
       </div>

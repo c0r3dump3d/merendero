@@ -1089,6 +1089,41 @@ where
 }
 // ===== scp progress: end =====
 
+// ===== scp broadcast: begin =====
+/// How many hosts are transferred to or from at the same time (the rest wait their turn).
+const SCP_BROADCAST_PARALLEL: usize = 8;
+
+/// A string made safe to be (part of) a file name. Host names and IPs come from reverse DNS or from an
+/// imported backup, so they are not trusted: no slashes (nothing can climb out of the chosen folder) and no
+/// leading dot.
+fn safe_file_name(s: &str) -> String {
+    let mut out: String = s
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    while out.starts_with('.') {
+        out.replace_range(0..1, "_");
+    }
+    out.truncate(100);
+    out
+}
+
+/// Folder of one host inside the download folder: "<hostname>_<ip>", or just the IP without a hostname.
+fn host_folder_name(hostname: Option<&str>, ip: &str) -> String {
+    let ip_part = safe_file_name(ip);
+    let host_part = hostname.map(safe_file_name).unwrap_or_default();
+    if host_part.is_empty() || host_part == ip_part {
+        if ip_part.is_empty() { String::from("host") } else { ip_part }
+    } else if ip_part.is_empty() {
+        host_part
+    } else {
+        format!("{}_{}", host_part, ip_part)
+    }
+}
+
+/// Upload: the same local file to every host. Download: the same remote path from every host, each one
+/// into its OWN folder inside `local_path` (they used to overwrite each other in one local path).
 async fn run_scp_broadcast_inner(
     hosts: Vec<host::Host>,
     network: host::Network,
@@ -1099,71 +1134,99 @@ async fn run_scp_broadcast_inner(
 ) -> Vec<serde_json::Value> {
     use tokio::process::Command;
 
+    let upload = direction == "upload";
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(SCP_BROADCAST_PARALLEL));
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut tasks = vec![];
 
     for host in hosts {
         let username = host::resolve_username(&host, &network, &defaults);
         let port = host::resolve_port(&host, &network, &defaults);
-        let identity_arg = host.identity_file.clone()
+        let identity_file = host.identity_file.clone()
             .or(network.identity_file.clone())
-            .or(defaults.identity_file.clone())
-            .map(|f| vec!["-i".to_string(), f])
-            .unwrap_or_default();
+            .or(defaults.identity_file.clone());
         let ip = host.ip.clone();
         let hostname = host.hostname.clone();
         let local = local_path.clone();
         let remote = remote_path.clone();
         let dir = direction.clone();
 
-        let task = tokio::spawn(async move {
-            let mut args = vec![
-                "-P".to_string(), port.to_string(),
-                "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
-                "-o".to_string(), "ConnectTimeout=5".to_string(),
-            ];
-            args.extend(identity_arg);
-
-            let remote_full = format!("{}@{}:{}", username, ip, remote);
-
-            args.push(String::from("--"));
-            if dir == "upload" {
-                args.push(local);
-                args.push(remote_full);
-            } else {
-                args.push(remote_full);
-                args.push(local);
+        let host_dir: Option<std::path::PathBuf> = if upload {
+            None
+        } else {
+            let mut folder = host_folder_name(hostname.as_deref(), &ip);
+            if !used.insert(folder.clone()) {
+                let mut n = 2;
+                while !used.insert(format!("{}_{}", folder, n)) {
+                    n += 1;
+                }
+                folder = format!("{}_{}", folder, n);
             }
+            Some(std::path::Path::new(&local_path).join(folder))
+        };
+        let limit = limit.clone();
+        let (ip_t, hostname_t) = (ip.clone(), hostname.clone());
 
+        let task = tokio::spawn(async move {
+            let _turn = limit.acquire_owned().await.ok();
+            let fail = |msg: String| serde_json::json!({
+                "ip": ip, "hostname": hostname, "success": false, "message": msg, "saved_to": serde_json::Value::Null,
+            });
+            let target = match &host_dir {
+                Some(d) => {
+                    if let Err(e) = std::fs::create_dir_all(d) {
+                        return fail(format!("Cannot create {}: {}", d.display(), e));
+                    }
+                    d.to_string_lossy().to_string()
+                }
+                None => local,
+            };
+            let args = scp_args(&ip, &username, port, &identity_file, &target, &remote, &dir);
             let output = Command::new(program("scp"))
                 .env("PATH", user_path())
                 .args(&args)
                 .output()
                 .await;
-
             match output {
-                Ok(out) => serde_json::json!({
+                Ok(out) if out.status.success() => serde_json::json!({
                     "ip": ip,
                     "hostname": hostname,
-                    "success": out.status.success(),
-                    "message": String::from_utf8_lossy(if out.status.success() { &out.stdout } else { &out.stderr }).to_string(),
+                    "success": true,
+                    "message": match &host_dir {
+                        Some(d) => format!("Saved in {}", d.display()),
+                        None => String::from_utf8_lossy(&out.stdout).to_string(),
+                    },
+                    "saved_to": host_dir.as_ref().map(|d| d.to_string_lossy().to_string()),
                 }),
-                Err(e) => serde_json::json!({
-                    "ip": ip,
-                    "hostname": hostname,
-                    "success": false,
-                    "message": format!("Failed: {}", e),
-                }),
+                Ok(out) => {
+                    if let Some(d) = &host_dir {
+                        let _ = std::fs::remove_dir(d); // only removes it if it is empty
+                    }
+                    fail(String::from_utf8_lossy(&out.stderr).to_string())
+                }
+                Err(e) => {
+                    if let Some(d) = &host_dir {
+                        let _ = std::fs::remove_dir(d);
+                    }
+                    fail(format!("Failed: {}", e))
+                }
             }
         });
-        tasks.push(task);
+        tasks.push((ip_t, hostname_t, task));
     }
 
     let mut results = vec![];
-    for task in tasks {
-        if let Ok(r) = task.await { results.push(r); }
+    for (ip, hostname, task) in tasks {
+        match task.await {
+            Ok(r) => results.push(r),
+            Err(e) => results.push(serde_json::json!({
+                "ip": ip, "hostname": hostname, "success": false, "message": format!("Internal error: {}", e), "saved_to": serde_json::Value::Null,
+            })),
+        }
     }
     results
 }
+// ===== scp broadcast: end =====
 
 fn iso_utc(secs: u64) -> String {
     let days = (secs / 86400) as i64;
@@ -2026,7 +2089,7 @@ async fn run_scp_broadcast(
     let results = run_scp_broadcast_inner(hosts, network, defaults, local_path, remote_path, direction).await;
     let outcome: Vec<serde_json::Value> = results
         .iter()
-        .map(|r| serde_json::json!({ "ip": r["ip"], "success": r["success"] }))
+        .map(|r| serde_json::json!({ "ip": r["ip"], "success": r["success"], "saved_to": r["saved_to"] }))
         .collect();
     audit_write("scp_broadcast", &net_name, outcome, serde_json::json!({ "phase": "end", "transfer": transfer }));
     results
