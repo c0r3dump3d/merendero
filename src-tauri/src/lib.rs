@@ -2928,6 +2928,760 @@ async fn check_hosts_reachable(
     results
 }
 
+// ===== tmux: begin =====
+/// tmux is a local, trusted program, but list-keys prints a few tens of KB: still bounded, and never waited
+/// on for ever.
+const TMUX_MAX_OUTPUT: usize = 2 * 1024 * 1024;
+const TMUX_TIMEOUT_SECS: u64 = 8;
+/// The editor does not take files bigger than this (a tmux.conf is a few KB).
+const TMUX_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+/// Backups kept per file.
+const TMUX_BACKUPS_KEEP: usize = 20;
+
+struct TmuxOut {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs tmux with a time limit. `socket`: Some(name) is an isolated server (-L name); None is the user's
+/// own default one.
+async fn tmux_run(args: &[&str], socket: Option<&str>) -> Result<TmuxOut, String> {
+    let mut cmd = tokio::process::Command::new(program("tmux"));
+    cmd.env("PATH", user_path());
+    if let Some(name) = socket {
+        cmd.arg("-L").arg(name);
+    }
+    cmd.args(args);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(TMUX_TIMEOUT_SECS),
+        ssh_output_capped(cmd, TMUX_MAX_OUTPUT, 64 * 1024),
+    )
+    .await
+    {
+        Err(_) => Err(String::from("tmux did not answer in time")),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(String::from("tmux is not installed on this computer")),
+        Ok(Err(e)) => Err(format!("Failed to run tmux: {}", e)),
+        Ok(Ok((_, _, _, true))) => Err(String::from("tmux printed far more than expected")),
+        Ok(Ok((status, out, err, false))) => Ok(TmuxOut {
+            ok: status.map_or(false, |s| s.success()),
+            stdout: String::from_utf8_lossy(&out).to_string(),
+            stderr: String::from_utf8_lossy(&err).to_string(),
+        }),
+    }
+}
+
+/// The backslash: tmux escapes some keys with it in list-keys.
+const TMUX_BACKSLASH: char = 92u8 as char;
+
+static TMUX_SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A throwaway tmux server on its own socket. It never touches the user's server, and by default reads NO
+/// configuration, so it shows what tmux does out of the box.
+struct TmuxScratch {
+    name: String,
+}
+
+impl TmuxScratch {
+    /// With no configuration at all: nothing the user has is read, so nothing of the user's runs.
+    async fn start() -> Result<TmuxScratch, String> {
+        TmuxScratch::start_inner(false).await
+    }
+
+    /// Reading the user's configuration exactly as tmux does when it starts. Whatever that configuration runs
+    /// at start-up (run-shell, plugins...) runs here too, so it is only started when the user asked for it.
+    async fn start_with_user_config() -> Result<TmuxScratch, String> {
+        TmuxScratch::start_inner(true).await
+    }
+
+    async fn start_inner(user_config: bool) -> Result<TmuxScratch, String> {
+        let n = TMUX_SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let name = format!("merendero-probe-{}-{}", std::process::id(), n);
+        let mut args: Vec<&str> = vec![];
+        if !user_config {
+            args.extend(["-f", "/dev/null"]);
+        }
+        args.extend(["new-session", "-d", "-s", "probe", "sleep 300"]);
+        let out = tmux_run(&args, Some(&name)).await?;
+        if !out.ok {
+            return Err(format!("tmux could not start a scratch server: {}", out.stderr.trim()));
+        }
+        Ok(TmuxScratch { name })
+    }
+
+    async fn run(&self, args: &[&str]) -> Result<TmuxOut, String> {
+        tmux_run(args, Some(&self.name)).await
+    }
+
+    /// Kills the server and removes ITS socket: tmux never deletes the socket file when a server exits, so each
+    /// scratch server would leave one in /tmp/tmux-UID. Only a socket with exactly our name is removed.
+    async fn stop(self) {
+        use std::os::unix::fs::FileTypeExt;
+        let path = self
+            .run(&["display-message", "-p", "#{socket_path}"])
+            .await
+            .ok()
+            .map(|o| std::path::PathBuf::from(o.stdout.trim()));
+        let _ = tmux_run(&["kill-server"], Some(&self.name)).await;
+        if let Some(p) = path {
+            let ours = p.file_name().map_or(false, |n| n.to_string_lossy() == self.name.as_str());
+            let is_socket = std::fs::symlink_metadata(&p).map_or(false, |m| m.file_type().is_socket());
+            if ours && is_socket {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+}
+
+/// "tmux 3.4" -> "3.4", "tmux next-3.5" -> "next-3.5".
+fn tmux_version_from(text: &str) -> Option<String> {
+    let t = text.trim();
+    let v = t.strip_prefix("tmux")?.trim();
+    if v.is_empty() { None } else { Some(v.to_string()) }
+}
+
+/// Splits one line of list-keys into tokens, keeping quoted text together.
+fn tmux_tokens(line: &str) -> Vec<(usize, usize, String)> {
+    // (start, end, text without quotes and backslashes)
+    let b: Vec<char> = line.chars().collect();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        while i < b.len() && b[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        let start = i;
+        let mut text = String::new();
+        if b[i] == '"' {
+            i += 1;
+            while i < b.len() && b[i] != '"' {
+                if b[i] == TMUX_BACKSLASH && i + 1 < b.len() {
+                    i += 1;
+                }
+                text.push(b[i]);
+                i += 1;
+            }
+            i += 1;
+        } else {
+            while i < b.len() && !b[i].is_whitespace() {
+                if b[i] == TMUX_BACKSLASH && i + 1 < b.len() {
+                    i += 1;
+                }
+                text.push(b[i]);
+                i += 1;
+            }
+        }
+        out.push((start, i.min(b.len()), text));
+    }
+    out
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+struct TmuxKey {
+    table: String,
+    key: String,
+    command: String,
+    repeat: bool,
+    note: Option<String>,
+    /// "default", "custom" (a key tmux does not bind out of the box) or "replaced" (a default key that now does
+    /// something else).
+    origin: String,
+    replaces: Option<String>,
+}
+
+/// One line of `tmux list-keys`: bind-key [-r] [-N note] -T table key command...
+fn parse_tmux_key_line(line: &str) -> Option<TmuxKey> {
+    let toks = tmux_tokens(line);
+    if toks.first().map(|t| t.2.as_str()) != Some("bind-key") {
+        return None;
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 1;
+    let (mut table, mut repeat, mut note) = (String::new(), false, None);
+    while i < toks.len() {
+        match toks[i].2.as_str() {
+            "-r" => { repeat = true; i += 1; }
+            "-T" if i + 1 < toks.len() => { table = toks[i + 1].2.clone(); i += 2; }
+            "-N" if i + 1 < toks.len() => { note = Some(toks[i + 1].2.clone()); i += 2; }
+            "-n" => { table = String::from("root"); i += 1; }
+            _ => break,
+        }
+    }
+    if table.is_empty() || i >= toks.len() {
+        return None;
+    }
+    let key = toks[i].2.clone();
+    let rest_start = toks[i].1;
+    let command: String = chars[rest_start.min(chars.len())..].iter().collect::<String>().trim().to_string();
+    Some(TmuxKey { table, key, command, repeat, note, origin: String::from("default"), replaces: None })
+}
+
+fn parse_tmux_keys(text: &str) -> Vec<TmuxKey> {
+    text.lines().filter_map(parse_tmux_key_line).collect()
+}
+
+fn tmux_norm(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `list-keys -N -P ""`: "<key>  <description>" for the keys of the prefix table that tmux describes.
+fn parse_tmux_notes(text: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in text.lines() {
+        let toks = tmux_tokens(line);
+        if toks.len() < 2 {
+            continue;
+        }
+        let key = toks[0].2.clone();
+        let chars: Vec<char> = line.chars().collect();
+        let note: String = chars[toks[0].1.min(chars.len())..].iter().collect::<String>().trim().to_string();
+        if !note.is_empty() {
+            map.insert(key, note);
+        }
+    }
+    map
+}
+
+#[derive(serde::Serialize)]
+struct TmuxKeys {
+    version: String,
+    running: bool,
+    source_used: String,
+    prefix: String,
+    prefix2: String,
+    keys: Vec<TmuxKey>,
+    removed: Vec<TmuxKey>,
+}
+
+/// Marks which of the keys `live_text` (a `list-keys` output) are the user's, comparing with tmux's own:
+/// "custom" (tmux does not bind it), "replaced" (tmux binds it to something else; says what) and, apart, the
+/// keys tmux binds that are gone.
+fn tmux_mark_keys(live_text: &str, def_keys: &[TmuxKey]) -> (Vec<TmuxKey>, Vec<TmuxKey>) {
+    let by_key: std::collections::HashMap<(String, String), &TmuxKey> = def_keys.iter().map(|k| ((k.table.clone(), k.key.clone()), k)).collect();
+    let mut keys = parse_tmux_keys(live_text);
+    let mut seen = std::collections::HashSet::new();
+    for k in keys.iter_mut() {
+        seen.insert((k.table.clone(), k.key.clone()));
+        match by_key.get(&(k.table.clone(), k.key.clone())) {
+            Some(d) if tmux_norm(&d.command) == tmux_norm(&k.command) => {
+                k.note = d.note.clone();
+            }
+            Some(d) => {
+                k.origin = String::from("replaced");
+                k.replaces = Some(d.command.clone());
+            }
+            None => k.origin = String::from("custom"),
+        }
+    }
+    let removed: Vec<TmuxKey> = def_keys
+        .iter()
+        .filter(|d| !seen.contains(&(d.table.clone(), d.key.clone())))
+        .cloned()
+        .collect();
+    (keys, removed)
+}
+
+/// The keys tmux has, from one of three places (`source`):
+/// - "running": your tmux server that is running now (plugins included);
+/// - "config": what a tmux that starts now would have with your configuration, read by a throwaway tmux. This
+///   one RUNS what your configuration runs at start-up, so the interface only asks for it after warning;
+/// - anything else: tmux's own keys, with no configuration.
+/// The first two mark which keys are yours. Nothing of the user's is changed.
+#[tauri::command]
+async fn tmux_keys(source: String) -> Result<TmuxKeys, String> {
+    let v = tmux_run(&["-V"], None).await?;
+    let version = tmux_version_from(&v.stdout).ok_or_else(|| String::from("tmux did not say its version"))?;
+
+    // tmux's own keys, from a scratch server with no configuration
+    let scratch = TmuxScratch::start().await?;
+    let defaults = scratch.run(&["list-keys"]).await;
+    let notes = scratch.run(&["list-keys", "-N", "-T", "prefix", "-P", ""]).await;
+    let def_prefix = scratch.run(&["show-options", "-gv", "prefix"]).await;
+    scratch.stop().await;
+    let defaults = defaults?;
+    if !defaults.ok {
+        return Err(format!("tmux could not list its keys: {}", defaults.stderr.trim()));
+    }
+    let mut def_keys = parse_tmux_keys(&defaults.stdout);
+    let notes = notes.map(|n| if n.ok { parse_tmux_notes(&n.stdout) } else { Default::default() }).unwrap_or_default();
+    let def_prefix = def_prefix.map(|p| p.stdout.trim().to_string()).unwrap_or_default();
+    for k in def_keys.iter_mut() {
+        if k.table == "prefix" {
+            k.note = notes.get(&k.key).cloned();
+        }
+    }
+
+    let server_running = tmux_run(&["list-sessions"], None).await.map_or(false, |o| o.ok);
+    let (live, used) = if source == "config" {
+        let scratch = TmuxScratch::start_with_user_config().await?;
+        let list = scratch.run(&["list-keys"]).await;
+        let prefix = scratch.run(&["show-options", "-gv", "prefix"]).await;
+        let prefix2 = scratch.run(&["show-options", "-gv", "prefix2"]).await;
+        scratch.stop().await;
+        let list = list?;
+        if !list.ok {
+            return Err(format!("tmux could not list the keys of your configuration: {}", list.stderr.trim()));
+        }
+        let word = |o: Result<TmuxOut, String>| o.map(|o| o.stdout.trim().to_string()).unwrap_or_default();
+        (Some((list.stdout, word(prefix), word(prefix2))), "config")
+    } else if source == "running" && server_running {
+        let list = tmux_run(&["list-keys"], None).await?;
+        if !list.ok {
+            return Err(format!("tmux could not list the keys of the running server: {}", list.stderr.trim()));
+        }
+        let word = |o: Result<TmuxOut, String>| o.map(|o| o.stdout.trim().to_string()).unwrap_or_default();
+        let prefix = word(tmux_run(&["show-options", "-gv", "prefix"], None).await);
+        let prefix2 = word(tmux_run(&["show-options", "-gv", "prefix2"], None).await);
+        (Some((list.stdout, prefix, prefix2)), "running")
+    } else {
+        (None, "defaults")
+    };
+    match live {
+        None => Ok(TmuxKeys { version, running: server_running, source_used: String::from(used), prefix: def_prefix, prefix2: String::from("None"), keys: def_keys, removed: vec![] }),
+        Some((text, prefix, prefix2)) => {
+            let (keys, removed) = tmux_mark_keys(&text, &def_keys);
+            Ok(TmuxKeys { version, running: server_running, source_used: String::from(used), prefix, prefix2, keys, removed })
+        }
+    }
+}
+
+/// The files tmux reads by default that the editor can change. Only these two: the interface never sends a
+/// path, only "home" or "xdg".
+fn tmux_config_candidates() -> Vec<(&'static str, std::path::PathBuf)> {
+    let home = dirs::home_dir();
+    let mut v = vec![];
+    if let Some(h) = &home {
+        v.push(("home", h.join(".tmux.conf")));
+    }
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+    if let Some(x) = xdg {
+        v.push(("xdg", x.join("tmux").join("tmux.conf")));
+    }
+    v
+}
+
+fn tmux_target_path(id: &str) -> Result<std::path::PathBuf, String> {
+    tmux_config_candidates()
+        .into_iter()
+        .find(|(name, _)| *name == id)
+        .map(|(_, p)| p)
+        .ok_or_else(|| format!("Unknown tmux configuration file: {}", id))
+}
+
+#[derive(serde::Serialize)]
+struct TmuxConfigFile {
+    id: String,
+    path: String,
+    exists: bool,
+    is_symlink: bool,
+    real_path: Option<String>,
+    writable: bool,
+    size: u64,
+}
+
+fn tmux_file_state(id: &str, path: &std::path::Path) -> TmuxConfigFile {
+    let link = std::fs::symlink_metadata(path).ok();
+    let is_symlink = link.as_ref().map_or(false, |m| m.file_type().is_symlink());
+    let real = std::fs::canonicalize(path).ok();
+    let meta = std::fs::metadata(path).ok();
+    TmuxConfigFile {
+        id: id.to_string(),
+        path: path.to_string_lossy().to_string(),
+        exists: meta.is_some(),
+        is_symlink,
+        real_path: if is_symlink { real.map(|r| r.to_string_lossy().to_string()) } else { None },
+        writable: meta.as_ref().map_or(true, |m| m.is_file() && !m.permissions().readonly()),
+        size: meta.map_or(0, |m| m.len()),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct TmuxInfo {
+    installed: bool,
+    version: Option<String>,
+    running: bool,
+    files: Vec<TmuxConfigFile>,
+    default_target: String,
+}
+
+#[tauri::command]
+async fn tmux_info() -> TmuxInfo {
+    let version = tmux_run(&["-V"], None).await.ok().and_then(|o| tmux_version_from(&o.stdout));
+    let installed = version.is_some();
+    let running = installed && tmux_run(&["list-sessions"], None).await.map_or(false, |o| o.ok);
+    let files: Vec<TmuxConfigFile> = tmux_config_candidates().iter().map(|(id, p)| tmux_file_state(id, p)).collect();
+    let default_target = if files.iter().any(|f| f.id == "home" && f.exists) || !files.iter().any(|f| f.exists) {
+        "home"
+    } else {
+        files.iter().find(|f| f.exists).map_or("home", |f| f.id.as_str())
+    }
+    .to_string();
+    TmuxInfo { installed, version, running, files, default_target }
+}
+
+#[derive(serde::Serialize)]
+struct TmuxConfigText {
+    file: TmuxConfigFile,
+    text: String,
+    read_only: bool,
+    read_only_reason: Option<String>,
+}
+
+/// Reads a tmux configuration file. Opening it never changes anything.
+#[tauri::command]
+async fn tmux_read_config(target: String) -> Result<TmuxConfigText, String> {
+    let path = tmux_target_path(&target)?;
+    let file = tmux_file_state(&target, &path);
+    if !file.exists {
+        return Ok(TmuxConfigText { file, text: String::new(), read_only: false, read_only_reason: None });
+    }
+    let (mut text, mut reason) = (String::new(), None);
+    if file.size > TMUX_CONFIG_MAX_BYTES {
+        reason = Some(format!("The file is bigger than {} KB: edit it with your own editor.", TMUX_CONFIG_MAX_BYTES / 1024));
+    } else {
+        match std::fs::read(&path) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(t) => text = t,
+                Err(_) => reason = Some(String::from("The file is not valid UTF-8: edit it with your own editor.")),
+            },
+            Err(e) => return Err(format!("Could not read {}: {}", path.display(), e)),
+        }
+    }
+    if reason.is_none() && !file.writable {
+        reason = Some(match &file.real_path {
+            Some(r) => format!("The file is read-only (it points to {}): it is probably managed by another tool.", r),
+            None => String::from("The file is read-only."),
+        });
+    }
+    Ok(TmuxConfigText { read_only: reason.is_some(), read_only_reason: reason, file, text })
+}
+
+/// "20261106-143005" in UTC.
+fn tmux_utc_stamp(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let (h, mi, s) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    format!("{:04}{:02}{:02}-{:02}{:02}{:02}", y, m, d, h, mi, s)
+}
+
+fn tmux_backup_dir() -> std::path::PathBuf {
+    get_config_dir().join("tmux-backups")
+}
+
+/// "home-20261106-143005.conf" or "home-20261106-143005-2.conf"; nothing else is accepted as a backup name.
+fn tmux_backup_name_ok(name: &str) -> bool {
+    let rest = match name.strip_prefix("home-").or_else(|| name.strip_prefix("xdg-")) {
+        Some(r) => r,
+        None => return false,
+    };
+    let stem = match rest.strip_suffix(".conf") {
+        Some(s) => s,
+        None => return false,
+    };
+    let parts: Vec<&str> = stem.split('-').collect();
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    match parts.as_slice() {
+        [d, t] => digits(d, 8) && digits(t, 6),
+        [d, t, n] => digits(d, 8) && digits(t, 6) && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+/// Age of a backup: its date, then the number it got when several were made in the same second ("-2", "-10";
+/// the first one has none). Names cannot be compared as text: "...-10.conf" < "...-3.conf" and "....conf" > "...-2.conf".
+fn tmux_backup_key(name: &str) -> (String, u32) {
+    let rest = name.strip_prefix("home-").or_else(|| name.strip_prefix("xdg-")).unwrap_or(name);
+    let stem = rest.strip_suffix(".conf").unwrap_or(rest);
+    let mut parts = stem.splitn(3, '-');
+    let date = parts.next().unwrap_or("");
+    let time = parts.next().unwrap_or("");
+    let n = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+    (format!("{}-{}", date, time), n)
+}
+
+#[derive(serde::Serialize)]
+struct TmuxBackup {
+    name: String,
+    size: u64,
+    modified: u64,
+}
+
+fn tmux_list_backups(target: &str) -> Vec<TmuxBackup> {
+    let mut v: Vec<TmuxBackup> = std::fs::read_dir(tmux_backup_dir())
+        .map(|d| d.filter_map(|e| e.ok()).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !tmux_backup_name_ok(&name) || !name.starts_with(&format!("{}-", target)) {
+                return None;
+            }
+            let m = e.metadata().ok()?;
+            let modified = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            Some(TmuxBackup { name, size: m.len(), modified })
+        })
+        .collect();
+    v.sort_by(|a, b| tmux_backup_key(&b.name).cmp(&tmux_backup_key(&a.name)));
+    v
+}
+
+#[tauri::command]
+async fn tmux_backups(target: String) -> Result<Vec<TmuxBackup>, String> {
+    tmux_target_path(&target)?;
+    Ok(tmux_list_backups(&target))
+}
+
+#[tauri::command]
+async fn tmux_read_backup(name: String) -> Result<String, String> {
+    if !tmux_backup_name_ok(&name) {
+        return Err(String::from("That is not a backup of Merendero"));
+    }
+    let bytes = std::fs::read(tmux_backup_dir().join(&name)).map_err(|e| format!("Could not read the backup: {}", e))?;
+    String::from_utf8(bytes).map_err(|_| String::from("The backup is not valid UTF-8"))
+}
+
+#[derive(serde::Serialize)]
+struct TmuxWriteResult {
+    path: String,
+    changed: bool,
+    created: bool,
+    backup: Option<String>,
+}
+
+/// Saves a tmux configuration file, and only that. The rules, so that what the user has always prevails:
+/// - the bytes written are exactly `text` (no reformatting, no newline added);
+/// - a symlink (dotfiles managers) is followed: the target is written and the link stays a link;
+/// - if the file is not as it was when the user opened it (`original`), nothing is written unless `force`;
+/// - a backup of what is there goes first (the last TMUX_BACKUPS_KEEP are kept);
+/// - the write is atomic (temp file in the same folder, then rename) and keeps the permissions of the file.
+#[tauri::command]
+async fn tmux_write_config(target: String, text: String, original: Option<String>, force: bool) -> Result<TmuxWriteResult, String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let path = tmux_target_path(&target)?;
+    if text.len() as u64 > TMUX_CONFIG_MAX_BYTES {
+        return Err(String::from("The text is too big for a tmux configuration file"));
+    }
+    let existed = path.exists();
+    let real = if existed {
+        std::fs::canonicalize(&path).map_err(|e| format!("Could not resolve {}: {}", path.display(), e))?
+    } else if std::fs::symlink_metadata(&path).is_ok() {
+        return Err(format!("{} is a broken symbolic link: fix it first", path.display()));
+    } else {
+        path.clone()
+    };
+    let mut mode = 0o644;
+    let mut current: Option<String> = None;
+    if existed {
+        let meta = std::fs::metadata(&real).map_err(|e| format!("Could not read {}: {}", real.display(), e))?;
+        if !meta.is_file() {
+            return Err(format!("{} is not a regular file", real.display()));
+        }
+        if meta.permissions().readonly() {
+            return Err(format!("{} is read-only: it is probably managed by another tool", real.display()));
+        }
+        if meta.len() > TMUX_CONFIG_MAX_BYTES {
+            return Err(String::from("The file is too big to be edited here"));
+        }
+        mode = meta.permissions().mode() & 0o7777;
+        let bytes = std::fs::read(&real).map_err(|e| format!("Could not read {}: {}", real.display(), e))?;
+        current = Some(String::from_utf8(bytes).map_err(|_| String::from("The file is not valid UTF-8: it is not edited here"))?);
+    }
+    if !force && current.as_deref() != original.as_deref() {
+        return Err(String::from("changed on disk: the file is not as it was when you opened it. Nothing was written."));
+    }
+    if current.as_deref() == Some(text.as_str()) {
+        return Ok(TmuxWriteResult { path: path.to_string_lossy().to_string(), changed: false, created: false, backup: None });
+    }
+
+    // backup of what is there now (which, with `force`, may be something the user did not see)
+    let mut backup = None;
+    if let Some(cur) = &current {
+        let dir = tmux_backup_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Could not create the backups folder: {}", e))?;
+        let stamp = tmux_utc_stamp(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+        // Several in the same second are numbered ABOVE the highest existing one, never in the first free
+        // gap: a freed name would be reused by a newer backup that sorts as the oldest and is rotated away.
+        let same_second = format!("{}-{}", target, stamp);
+        let highest = tmux_list_backups(&target)
+            .iter()
+            .filter(|b| tmux_backup_key(&b.name).0 == stamp)
+            .map(|b| tmux_backup_key(&b.name).1)
+            .max();
+        let name = match highest {
+            None => format!("{}.conf", same_second),
+            Some(h) => format!("{}-{}.conf", same_second, h + 1),
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(&name))
+            .map_err(|e| format!("Could not write the backup: {}", e))?;
+        f.write_all(cur.as_bytes()).map_err(|e| format!("Could not write the backup: {}", e))?;
+        let _ = f.sync_all();
+        backup = Some(name);
+        // keep the last ones
+        let all = tmux_list_backups(&target);
+        for old in all.iter().skip(TMUX_BACKUPS_KEEP) {
+            let _ = std::fs::remove_file(dir.join(&old.name));
+        }
+    }
+
+    if !existed {
+        if let Some(parent) = real.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("Could not create {}: {}", parent.display(), e))?;
+        }
+    }
+    let parent = real.parent().ok_or_else(|| String::from("The file has no folder"))?;
+    let file_name = real.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = parent.join(format!(".{}.merendero-{}", file_name, std::process::id()));
+    let write = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, &real)
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Could not write {}: {}", real.display(), e));
+    }
+    Ok(TmuxWriteResult { path: path.to_string_lossy().to_string(), changed: true, created: !existed, backup })
+}
+#[derive(serde::Serialize)]
+struct TmuxIssue {
+    line: usize,
+    text: String,
+}
+
+#[derive(serde::Serialize)]
+struct TmuxCheck {
+    ok: bool,
+    errors: Vec<TmuxIssue>,
+    notices: Vec<TmuxIssue>,
+}
+
+/// Lines that run something, or read another file, when tmux reads the configuration. The check does NOT run
+/// them; it only says they are there.
+fn tmux_notice_lines(text: &str) -> Vec<TmuxIssue> {
+    let mut v = vec![];
+    for (n, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let first_words: Vec<&str> = t.split(';').filter_map(|seg| seg.split_whitespace().next()).map(|w| w.trim_start_matches('{')).collect();
+        let named = |w: &str| t.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).any(|x| x == w);
+        let hit = first_words.iter().any(|w| ["run", "run-shell", "if", "if-shell", "source", "source-file"].contains(w))
+            || named("run-shell")
+            || named("if-shell")
+            || named("source-file");
+        if hit {
+            v.push(TmuxIssue { line: n + 1, text: line.trim().to_string() });
+        }
+    }
+    v
+}
+
+static TMUX_CHECK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Checks the SYNTAX of a tmux configuration text with tmux's own parser (`source-file -n`) on a throwaway
+/// server: nothing is executed, so the commands of the text (run-shell...) do not run and the user's server
+/// is not touched. tmux cannot tell more without running it: an invalid value or an unknown option is only
+/// found when the text is applied (Reload shows those).
+#[tauri::command]
+async fn tmux_check_config(text: String) -> Result<TmuxCheck, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if text.len() as u64 > TMUX_CONFIG_MAX_BYTES {
+        return Err(String::from("The text is too big for a tmux configuration file"));
+    }
+    let n = TMUX_CHECK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!("merendero-tmux-check-{}-{}.conf", std::process::id(), n));
+    let tmp_str = tmp.to_string_lossy().to_string();
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("Could not write the temporary file: {}", e))?;
+        f.write_all(text.as_bytes()).map_err(|e| format!("Could not write the temporary file: {}", e))?;
+    }
+    let result = match TmuxScratch::start().await {
+        Ok(scratch) => {
+            let r = scratch.run(&["source-file", "-n", &tmp_str]).await;
+            scratch.stop().await;
+            r
+        }
+        Err(e) => Err(e),
+    };
+    let _ = std::fs::remove_file(&tmp);
+    let out = result?;
+    let mut errors = vec![];
+    for line in out.stderr.lines().chain(out.stdout.lines()) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line.strip_prefix(&format!("{}:", tmp_str)) {
+            Some(rest) => {
+                let (num, msg) = rest.split_once(':').unwrap_or(("0", rest));
+                errors.push(TmuxIssue { line: num.trim().parse().unwrap_or(0), text: msg.trim().to_string() });
+            }
+            None => errors.push(TmuxIssue { line: 0, text: line.to_string() }),
+        }
+    }
+    Ok(TmuxCheck { ok: out.ok && errors.is_empty(), errors, notices: tmux_notice_lines(&text) })
+}
+
+#[derive(serde::Serialize)]
+struct TmuxReload {
+    applied: bool,
+    running: bool,
+    output: String,
+}
+
+/// Applies the saved file to the user's RUNNING tmux (`source-file`), only when asked. It never starts a server,
+/// and what tmux says is shown as it comes, errors included.
+#[tauri::command]
+async fn tmux_reload(target: String) -> Result<TmuxReload, String> {
+    let path = tmux_target_path(&target)?;
+    if !path.exists() {
+        return Err(String::from("The file does not exist yet: save it first"));
+    }
+    if !tmux_run(&["list-sessions"], None).await?.ok {
+        return Ok(TmuxReload {
+            applied: false,
+            running: false,
+            output: String::from("No tmux server is running, so there is nothing to reload: tmux will read the file the next time it starts."),
+        });
+    }
+    let out = tmux_run(&["source-file", &path.to_string_lossy()], None).await?;
+    let output = format!("{}{}", out.stderr, out.stdout).trim().to_string();
+    Ok(TmuxReload { applied: out.ok, running: true, output })
+}
+// ===== tmux: end =====
+
 #[tauri::command]
 fn launch_broadcast(hosts: Vec<host::Host>, network: host::Network, defaults: Defaults, session_name: String) -> Result<(), String> {
     if hosts.is_empty() { return Err(String::from("No hosts selected")); }
@@ -3013,6 +3767,14 @@ pub fn run() {
             run_scp,
             cancel_scp,
             cancel_scp_batch,
+            tmux_info,
+            tmux_keys,
+            tmux_read_config,
+            tmux_write_config,
+            tmux_check_config,
+            tmux_reload,
+            tmux_backups,
+            tmux_read_backup,
             run_scp_broadcast,
             run_command,
             health_check,

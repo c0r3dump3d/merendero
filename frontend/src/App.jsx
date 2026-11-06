@@ -1800,6 +1800,420 @@ function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
   );
 }
 
+const TMUX_TABLE_TITLES = {
+  prefix: "Prefix",
+  root: "No prefix",
+  "copy-mode": "Copy mode (emacs)",
+  "copy-mode-vi": "Copy mode (vi)",
+};
+
+function tmuxTableTitle(t) {
+  return TMUX_TABLE_TITLES[t] || `Table ${t}`;
+}
+
+// tmux lists the tables alphabetically; what matters most (the prefix) goes first.
+const TMUX_TABLE_ORDER = ["prefix", "root", "copy-mode", "copy-mode-vi"];
+const tmuxTableRank = (t) => (TMUX_TABLE_ORDER.includes(t) ? TMUX_TABLE_ORDER.indexOf(t) : TMUX_TABLE_ORDER.length);
+const byTable = (a, b) => tmuxTableRank(a) - tmuxTableRank(b) || a.localeCompare(b);
+// Within a table, the keys that are yours go first.
+const byYours = (a, b) => (a.origin === "default" ? 1 : 0) - (b.origin === "default" ? 1 : 0);
+
+// "home-20261106-115255-2.conf" -> "2026-11-06 11:52:55 UTC"
+function tmuxBackupLabel(name) {
+  const parts = String(name).replace(".conf", "").split("-");
+  const d = parts[1] || "", t = parts[2] || "";
+  if (d.length !== 8 || t.length !== 6) return name;
+  return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)} ${t.slice(0, 2)}:${t.slice(2, 4)}:${t.slice(4, 6)} UTC`;
+}
+
+// The editor shows LF; a file that had CRLF is written back with CRLF, so what is saved is what was typed.
+const TMUX_CRLF = "\r\n";
+const fromDisk = (s) => s.split(TMUX_CRLF).join("\n");
+
+function TmuxModal({ onClose, showToast }) {
+  const [tab, setTab] = useState("keys");
+  const [info, setInfo] = useState(null);
+
+  const [source, setSource] = useState("running");
+  const [keys, setKeys] = useState(null);
+  const [keysError, setKeysError] = useState("");
+  const [keysLoading, setKeysLoading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [tableFilter, setTableFilter] = useState("all");
+  const [onlyMine, setOnlyMine] = useState(false);
+  // Reading the keys of the user's tmux.conf starts a temporary tmux that RUNS what the file runs at start-up:
+  // it is asked once, with the lines that would run something.
+  const [configAsk, setConfigAsk] = useState(null);
+  const [configOk, setConfigOk] = useState(false);
+
+  const [target, setTarget] = useState(null);
+  const [file, setFile] = useState(null);
+  const [text, setText] = useState("");
+  const [fileError, setFileError] = useState("");
+  const [busy, setBusy] = useState("");
+  const [conflict, setConflict] = useState(false);
+  const [confirm, setConfirm] = useState("");
+  const [check, setCheck] = useState(null);
+  const [reload, setReload] = useState(null);
+  const [backups, setBackups] = useState([]);
+  const [showBackups, setShowBackups] = useState(false);
+
+  const crlf = !!file && file.text.includes(TMUX_CRLF);
+  const toDisk = (s) => (crlf ? s.split("\n").join(TMUX_CRLF) : s);
+  const dirty = !!file && toDisk(text) !== file.text;
+
+  useEffect(() => {
+    invoke("tmux_info").then(i => {
+      setInfo(i);
+      setTarget(i.default_target);
+    }).catch(e => setKeysError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    if (!info || !info.installed) return;
+    setKeysLoading(true);
+    setKeysError("");
+    invoke("tmux_keys", { source })
+      .then(setKeys)
+      .catch(e => setKeysError(String(e)))
+      .finally(() => setKeysLoading(false));
+  }, [info, source]);
+
+  async function askConfig() {
+    setConfigAsk({ loading: true, notices: [] });
+    const notices = [];
+    try {
+      for (const f of files.filter(x => x.exists)) {
+        const body = await invoke("tmux_read_config", { target: f.id });
+        const res = await invoke("tmux_check_config", { text: body.text });
+        if (res.notices.length > 0) notices.push({ path: f.path, lines: res.notices.map(n => n.line) });
+      }
+    } catch (e) {
+      setKeysError(String(e));
+    }
+    setConfigAsk({ loading: false, notices });
+  }
+
+  function chooseSource(src) {
+    if (src === "config" && !configOk) { askConfig(); return; }
+    setConfigAsk(null);
+    setSource(src);
+  }
+
+  function confirmConfig() {
+    setConfigOk(true);
+    setConfigAsk(null);
+    setSource("config");
+  }
+
+  async function loadFile(t) {
+    setBusy("load");
+    setFileError("");
+    setConflict(false);
+    setCheck(null);
+    setReload(null);
+    setConfirm("");
+    try {
+      const f = await invoke("tmux_read_config", { target: t });
+      setFile(f);
+      setText(fromDisk(f.text));
+      setBackups(await invoke("tmux_backups", { target: t }));
+    } catch (e) {
+      setFileError(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  useEffect(() => {
+    if (tab === "file" && target && info && info.installed && (!file || file.file.id !== target)) loadFile(target);
+  }, [tab, target, info]);
+
+  function chooseTarget(t) {
+    if (t === target) return;
+    if (dirty) { setConfirm("target:" + t); return; }
+    setTarget(t);
+  }
+
+  async function save(thenReload, force) {
+    setBusy("save");
+    setFileError("");
+    setConflict(false);
+    setConfirm("");
+    try {
+      const body = toDisk(text);
+      const res = await invoke("tmux_write_config", { target, text: body, original: file.file.exists ? file.text : null, force: !!force });
+      setFile(prev => ({ ...prev, text: body, file: { ...prev.file, exists: true, size: body.length } }));
+      setBackups(await invoke("tmux_backups", { target }));
+      invoke("tmux_info").then(setInfo).catch(() => {});
+      showToast(res.changed ? (res.backup ? `Saved. Backup: ${tmuxBackupLabel(res.backup)}` : "Saved") : "Nothing to save: the file is already like that");
+      if (thenReload) await doReload();
+    } catch (e) {
+      const msg = String(e);
+      if (msg.startsWith("changed on disk")) setConflict(true);
+      else setFileError(msg);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function doCheck() {
+    setBusy("check");
+    setFileError("");
+    try {
+      setCheck(await invoke("tmux_check_config", { text: toDisk(text) }));
+    } catch (e) {
+      setFileError(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function doReload() {
+    setBusy("reload");
+    setFileError("");
+    try {
+      setReload(await invoke("tmux_reload", { target }));
+    } catch (e) {
+      setFileError(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function loadBackup(name) {
+    try {
+      const t = await invoke("tmux_read_backup", { name });
+      setText(fromDisk(t));
+      setConfirm("");
+      setShowBackups(false);
+      setCheck(null);
+      showToast(`Backup ${tmuxBackupLabel(name)} loaded in the editor. Nothing is saved until you press Save`);
+    } catch (e) {
+      setFileError(String(e));
+    }
+  }
+
+  function closeModal() {
+    if (dirty) { setConfirm("close"); return; }
+    onClose();
+  }
+
+  const q = query.trim().toLowerCase();
+  const textMatch = (k) => !q || k.key.toLowerCase().includes(q) || k.command.toLowerCase().includes(q) || (k.note || "").toLowerCase().includes(q);
+  const shown = keys ? keys.keys.filter(k => (tableFilter === "all" || k.table === tableFilter) && (!onlyMine || k.origin !== "default") && textMatch(k)) : [];
+  const removedShown = keys ? keys.removed.filter(k => (tableFilter === "all" || k.table === tableFilter) && textMatch(k)) : [];
+  const tables = keys ? Array.from(new Set(keys.keys.map(k => k.table))).sort(byTable) : [];
+  const mine = keys ? keys.keys.filter(k => k.origin === "custom").length : 0;
+  const replaced = keys ? keys.keys.filter(k => k.origin === "replaced").length : 0;
+  const groups = Array.from(new Set(shown.map(k => k.table))).sort(byTable);
+  // The key column is as wide as the longest key (tmux has some of 25 characters), within limits.
+  const longestKey = keys ? Math.max(6, ...keys.keys.concat(keys.removed).map(k => k.key.length)) : 6;
+  const keyCol = Math.min(260, Math.max(100, longestKey * 8 + 12));
+
+  const files = info ? info.files : [];
+  const bothExist = files.length === 2 && files.every(f => f.exists);
+
+  return (
+    <div className="modal-overlay">
+      <div className="modal modal-wide tmux-modal">
+        <h3>⌨ tmux{info && info.version ? ` ${info.version}` : ""}</h3>
+
+        {info && !info.installed && <div className="scp-result error">tmux is not installed on this computer.</div>}
+
+        {info && info.installed && (
+          <>
+            <div className="scp-direction tmux-tabs">
+              <button className={`scp-dir-btn ${tab === "keys" ? "active" : ""}`} onClick={() => setTab("keys")}>Keys</button>
+              <button className={`scp-dir-btn ${tab === "file" ? "active" : ""}`} onClick={() => setTab("file")}>Config file{dirty ? " •" : ""}</button>
+            </div>
+
+            {tab === "keys" && (
+              <div className="tmux-body">
+                <div className="tmux-toolbar">
+                  <div className="tmux-source">
+                    <button className={`tmux-chip ${source === "running" ? "on" : ""}`} onClick={() => chooseSource("running")} title="The keys of your tmux server that is running now, plugins included">Running server</button>
+                    <button className={`tmux-chip ${source === "config" ? "on" : ""}`} onClick={() => chooseSource("config")} title="The keys a tmux that starts now would have with your tmux.conf. It does not need a running tmux">From my tmux.conf</button>
+                    <button className={`tmux-chip ${source === "defaults" ? "on" : ""}`} onClick={() => chooseSource("defaults")} title="The keys tmux has with no configuration at all">tmux defaults</button>
+                  </div>
+                  <input className="tmux-search" placeholder="Search keys, commands, descriptions…" value={query} onChange={e => setQuery(e.target.value)} />
+                  <label className="tmux-only"><input type="checkbox" checked={onlyMine} onChange={e => setOnlyMine(e.target.checked)} /> Only yours</label>
+                </div>
+                {configAsk && (
+                  <div className="tmux-ask">
+                    <div>To show the keys of your tmux.conf, Merendero starts a temporary tmux that reads it exactly as tmux does when it starts, and closes it. Your own tmux is not touched, but whatever your configuration runs at start-up (run-shell, plugins, session auto-restore…) runs in that temporary tmux.</div>
+                    {configAsk.loading && <div className="tmux-note-line">Looking at your tmux.conf…</div>}
+                    {!configAsk.loading && configAsk.notices.length === 0 && <div className="tmux-note-line">No line of your tmux.conf that runs commands or loads other files was found.</div>}
+                    {!configAsk.loading && configAsk.notices.map(n => <div key={n.path} className="tmux-note-line">{n.path}: {n.lines.map(l => `line ${l}`).join(", ")} run commands or load other files.</div>)}
+                    <div className="tmux-conflict-actions">
+                      <button className="btn-primary" disabled={configAsk.loading} onClick={confirmConfig}>Read my configuration</button>
+                      <button className="btn-cancel" onClick={() => setConfigAsk(null)}>Cancel</button>
+                    </div>
+                  </div>
+                )}
+                {keysLoading && <div className="tmux-note-line">Reading the keys from tmux…</div>}
+                {keysError && <div className="scp-result error">{keysError}</div>}
+                {keys && (
+                  <>
+                    <div className="tmux-chips">
+                      <button className={`tmux-chip ${tableFilter === "all" ? "on" : ""}`} onClick={() => setTableFilter("all")}>All</button>
+                      {tables.map(t => <button key={t} className={`tmux-chip ${tableFilter === t ? "on" : ""}`} onClick={() => setTableFilter(t)}>{tmuxTableTitle(t)}</button>)}
+                    </div>
+                    <div className="tmux-summary">
+                      prefix <b>{keys.prefix}</b>{keys.prefix2 && keys.prefix2 !== "None" ? <> and <b>{keys.prefix2}</b></> : null} · {keys.keys.length} keys
+                      {keys.source_used !== "defaults" && <> · <b>{mine}</b> yours · <b>{replaced}</b> replace a default · <b>{keys.removed.length}</b> removed</>}
+                      {keys.source_used === "config" && " · read from your tmux.conf"}
+                    </div>
+                    {source === "running" && keys.source_used === "defaults" && (
+                      <div className="tmux-note-line">No tmux server is running, so these are tmux's own keys, not yours: your tmux.conf only takes effect when tmux starts. <button className="tmux-link" onClick={() => chooseSource("config")}>Read the keys from my tmux.conf…</button></div>
+                    )}
+                    <div className="tmux-keys" style={{ "--tmux-keycol": `${keyCol}px` }}>
+                      {groups.map(t => (
+                        <div key={t} className="tmux-group">
+                          <div className="tmux-group-title">{tmuxTableTitle(t)}{t === "prefix" ? ` — press ${keys.prefix} first` : ""}</div>
+                          {shown.filter(k => k.table === t).sort(byYours).map(k => (
+                            <div key={`${k.table}:${k.key}`} className={`tmux-key-row ${k.origin}`}>
+                              <span className="tmux-keycap" title={k.key}>{k.key}</span>
+                              <span className="tmux-cmd" title={k.command}>{k.command}{k.repeat ? <span className="tmux-repeat" title="Repeats while you keep pressing (bind -r)"> ↻</span> : null}</span>
+                              <span className="tmux-key-note">
+                                {k.origin === "custom" && <span className="tmux-badge mine">★ yours</span>}
+                                {k.origin === "replaced" && <span className="tmux-badge replaced" title={`tmux has this key bound to: ${k.replaces}`}>⇄ yours · replaces <code>{k.replaces}</code></span>}
+                                {k.origin === "default" && (k.note || "")}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                      {removedShown.length > 0 && (
+                        <div className="tmux-group">
+                          <div className="tmux-group-title">Removed from tmux's defaults</div>
+                          {removedShown.map(k => (
+                            <div key={`r:${k.table}:${k.key}`} className="tmux-key-row removed">
+                              <span className="tmux-keycap" title={k.key}>{k.key}</span>
+                              <span className="tmux-cmd">{tmuxTableTitle(k.table)}: was <code>{k.command}</code></span>
+                              <span className="tmux-key-note"><span className="tmux-badge removed">✕ unbound</span></span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {shown.length === 0 && removedShown.length === 0 && <div className="tmux-note-line">No key matches.</div>}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {tab === "file" && (
+              <div className="tmux-body">
+                <div className="scp-hint tmux-promise">Your tmux.conf always prevails: Merendero changes it only when you press Save, keeps a backup first, follows symlinks, and does not overwrite it if it changed on disk meanwhile.</div>
+                <div className="tmux-files">
+                  {files.map(f => (
+                    <button key={f.id} className={`tmux-chip ${target === f.id ? "on" : ""}`} onClick={() => chooseTarget(f.id)} title={f.exists ? "Exists" : "Does not exist yet: it is created when you save"}>
+                      {f.path}{f.exists ? "" : " (new)"}
+                    </button>
+                  ))}
+                </div>
+                {bothExist && <div className="tmux-note-line">tmux reads both files, in this order: when they disagree, the second one wins.</div>}
+                {file && (
+                  <div className="tmux-fileinfo">
+                    {file.file.path}{file.file.is_symlink ? ` → ${file.file.real_path} (symlink: saving writes the target and keeps the link)` : ""}
+                    {file.file.exists ? ` · ${file.file.size} bytes` : " · new file: it will be created when you save"}
+                    {crlf ? " · Windows line endings (kept)" : ""}
+                  </div>
+                )}
+                {file && file.read_only && <div className="scp-result error">{file.read_only_reason}</div>}
+                {conflict && (
+                  <div className="scp-result error tmux-conflict">
+                    The file changed on disk since you opened it. Nothing was written.
+                    <div className="tmux-conflict-actions">
+                      <button className="btn-cancel" onClick={() => loadFile(target)}>Reload it from disk (lose my edits)</button>
+                      {confirm === "overwrite"
+                        ? <button className="btn-primary" onClick={() => save(false, true)}>Yes, overwrite (the file on disk goes to a backup)</button>
+                        : <button className="btn-cancel" onClick={() => setConfirm("overwrite")}>Overwrite anyway…</button>}
+                    </div>
+                  </div>
+                )}
+                {fileError && <div className="scp-result error">{fileError}</div>}
+                {file && (
+                  <textarea
+                    className="tmux-editor"
+                    spellCheck={false}
+                    wrap="off"
+                    value={text}
+                    readOnly={file.read_only}
+                    onChange={e => { setText(e.target.value); setCheck(null); }}
+                    placeholder={file.file.exists ? "" : "# The file does not exist yet. What you type here is created when you press Save."}
+                  />
+                )}
+                {check && (
+                  <div className="tmux-check">
+                    {check.errors.length === 0
+                      ? <div className="scp-result success">✓ Syntax OK. tmux cannot say more without applying the file: an invalid value or an unknown option only shows when you Reload.</div>
+                      : <div className="scp-result error">{check.errors.map((e, i) => <div key={i}>{e.line > 0 ? `Line ${e.line}: ` : ""}{e.text}</div>)}</div>}
+                    {check.notices.length > 0 && (
+                      <div className="scp-hint">These lines run commands or load other files when tmux reads the file (the check does not run them): {check.notices.map(n => `line ${n.line}`).join(", ")}</div>
+                    )}
+                  </div>
+                )}
+                {reload && (
+                  <div className={`scp-result ${reload.applied ? "success" : "error"}`}>
+                    {reload.applied ? "✓ tmux applied the file." : reload.running ? "tmux reported errors (the lines before the error were applied):" : ""} {reload.output}
+                  </div>
+                )}
+                {showBackups && (
+                  <div className="tmux-backups">
+                    {backups.length === 0 ? <div className="tmux-note-line">No backups yet: one is made before each change.</div> : backups.map(b => (
+                      <div key={b.name} className="tmux-backup-row">
+                        <span>{tmuxBackupLabel(b.name)} · {b.size} bytes</span>
+                        {confirm === `backup:${b.name}`
+                          ? <button className="btn-primary" onClick={() => loadBackup(b.name)}>Yes, replace my edits</button>
+                          : <button className="btn-cancel" onClick={() => (dirty ? setConfirm(`backup:${b.name}`) : loadBackup(b.name))}>Load into editor</button>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        {confirm.startsWith("target:") && (
+          <div className="scp-result error tmux-confirm">You have unsaved changes in this file.
+            <button className="btn-cancel" onClick={() => { const t = confirm.slice(7); setConfirm(""); setFile(null); setTarget(t); }}>Discard and switch</button>
+            <button className="btn-cancel" onClick={() => setConfirm("")}>Keep editing</button>
+          </div>
+        )}
+        {confirm === "revert" && (
+          <div className="scp-result error tmux-confirm">Discard your edits and read the file again?
+            <button className="btn-cancel" onClick={() => loadFile(target)}>Yes, discard</button>
+            <button className="btn-cancel" onClick={() => setConfirm("")}>Keep editing</button>
+          </div>
+        )}
+        {confirm === "close" && (
+          <div className="scp-result error tmux-confirm">You have unsaved changes.
+            <button className="btn-cancel" onClick={onClose}>Close and discard</button>
+            <button className="btn-cancel" onClick={() => setConfirm("")}>Keep editing</button>
+          </div>
+        )}
+
+        <div className="modal-actions">
+          {tab === "file" && file && (
+            <>
+              <button className="btn-cancel" disabled={!!busy} onClick={() => setShowBackups(s => !s)}>Backups ({backups.length})</button>
+              <button className="btn-cancel" disabled={!!busy || !dirty} onClick={() => setConfirm("revert")}>Revert</button>
+              <button className="btn-cancel" disabled={!!busy} onClick={doCheck}>Check syntax</button>
+              <button className="btn-cancel" disabled={!!busy || dirty || !file.file.exists} title={dirty ? "Save first: Reload applies the file on disk" : "Apply the file to your running tmux"} onClick={doReload}>Reload tmux</button>
+              <button className="btn-primary" disabled={!!busy || !dirty || file.read_only} onClick={() => save(false, false)}>Save</button>
+              <button className="btn-primary" disabled={!!busy || !dirty || file.read_only} onClick={() => save(true, false)}>Save & reload</button>
+            </>
+          )}
+          <button className="btn-cancel" onClick={closeModal}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function pathBase(p) {
   const parts = (p || "").split("/").filter(Boolean);
   return parts.length ? parts[parts.length - 1] : "";
@@ -2723,6 +3137,7 @@ function App() {
   const [showUsernameModal, setShowUsernameModal] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showTmux, setShowTmux] = useState(false);
   const [showRunCommand, setShowRunCommand] = useState(false);
   const [showScpBroadcast, setShowScpBroadcast] = useState(false);
   const [showBroadcastConfirm, setShowBroadcastConfirm] = useState(false);
@@ -3114,6 +3529,7 @@ function App() {
       {showScpBroadcast && <ScpBroadcastModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowScpBroadcast(false)} showToast={showToast} />}
       {showRunCommand && <RunCommandModal hosts={networks[selectedNetwork]?.hosts.filter(h => selectedHosts.has(h.ip)) || []} network={networks[selectedNetwork]} config={config} onClose={() => setShowRunCommand(false)} />}
       {showSettings && <SettingsModal config={config} networks={networks} onSave={handleSaveSettings} onClose={() => setShowSettings(false)} showToast={showToast} />}
+      {showTmux && <TmuxModal onClose={() => setShowTmux(false)} showToast={showToast} />}
       {scanConfirm && <ScanConfirmModal network={scanConfirm.network} info={scanConfirm.info} onClose={() => setScanConfirm(null)} onConfirm={() => { setScanConfirm(null); runScan(); }} />}
       {terminalPrompt && <TerminalPromptModal terminals={terminalPrompt.terminals} autoId={terminalPrompt.autoId} onChoose={async (v) => { setTerminalPrompt(null); await handleSaveSettings({ ...config, defaults: { ...config.defaults, terminal: v } }); }} />}
       {hostModal && <HostModal host={hostModal.host} networks={networks} defaultNetworkIndex={selectedNetwork ?? 0} onSave={handleSaveHost} onClose={() => setHostModal(null)} showToast={showToast} onHealthCheck={(h) => { setHostModal(null); setHealthModal(h); }} />}
@@ -3168,6 +3584,7 @@ function App() {
               <div className="main-actions">
                 <div className="filter-wrap"><input onKeyDown={e => { if (e.key === "Escape") setFilter(""); }} className="filter-input" type="text" placeholder="Filter: ip, fqdn, tag, :critical, :warning, :issues, :down, :up" value={filter} onChange={e => setFilter(e.target.value)} disabled={scanning || checking} />{filter && <button className="filter-clear" onClick={() => setFilter("")} title="Clear filter (Esc)">✕</button>}</div>
                 <button className={`filter-outputs ${searchOutputs ? "on" : ""}`} onClick={() => setSearchOutputs(s => !s)} title="Also search the stored output of the profiles (3+ characters)">{outputsSearching ? "…" : "▣"}</button>
+                <button className="btn-settings" title="tmux: keys and configuration" onClick={() => setShowTmux(true)}>tmux</button>
                 <button className="btn-settings" onClick={() => setShowSettings(true)}>⚙</button>
                 <button className="btn-add-network-main" onClick={() => setNetworkModal({ network: null, index: undefined })}>+ Network</button>
                 {globalMode && <button className="btn-clear" onClick={() => setFilter("")}>✕ Clear search</button>}
