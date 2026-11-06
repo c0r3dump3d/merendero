@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 
+/// How the tmux session of a Broadcast is set up. Every field defaults to true, so a config.toml written
+/// before these settings existed keeps working (and gets them).
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct BroadcastSettings {
+    /// Each pane carries the name of its host on its border.
+    pub label_panes: bool,
+    /// A pane whose ssh fails stays open, with its output, instead of disappearing.
+    pub keep_failed: bool,
+    /// The panes start synchronized (what a Broadcast is for).
+    pub start_synced: bool,
+}
+
+impl Default for BroadcastSettings {
+    fn default() -> Self {
+        BroadcastSettings { label_panes: true, keep_failed: true, start_synced: true }
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Defaults {
     pub username: String,
@@ -8,6 +27,9 @@ pub struct Defaults {
     pub dns_server: Option<String>,
     pub identity_file: Option<String>,
     pub terminal: Option<String>,
+    // A table: it has to come after the plain values for the TOML to be written.
+    #[serde(default)]
+    pub broadcast: BroadcastSettings,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -51,6 +73,7 @@ pub fn default_config() -> Config {
             dns_server: None,
             identity_file: None,
             terminal: None,
+            broadcast: BroadcastSettings::default(),
         },
         ai: None,
         monitoring: None,
@@ -127,16 +150,36 @@ pub fn load_history(path: &str) -> History {
     toml::from_str(&content).unwrap_or(History { connections: vec![] })
 }
 
+/// Most hosts kept in the history. It is only used to show "Last connection", so what matters is the
+/// most recent connection to each host, not how many connections there were.
+const MAX_HISTORY_HOSTS: usize = 1000;
+
 pub fn save_history(path: &str, history: &History) -> Result<(), String> {
-    // máximo 50 entradas
-    let mut h = history.clone();
-    if h.connections.len() > 50 {
-        h.connections = h.connections.into_iter().rev().take(50).rev().collect();
+    // Only the most recent connection of each host (network + ip) is kept, up to MAX_HISTORY_HOSTS.
+    // Keeping the last 50 ENTRIES instead made a broadcast to 20 hosts push 20 other hosts out.
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<ConnectionRecord> = Vec::new();
+    for r in history.connections.iter().rev() {
+        if kept.len() >= MAX_HISTORY_HOSTS {
+            break;
+        }
+        if seen.insert((r.network_name.clone(), r.ip.clone())) {
+            kept.push(r.clone());
+        }
     }
+    kept.reverse();
+    let h = History { connections: kept };
     let content = toml::to_string(&h)
         .map_err(|e| format!("Could not serialize history: {}", e))?;
     std::fs::write(path, content)
         .map_err(|e| format!("Could not write history: {}", e))
+}
+
+/// Adds connection records in ONE load/save of the history (a broadcast records one per host).
+pub fn record_connections(path: &str, records: Vec<ConnectionRecord>) -> Result<(), String> {
+    let mut history = load_history(path);
+    history.connections.extend(records);
+    save_history(path, &history)
 }
 
 pub fn _resolve_identity_file(host: &Host, network: &Network, defaults: &Defaults) -> Option<String> {

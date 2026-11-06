@@ -3682,6 +3682,834 @@ async fn tmux_reload(target: String) -> Result<TmuxReload, String> {
 }
 // ===== tmux: end =====
 
+// ===== tmux options: begin =====
+const TMUX_BLOCK_BEGIN: &str = "# >>> merendero tmux options >>>";
+const TMUX_BLOCK_END: &str = "# <<< merendero tmux options <<<";
+const TMUX_BLOCK_TAG: &str = "# merendero:option ";
+
+/// "3.4" -> (3, 4); "3.3a" -> (3, 3); "next-3.5" -> (3, 5). None when it cannot be read: then nothing is
+/// refused for its version.
+fn tmux_version_pair(v: &str) -> Option<(u32, u32)> {
+    let v = v.trim().trim_start_matches("next-");
+    let mut parts = v.split('.');
+    let major: u32 = parts.next()?.trim().parse().ok()?;
+    let minor: String = parts.next().unwrap_or("0").chars().take_while(|c| c.is_ascii_digit()).collect();
+    Some((major, minor.parse().unwrap_or(0)))
+}
+
+/// FNV-1a: not a security hash, only a way to notice that the block was edited by hand.
+fn tmux_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", h)
+}
+
+struct TmuxOptionDef {
+    id: &'static str,
+    group: &'static str,
+    title: &'static str,
+    description: &'static str,
+    min: (u32, u32),
+    /// (value, label); empty when the option has no value to choose
+    values: &'static [(&'static str, &'static str)],
+    default: &'static str,
+    /// All or nothing: if the user sets any part of it, none of it is written.
+    atomic: bool,
+    /// The values are KEYS of the prefix table: one the user already uses is not offered, and if the user already
+    /// has the function on any key, it counts as done.
+    keys: bool,
+}
+
+const TMUX_OPTION_DEFS: &[TmuxOptionDef] = &[
+    TmuxOptionDef { id: "mouse", group: "Basics", title: "Mouse", description: "Click to select a pane, scroll with the wheel and drag the borders to resize", min: (1, 8), values: &[], default: "", atomic: false, keys: false },
+    TmuxOptionDef { id: "history", group: "Basics", title: "Scrollback history", description: "How many lines each pane remembers (tmux keeps 2000 by default)", min: (1, 8), values: &[("10000", "10,000 lines"), ("50000", "50,000 lines"), ("100000", "100,000 lines")], default: "50000", atomic: false, keys: false },
+    TmuxOptionDef { id: "escape-time", group: "Basics", title: "Fast Escape key", description: "No half-second wait after Escape (it helps vim and similar programs over ssh)", min: (1, 8), values: &[], default: "", atomic: false, keys: false },
+    TmuxOptionDef { id: "numbering", group: "Basics", title: "Number windows and panes from 1", description: "Like the keyboard: prefix + 1 is the first window", min: (1, 8), values: &[], default: "", atomic: false, keys: false },
+    TmuxOptionDef { id: "renumber", group: "Basics", title: "Renumber windows when one closes", description: "No gaps in the window numbers", min: (1, 8), values: &[], default: "", atomic: false, keys: false },
+    TmuxOptionDef { id: "focus", group: "Basics", title: "Focus events", description: "Tells vim and other programs when the pane gains or loses focus", min: (1, 9), values: &[], default: "", atomic: false, keys: false },
+    TmuxOptionDef { id: "vi-keys", group: "Copy mode", title: "vi keys in copy mode", description: "Move, search and select with vi keys (v to select, y to copy with the shortcuts below)", min: (1, 8), values: &[], default: "", atomic: false, keys: false },
+    TmuxOptionDef { id: "clipboard", group: "Copy mode", title: "System clipboard", description: "Lets programs in a pane copy to the system clipboard, if your terminal allows it", min: (1, 5), values: &[], default: "", atomic: false, keys: false },
+    TmuxOptionDef { id: "sync", group: "Panes and Broadcast", title: "Toggle synchronize-panes with a key", description: "Type in all the panes of a Broadcast, or only in one: the status line says whether it is ON or OFF. Pick the key after prefix", min: (3, 2), values: &[("S", "prefix + S"), ("y", "prefix + y"), ("Y", "prefix + Y"), ("a", "prefix + a"), ("u", "prefix + u")], default: "S", atomic: false, keys: true },
+    TmuxOptionDef { id: "splits", group: "Panes and Broadcast", title: "Split with | and -, in the same directory", description: "prefix + | splits side by side and prefix + - one above the other, and the new pane starts where you were", min: (1, 8), values: &[], default: "", atomic: false, keys: false },
+    TmuxOptionDef { id: "reload", group: "Keys", title: "Reload the configuration with a key", description: "Applies your tmux.conf to the running tmux and says so in the status line. Pick the key after prefix", min: (3, 2), values: &[("r", "prefix + r"), ("R", "prefix + R"), ("B", "prefix + B")], default: "r", atomic: false, keys: true },
+    TmuxOptionDef { id: "prefix", group: "Keys", title: "Prefix key", description: "The key you press before every tmux shortcut (tmux uses Ctrl-b by default)", min: (1, 8), values: &[("C-a", "Ctrl-a"), ("C-Space", "Ctrl-Space"), ("C-s", "Ctrl-s")], default: "C-a", atomic: true, keys: false },
+    TmuxOptionDef { id: "status", group: "Status bar", title: "Host name and time on the right", description: "Useful when several terminals look the same", min: (1, 8), values: &[], default: "", atomic: true, keys: false },
+    TmuxOptionDef { id: "no-rename", group: "Status bar", title: "Do not let programs rename windows", description: "Stops a program in a pane from changing the window title by itself", min: (1, 8), values: &[], default: "", atomic: false, keys: false },
+];
+
+struct TmuxItem {
+    /// "set" (an option) or "bind" (a key of the prefix table)
+    kind: &'static str,
+    name: String,
+    line: String,
+    /// For a key: a word that the user's command must contain to do the same thing as ours. Without it, the key
+    /// is only taken by something else (a tick would say it is applied when it is not). Empty: any use counts.
+    same: &'static str,
+}
+
+/// What an option writes: one line for each thing it sets, so that what the user already sets is not repeated.
+fn tmux_option_items(id: &str, value: &str, conf: &str) -> Vec<TmuxItem> {
+    let set = |name: &str, line: String| TmuxItem { kind: "set", name: name.to_string(), line, same: "" };
+    let bind = |key: &str, line: String, same: &'static str| TmuxItem { kind: "bind", name: key.to_string(), line, same };
+    match id {
+        "mouse" => vec![set("mouse", String::from("set -g mouse on"))],
+        "history" => vec![set("history-limit", format!("set -g history-limit {}", value))],
+        "escape-time" => vec![set("escape-time", String::from("set -sg escape-time 10"))],
+        "numbering" => vec![set("base-index", String::from("set -g base-index 1")), set("pane-base-index", String::from("setw -g pane-base-index 1"))],
+        "renumber" => vec![set("renumber-windows", String::from("set -g renumber-windows on"))],
+        "focus" => vec![set("focus-events", String::from("set -g focus-events on"))],
+        "vi-keys" => vec![set("mode-keys", String::from("setw -g mode-keys vi"))],
+        "clipboard" => vec![set("set-clipboard", String::from("set -g set-clipboard on"))],
+        "sync" => vec![bind(value, format!(r##"bind {} {{ setw synchronize-panes; display-message "synchronize-panes #{{?synchronize-panes,ON,OFF}}" }}"##, value), "synchronize-panes")],
+        "splits" => vec![
+            bind("|", String::from(r##"bind | split-window -h -c "#{pane_current_path}""##), "split-window"),
+            bind("-", String::from(r##"bind - split-window -v -c "#{pane_current_path}""##), "split-window"),
+        ],
+        "reload" => vec![bind(value, format!(r##"bind {} {{ source-file "{}" ; display-message "tmux.conf reloaded" }}"##, value, conf), "source-file")],
+        "prefix" => vec![set("prefix", format!("set -g prefix {}", value)), bind("C-b", String::from("unbind C-b"), ""), bind(value, format!("bind {} send-prefix", value), "send-prefix")],
+        "status" => vec![
+            set("status-interval", String::from("set -g status-interval 5")),
+            set("status-right-length", String::from("set -g status-right-length 60")),
+            set("status-right", String::from(r##"set -g status-right " #H | %Y-%m-%d %H:%M ""##)),
+        ],
+        "no-rename" => vec![set("allow-rename", String::from("setw -g allow-rename off"))],
+        _ => vec![],
+    }
+}
+
+/// Something the user's own files already decide.
+struct TmuxSeen {
+    kind: String,
+    name: String,
+    label: String,
+    line: usize,
+    text: String,
+    /// the whole command, not shortened: it is searched for the word that says what it does
+    full: String,
+}
+
+const TMUX_NEWLINE: char = 10u8 as char;
+
+/// The commands of a tmux configuration text, as (line, words), following the rules of tmux's parser that matter
+/// here: `#` at the start of a word begins a comment, quotes keep a word together, a `;` ends a command (a `\;`
+/// does NOT: in a file it only chains the commands of a bind, and tmux gives an error anywhere else), a backslash
+/// at the end of a line continues it and what is inside `{ }` is not a top-level command.
+fn tmux_commands(text: &str) -> Vec<(usize, Vec<String>)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<(usize, Vec<String>)> = vec![];
+    let mut cur: Vec<String> = vec![];
+    let mut cur_line = 1;
+    let mut line = 1;
+    let mut depth = 0usize;
+    let mut tok = String::new();
+    let mut in_tok = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let mut end_word = false;
+        let mut end_cmd = false;
+        if c == TMUX_BACKSLASH && i + 1 < chars.len() && chars[i + 1] == TMUX_NEWLINE {
+            end_word = true;
+            line += 1;
+            i += 1;
+        } else if c == TMUX_BACKSLASH && i + 1 < chars.len() {
+            tok.push(chars[i + 1]);
+            in_tok = true;
+            i += 1;
+        } else if c == TMUX_NEWLINE {
+            end_word = true;
+            end_cmd = true;
+            line += 1;
+        } else if c == ' ' || c == '\t' || c == '\r' {
+            end_word = true;
+        } else if c == ';' {
+            end_word = true;
+            end_cmd = true;
+        } else if c == '#' && !in_tok {
+            while i + 1 < chars.len() && chars[i + 1] != TMUX_NEWLINE {
+                i += 1;
+            }
+        } else if c == '"' || c == '\'' {
+            in_tok = true;
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                if c == '"' && chars[i] == TMUX_BACKSLASH && i + 1 < chars.len() {
+                    i += 1;
+                }
+                if chars[i] == TMUX_NEWLINE {
+                    line += 1;
+                }
+                tok.push(chars[i]);
+                i += 1;
+            }
+        } else if c == '{' && !in_tok {
+            depth += 1;
+        } else if c == '}' && depth > 0 {
+            depth -= 1;
+            end_word = true;
+        } else {
+            tok.push(c);
+            in_tok = true;
+        }
+        if end_word && in_tok {
+            if depth == 0 {
+                if cur.is_empty() {
+                    cur_line = line;
+                }
+                cur.push(std::mem::take(&mut tok));
+            } else {
+                tok.clear();
+            }
+            in_tok = false;
+        }
+        if end_cmd && depth == 0 && !cur.is_empty() {
+            out.push((cur_line, std::mem::take(&mut cur)));
+        }
+        i += 1;
+    }
+    if in_tok && depth == 0 {
+        if cur.is_empty() {
+            cur_line = line;
+        }
+        cur.push(tok);
+    }
+    if !cur.is_empty() {
+        out.push((cur_line, cur));
+    }
+    out
+}
+
+/// The options set and the keys of the prefix table bound or unbound by `text`.
+fn tmux_seen_in(text: &str, label: &str) -> Vec<TmuxSeen> {
+    let mut seen = vec![];
+    for (line, words) in tmux_commands(text) {
+        let name = words[0].as_str();
+        let is_set = ["set", "set-option", "setw", "set-window-option"].contains(&name);
+        let is_bind = ["bind", "bind-key"].contains(&name);
+        let is_unbind = ["unbind", "unbind-key"].contains(&name);
+        if !is_set && !is_bind && !is_unbind {
+            continue;
+        }
+        let mut table = String::from("prefix");
+        let mut all = false;
+        let mut i = 1;
+        while i < words.len() && words[i].starts_with('-') && words[i].len() > 1 {
+            let flags = &words[i][1..];
+            if flags.contains('n') && !is_set {
+                table = String::from("root");
+            }
+            if flags.contains('a') && is_unbind {
+                all = true;
+            }
+            let takes_arg = flags.ends_with('t') || (is_bind && (flags.ends_with('N') || flags.ends_with('T'))) || (is_unbind && flags.ends_with('T'));
+            if flags.ends_with('T') && i + 1 < words.len() {
+                table = words[i + 1].clone();
+            }
+            i += if takes_arg { 2 } else { 1 };
+        }
+        let full = words.join(" ");
+        let snippet: String = full.chars().take(90).collect();
+        if all {
+            seen.push(TmuxSeen { kind: String::from("bind"), name: String::from("*"), label: label.to_string(), line, text: snippet, full: full.clone() });
+        } else if i < words.len() {
+            if is_set {
+                let opt = words[i].split('[').next().unwrap_or("").to_string();
+                seen.push(TmuxSeen { kind: String::from("set"), name: opt, label: label.to_string(), line, text: snippet, full: full.clone() });
+            } else if table == "prefix" {
+                seen.push(TmuxSeen { kind: String::from("bind"), name: words[i].clone(), label: label.to_string(), line, text: snippet, full: full.clone() });
+            }
+        }
+    }
+    seen
+}
+
+struct TmuxBlockInfo {
+    present: bool,
+    /// A start without an end, an end without a start, or several blocks: nothing is touched.
+    broken: bool,
+    modified: bool,
+    at_top: bool,
+    lines_before: usize,
+    selection: Vec<(String, Option<String>)>,
+    first: usize,
+    last: usize,
+}
+
+fn tmux_line_trim(l: &str) -> &str {
+    l.trim_end_matches(|c| c == TMUX_NEWLINE || c == '\r')
+}
+
+fn tmux_find_block(text: &str) -> TmuxBlockInfo {
+    let lines: Vec<&str> = text.split_inclusive(TMUX_NEWLINE).collect();
+    let mut info = TmuxBlockInfo { present: false, broken: false, modified: false, at_top: true, lines_before: 0, selection: vec![], first: 0, last: 0 };
+    let begins: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| tmux_line_trim(l).starts_with(TMUX_BLOCK_BEGIN)).map(|(i, _)| i).collect();
+    let ends: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| tmux_line_trim(l) == TMUX_BLOCK_END).map(|(i, _)| i).collect();
+    if begins.is_empty() && ends.is_empty() {
+        return info;
+    }
+    info.present = true;
+    if begins.len() != 1 || ends.len() != 1 || ends[0] < begins[0] {
+        info.broken = true;
+        return info;
+    }
+    info.first = begins[0];
+    info.last = ends[0];
+    let body: Vec<&str> = lines[info.first + 1..info.last].iter().map(|l| tmux_line_trim(l)).collect();
+    let begin_line = tmux_line_trim(lines[info.first]);
+    let stored = begin_line[TMUX_BLOCK_BEGIN.len()..].split("hash=").nth(1).map(|h| h.trim().to_string());
+    info.modified = stored.as_deref() != Some(tmux_hash(&body.join("\n")).as_str());
+    for l in &body {
+        if let Some(rest) = l.strip_prefix(TMUX_BLOCK_TAG) {
+            match rest.split_once('=') {
+                Some((id, v)) => info.selection.push((id.trim().to_string(), Some(v.trim().to_string()))),
+                None => info.selection.push((rest.trim().to_string(), None)),
+            }
+        }
+    }
+    info.lines_before = lines[..info.first].iter().filter(|l| {
+        let t = l.trim();
+        !t.is_empty() && !t.starts_with('#')
+    }).count();
+    info.at_top = info.lines_before == 0;
+    info
+}
+
+/// The text without the block and without the one blank line that follows it (the one Merendero adds).
+fn tmux_strip_block(text: &str, info: &TmuxBlockInfo) -> String {
+    let mut out = String::new();
+    for (i, l) in text.split_inclusive(TMUX_NEWLINE).enumerate() {
+        if info.present && !info.broken && i >= info.first && i <= info.last {
+            continue;
+        }
+        if info.present && !info.broken && i == info.last + 1 && tmux_line_trim(l).is_empty() {
+            continue;
+        }
+        out.push_str(l);
+    }
+    out
+}
+
+#[derive(serde::Deserialize)]
+struct TmuxChoice {
+    id: String,
+    value: Option<String>,
+}
+
+struct TmuxComposed {
+    block: String,
+    text: String,
+    skipped: Vec<(String, String)>,
+    unchanged: bool,
+    block_modified: bool,
+    moved: bool,
+}
+
+/// What of the user's own files decides this item: the option, or the key (`unbind -a` decides all of them).
+fn tmux_item_hits<'a>(seen: &'a [TmuxSeen], it: &TmuxItem) -> Vec<&'a TmuxSeen> {
+    seen.iter().filter(|s| s.kind == it.kind && (s.name == it.name || (it.kind == "bind" && s.name == "*"))).collect()
+}
+
+/// Is any of those decisions doing the same thing as the item? (a key bound to something else, or unbound, is not)
+fn tmux_does_same(it: &TmuxItem, hits: &[&TmuxSeen]) -> bool {
+    it.same.is_empty() || hits.iter().any(|s| s.full.contains(it.same))
+}
+
+/// For an option whose values are keys: does the user already have its function on ANY key? (a bind of theirs
+/// with the word that says what it does, such as `synchronize-panes`)
+fn tmux_function_present<'a>(seen: &'a [TmuxSeen], def: &TmuxOptionDef) -> Option<&'a TmuxSeen> {
+    if !def.keys {
+        return None;
+    }
+    let same = tmux_option_items(def.id, def.default, "").first().map(|it| it.same).unwrap_or("");
+    if same.is_empty() {
+        return None;
+    }
+    seen.iter().find(|s| s.kind == "bind" && s.name != "*" && s.full.contains(same))
+}
+
+/// The new text of the file for a selection of options: the block FIRST (tmux applies the lines in order, so
+/// everything of the user's, which comes after, wins) and the rest of the text exactly as it was.
+fn tmux_compose(original: Option<&str>, selection: &[TmuxChoice], other_seen: &[TmuxSeen], vpair: Option<(u32, u32)>, conf: &str, label: &str) -> Result<TmuxComposed, String> {
+    let orig = original.unwrap_or("");
+    let info = tmux_find_block(orig);
+    if info.broken {
+        return Err(String::from("The Merendero block of your file is incomplete or repeated (its first or last line is missing or appears twice): fix it by hand or remove it. Nothing was changed."));
+    }
+    for c in selection {
+        if !TMUX_OPTION_DEFS.iter().any(|d| d.id == c.id) {
+            return Err(format!("Unknown option: {}", c.id));
+        }
+    }
+    let rest = tmux_strip_block(orig, &info);
+    let mut seen = tmux_seen_in(&rest, label);
+    seen.extend(other_seen.iter().map(|s| TmuxSeen { kind: s.kind.clone(), name: s.name.clone(), label: s.label.clone(), line: s.line, text: s.text.clone(), full: s.full.clone() }));
+
+    let mut body: Vec<String> = vec![String::from("# Written by Merendero. tmux applies a file in order, so everything below this block wins over it.")];
+    let mut skipped = vec![];
+    let mut written = 0;
+    for def in TMUX_OPTION_DEFS {
+        let choice = match selection.iter().find(|c| c.id == def.id) {
+            Some(c) => c,
+            None => continue,
+        };
+        if let Some(v) = vpair {
+            if v < def.min {
+                return Err(format!("{} needs tmux {}.{} or newer", def.title, def.min.0, def.min.1));
+            }
+        }
+        let value = choice.value.clone().unwrap_or_else(|| def.default.to_string());
+        if def.values.is_empty() {
+            if choice.value.is_some() && !choice.value.as_deref().unwrap_or("").is_empty() {
+                return Err(format!("{} has no value to choose", def.title));
+            }
+        } else if !def.values.iter().any(|(v, _)| *v == value) {
+            return Err(format!("{}: \"{}\" is not one of its values", def.title, value));
+        }
+        if tmux_function_present(&seen, def).is_some() {
+            skipped.push((def.id.to_string(), String::from("already set in your own configuration")));
+            continue;
+        }
+        let items = tmux_option_items(def.id, &value, conf);
+        let mine = |it: &TmuxItem| !tmux_item_hits(&seen, it).is_empty();
+        let yours: Vec<&TmuxItem> = items.iter().filter(|it| mine(it)).collect();
+        if yours.len() == items.len() || (def.atomic && !yours.is_empty()) {
+            let other = yours.iter().any(|it| !tmux_does_same(it, &tmux_item_hits(&seen, it)));
+            skipped.push((def.id.to_string(), String::from(if other { "its key is already used by you for something else" } else { "already set in your own configuration" })));
+            continue;
+        }
+        body.push(if def.values.is_empty() { format!("{}{}", TMUX_BLOCK_TAG, def.id) } else { format!("{}{}={}", TMUX_BLOCK_TAG, def.id, value) });
+        for it in items.iter().filter(|it| !mine(it)) {
+            body.push(it.line.clone());
+        }
+        if !yours.is_empty() {
+            body.push(format!("# (not written, already set by you: {})", yours.iter().map(|i| i.name.clone()).collect::<Vec<_>>().join(", ")));
+        }
+        written += 1;
+    }
+    let crlf = orig.contains("\r\n");
+    let eol = if crlf { "\r\n" } else { "\n" };
+    let (block, text) = if written == 0 {
+        (String::new(), rest)
+    } else {
+        let mut lines = vec![format!("{} hash={}", TMUX_BLOCK_BEGIN, tmux_hash(&body.join("\n")))];
+        lines.extend(body.iter().cloned());
+        lines.push(String::from(TMUX_BLOCK_END));
+        let block_text = format!("{}{}", lines.join(eol), eol);
+        let text = if rest.is_empty() { block_text.clone() } else { format!("{}{}{}", block_text, eol, rest) };
+        (lines.join("\n"), text)
+    };
+    Ok(TmuxComposed { unchanged: text == orig, block, text, skipped: skipped.into_iter().map(|(id, why)| (id, why)).collect(), block_modified: info.present && info.modified, moved: info.present && !info.at_top })
+}
+
+/// Where Merendero writes its block: the FIRST file tmux reads, so that the second one (if there is one) still
+/// wins over it. That is ~/.tmux.conf when it exists, or when neither does; otherwise the XDG one.
+struct TmuxOptionsLoaded {
+    version: String,
+    vpair: Option<(u32, u32)>,
+    target: String,
+    file: TmuxConfigFile,
+    text: Option<String>,
+    label: String,
+    other_path: Option<String>,
+    other_seen: Vec<TmuxSeen>,
+}
+
+fn tmux_short_path(p: &str) -> String {
+    match dirs::home_dir() {
+        Some(h) => match p.strip_prefix(h.to_string_lossy().as_ref()) {
+            Some(rest) if rest.starts_with('/') => format!("~{}", rest),
+            _ => p.to_string(),
+        },
+        None => p.to_string(),
+    }
+}
+
+async fn tmux_options_load() -> Result<TmuxOptionsLoaded, String> {
+    let v = tmux_run(&["-V"], None).await?;
+    let version = tmux_version_from(&v.stdout).ok_or_else(|| String::from("tmux did not say its version"))?;
+    let files: Vec<TmuxConfigFile> = tmux_config_candidates().iter().map(|(id, p)| tmux_file_state(id, p)).collect();
+    let home = files.iter().find(|f| f.id == "home").ok_or_else(|| String::from("No home folder"))?;
+    let xdg = files.iter().find(|f| f.id == "xdg");
+    let (target, other) = if home.exists || !xdg.map_or(false, |x| x.exists) {
+        ("home", xdg.filter(|x| x.exists))
+    } else {
+        ("xdg", None)
+    };
+    let file = tmux_file_state(target, &tmux_target_path(target)?);
+    let text = if file.exists {
+        if file.size > TMUX_CONFIG_MAX_BYTES {
+            return Err(String::from("The file is too big to be edited here: edit it with your own editor."));
+        }
+        let bytes = std::fs::read(&file.path).map_err(|e| format!("Could not read {}: {}", file.path, e))?;
+        Some(String::from_utf8(bytes).map_err(|_| String::from("The file is not valid UTF-8: edit it with your own editor."))?)
+    } else {
+        None
+    };
+    let mut other_seen = vec![];
+    let mut other_path = None;
+    if let Some(o) = other {
+        other_path = Some(o.path.clone());
+        if o.size <= TMUX_CONFIG_MAX_BYTES {
+            if let Ok(t) = std::fs::read_to_string(&o.path) {
+                other_seen = tmux_seen_in(&t, &tmux_short_path(&o.path));
+            }
+        }
+    }
+    let label = tmux_short_path(&file.path);
+    Ok(TmuxOptionsLoaded { vpair: tmux_version_pair(&version), version, target: target.to_string(), file, text, label, other_path, other_seen })
+}
+
+#[derive(serde::Serialize)]
+struct TmuxOptionView {
+    id: String,
+    group: String,
+    title: String,
+    description: String,
+    available: bool,
+    needs: Option<String>,
+    values: Vec<(String, String)>,
+    value: String,
+    enabled: bool,
+    /// what the block writes for it now
+    lines: Vec<String>,
+    /// where the user already sets what it would write
+    yours: Vec<String>,
+    /// all of it is already the user's AND does what ours would do: the tick
+    all_yours: bool,
+    /// for key options: the keys of its values that the user already uses (not offered)
+    taken: Vec<String>,
+    /// for key options: why a key other than the usual one is proposed
+    key_note: Option<String>,
+    /// it cannot be added because a key it needs is already used by the user for something else (no tick)
+    blocked: bool,
+    conflicts: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct TmuxBlockView {
+    present: bool,
+    broken: bool,
+    modified: bool,
+    at_top: bool,
+    lines_before: usize,
+}
+
+#[derive(serde::Serialize)]
+struct TmuxOptionsView {
+    version: String,
+    target: String,
+    path: String,
+    other_path: Option<String>,
+    read_only: bool,
+    read_only_reason: Option<String>,
+    block: TmuxBlockView,
+    options: Vec<TmuxOptionView>,
+}
+
+/// The options Merendero can write into the user's tmux.conf, which of them the block has now, and which the
+/// user already sets by hand. It only reads.
+#[tauri::command]
+async fn tmux_options_state() -> Result<TmuxOptionsView, String> {
+    let l = tmux_options_load().await?;
+    let orig = l.text.clone().unwrap_or_default();
+    let info = tmux_find_block(&orig);
+    let rest = tmux_strip_block(&orig, &info);
+    let mut seen = tmux_seen_in(&rest, &l.label);
+    seen.extend(l.other_seen.iter().map(|s| TmuxSeen { kind: s.kind.clone(), name: s.name.clone(), label: s.label.clone(), line: s.line, text: s.text.clone(), full: s.full.clone() }));
+    let mut options = vec![];
+    for def in TMUX_OPTION_DEFS {
+        let tag = info.selection.iter().find(|(id, _)| id == def.id);
+        let line_of = |h: &TmuxSeen| format!("{} line {}: {}", h.label, h.line, h.text);
+        let taken: Vec<String> = if def.keys {
+            def.values.iter().map(|(v, _)| v.to_string()).filter(|v| tmux_option_items(def.id, v, &l.file.path).iter().any(|it| !tmux_item_hits(&seen, it).is_empty())).collect()
+        } else {
+            vec![]
+        };
+        let present = tmux_function_present(&seen, def);
+        let from_tag = tag.and_then(|(_, v)| v.clone()).filter(|v| def.values.iter().any(|(x, _)| x == v));
+        let value = match from_tag {
+            Some(v) => v,
+            None if def.keys => def.values.iter().map(|(v, _)| v.to_string()).find(|v| !taken.contains(v)).unwrap_or_else(|| def.default.to_string()),
+            None => def.default.to_string(),
+        };
+        let items = tmux_option_items(def.id, &value, &l.file.path);
+        let hit = |it: &TmuxItem| tmux_item_hits(&seen, it);
+        let mut yours: Vec<String> = vec![];
+        let mut conflicts: Vec<String> = vec![];
+        let mut mine_count = 0;
+        for it in &items {
+            let h = hit(it);
+            if !h.is_empty() {
+                mine_count += 1;
+                let line = line_of(h[0]);
+                if !tmux_does_same(it, &h) {
+                    conflicts.push(line.clone());
+                }
+                yours.push(line);
+            }
+        }
+        let mut held = mine_count == items.len() || (def.atomic && mine_count > 0);
+        let mut blocked = held && !conflicts.is_empty();
+        let mut all_yours = held && conflicts.is_empty();
+        if let Some(p) = present {
+            held = true;
+            blocked = false;
+            all_yours = true;
+            conflicts = vec![];
+            yours = vec![line_of(p)];
+        }
+        let key_note = if def.keys && present.is_none() && tag.is_none() && value != def.default && taken.iter().any(|t| t == def.default) {
+            tmux_option_items(def.id, def.default, &l.file.path).first().and_then(|it| tmux_item_hits(&seen, it).first().map(|h| format!("prefix + {} is already used by you ({}), so prefix + {} is proposed", def.default, line_of(h), value)))
+        } else {
+            None
+        };
+        let lines: Vec<String> = if held { vec![] } else { items.iter().filter(|it| hit(it).is_empty()).map(|it| it.line.clone()).collect() };
+        let available = l.vpair.map_or(true, |v| v >= def.min);
+        options.push(TmuxOptionView {
+            id: def.id.to_string(),
+            group: def.group.to_string(),
+            title: def.title.to_string(),
+            description: def.description.to_string(),
+            available,
+            needs: if available { None } else { Some(format!("{}.{}", def.min.0, def.min.1)) },
+            values: def.values.iter().map(|(v, lab)| (v.to_string(), lab.to_string())).collect(),
+            value,
+            enabled: tag.is_some(),
+            lines,
+            yours,
+            all_yours,
+            taken,
+            key_note,
+            blocked,
+            conflicts,
+        });
+    }
+    let reason = if !l.file.writable {
+        Some(match &l.file.real_path {
+            Some(r) => format!("The file is read-only (it points to {}): it is probably managed by another tool.", r),
+            None => String::from("The file is read-only."),
+        })
+    } else {
+        None
+    };
+    Ok(TmuxOptionsView {
+        version: l.version,
+        target: l.target,
+        path: l.file.path.clone(),
+        other_path: l.other_path,
+        read_only: reason.is_some(),
+        read_only_reason: reason,
+        block: TmuxBlockView { present: info.present, broken: info.broken, modified: info.modified, at_top: info.at_top, lines_before: info.lines_before },
+        options,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct TmuxOptionsBuild {
+    target: String,
+    /// The file as it is now (None if it does not exist yet): it is what Save has to be given as `original`.
+    original: Option<String>,
+    block: String,
+    text: String,
+    unchanged: bool,
+    skipped: Vec<(String, String)>,
+    block_modified: bool,
+    moved: bool,
+}
+
+/// The text the file would have for a selection of options, without writing anything: the block first, the rest
+/// of the file as it was. Saving it is the job of tmux_write_config, with its backup and its checks.
+#[tauri::command]
+async fn tmux_options_build(selection: Vec<TmuxChoice>) -> Result<TmuxOptionsBuild, String> {
+    let l = tmux_options_load().await?;
+    let c = tmux_compose(l.text.as_deref(), &selection, &l.other_seen, l.vpair, &l.file.path, &l.label)?;
+    Ok(TmuxOptionsBuild { target: l.target, original: l.text, block: c.block, text: c.text, unchanged: c.unchanged, skipped: c.skipped, block_modified: c.block_modified, moved: c.moved })
+}
+// ===== tmux options: end =====
+
+// ===== broadcast settings: begin =====
+/// What the tmux session of a Broadcast gets: the user's settings, limited by the tmux version and by what the
+/// user's own tmux configuration already decides (which is left alone).
+struct BroadcastPlan {
+    label_panes: bool,
+    keep_failed: bool,
+    start_synced: bool,
+}
+
+/// What the user's own tmux already sets: how the pane borders look, and what happens when a pane ends.
+struct BroadcastYours {
+    border: bool,
+    remain: bool,
+}
+
+fn broadcast_plan(s: &host::BroadcastSettings, vpair: Option<(u32, u32)>, yours: &BroadcastYours) -> BroadcastPlan {
+    // A version that cannot be read is not held against the user.
+    let at_least = |min: (u32, u32)| vpair.map_or(true, |v| v >= min);
+    BroadcastPlan {
+        // per-pane user options (-p on an @option) need tmux 3.1
+        label_panes: s.label_panes && !yours.border && at_least((3, 1)),
+        // "remain-on-exit failed" needs tmux 3.3 (before it was only on or off)
+        keep_failed: s.keep_failed && !yours.remain && at_least((3, 3)),
+        start_synced: s.start_synced,
+    }
+}
+
+/// The settings of the user's tmux files and server that decide what Merendero would otherwise set. An option
+/// counts as the user's if a file sets it (even to tmux's own default) or the running tmux has it away from the default.
+fn broadcast_yours(texts: &[String], border_value: &str, remain_value: &str) -> BroadcastYours {
+    let mut yours = BroadcastYours { border: !border_value.is_empty() && border_value != "off", remain: !remain_value.is_empty() && remain_value != "off" };
+    for t in texts {
+        for s in tmux_seen_in(t, "") {
+            if s.kind == "set" {
+                match s.name.as_str() {
+                    "pane-border-status" | "pane-border-format" => yours.border = true,
+                    "remain-on-exit" => yours.remain = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    yours
+}
+
+/// The name shown on a pane border: "hostname (ip)", or just the address. Only letters, digits and . - _ : are
+/// kept, so nothing that arrives from a scan or a DNS answer can carry tmux formats or control characters.
+fn broadcast_label(hostname: Option<&str>, ip: &str) -> String {
+    let clean = |s: &str| -> String { s.chars().filter(|c| c.is_alphanumeric() || ".-_:".contains(*c)).take(60).collect() };
+    let ip_c = clean(ip);
+    match hostname.map(|h| clean(h.trim())) {
+        Some(h) if !h.is_empty() && h != ip_c => format!("{} ({})", h, ip_c),
+        _ => ip_c,
+    }
+}
+
+fn broadcast_config_texts() -> Vec<String> {
+    tmux_config_candidates()
+        .iter()
+        .filter_map(|(_, p)| {
+            let m = std::fs::metadata(p).ok()?;
+            if m.len() > TMUX_CONFIG_MAX_BYTES {
+                return None;
+            }
+            std::fs::read_to_string(p).ok()
+        })
+        .collect()
+}
+
+/// Builds the tmux session of a Broadcast. `run` runs tmux with the given arguments (the real tmux, or a test's).
+///
+/// A pane whose ssh fails at once could die before any option was set, and then the session would vanish. So
+/// `remain-on-exit failed` goes in the SAME tmux command as the first pane (tmux runs the whole sequence before it
+/// looks at any process that ended) and is taken back if it turns out that the user's own tmux already decides it.
+fn broadcast_build<F>(run: &F, session: &str, panes: &[(String, String)], settings: &host::BroadcastSettings, config_texts: &[String]) -> Result<BroadcastPlan, String>
+where
+    F: Fn(&[&str]) -> std::io::Result<std::process::Output>,
+{
+    let text = |o: &std::process::Output| String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let _ = run(&["kill-session", "-t", session]);
+    let version = run(&["-V"]).ok().and_then(|o| tmux_version_from(&text(&o))).and_then(|v| tmux_version_pair(&v));
+    let from_files = broadcast_yours(config_texts, "", "");
+    let early_keep = broadcast_plan(settings, version, &BroadcastYours { border: true, remain: from_files.remain }).keep_failed;
+    let mut args: Vec<&str> = vec!["new-session", "-d", "-s", session, "-x", "220", "-y", "50", "-P", "-F", "#{pane_id}", panes[0].1.as_str()];
+    if early_keep {
+        args.extend([";", "set-window-option", "-t", session, "remain-on-exit", "failed"]);
+    }
+    let first = run(&args).map_err(|e| format!("Failed to run tmux: {}", e))?;
+    if !first.status.success() {
+        return Err(format!("tmux could not create the session: {}", String::from_utf8_lossy(&first.stderr).trim()));
+    }
+    let first_id = text(&first);
+    // The user's own tmux (with its configuration loaded) decides first
+    let value = |name: &str| run(&["show-options", "-gwv", name]).ok().filter(|o| o.status.success()).map(|o| text(&o)).unwrap_or_default();
+    let (border_now, remain_now) = (value("pane-border-status"), value("remain-on-exit"));
+    let yours = broadcast_yours(config_texts, &border_now, &remain_now);
+    let mut plan = broadcast_plan(settings, version, &yours);
+    if early_keep && !plan.keep_failed {
+        // it turned out to be the user's own: take back what was set in advance
+        let _ = run(&["set-window-option", "-u", "-t", first_id.as_str(), "remain-on-exit"]);
+    }
+    if plan.label_panes {
+        let _ = run(&["set-window-option", "-t", first_id.as_str(), "pane-border-status", "top"]);
+        let _ = run(&["set-window-option", "-t", first_id.as_str(), "pane-border-format", " #{pane_index}: #{@merendero_host} "]);
+        let _ = run(&["set-option", "-p", "-t", first_id.as_str(), "@merendero_host", panes[0].0.as_str()]);
+    }
+    for (i, (label, cmd)) in panes.iter().enumerate().skip(1) {
+        let out = run(&["split-window", "-t", session, "-v", "-P", "-F", "#{pane_id}", cmd.as_str()]).map_err(|e| format!("Failed to run tmux: {}", e))?;
+        if !out.status.success() {
+            let _ = run(&["kill-session", "-t", session]);
+            return Err(format!("tmux has no room for more panes: only {} of {} hosts fit. Select fewer hosts", i, panes.len()));
+        }
+        if plan.label_panes {
+            let _ = run(&["set-option", "-p", "-t", text(&out).as_str(), "@merendero_host", label.as_str()]);
+        }
+        let _ = run(&["select-layout", "-t", session, "tiled"]);
+    }
+    if plan.start_synced {
+        let _ = run(&["set-window-option", "-t", session, "synchronize-panes", "on"]);
+    }
+    plan.keep_failed = plan.keep_failed && early_keep;
+    Ok(plan)
+}
+
+#[derive(serde::Serialize)]
+struct BroadcastInfo {
+    installed: bool,
+    version: Option<String>,
+    label_supported: bool,
+    keep_supported: bool,
+    /// where the user's own tmux already sets what Merendero would set (so it is left alone)
+    label_yours: Option<String>,
+    keep_yours: Option<String>,
+}
+
+/// What the Settings window needs to say about the Broadcast options: whether this tmux supports them and whether
+/// the user's own tmux already decides them. It only reads.
+#[tauri::command]
+async fn broadcast_info() -> BroadcastInfo {
+    let version = tmux_run(&["-V"], None).await.ok().and_then(|o| tmux_version_from(&o.stdout));
+    let vpair = version.as_deref().and_then(tmux_version_pair);
+    let mut label_yours = None;
+    let mut keep_yours = None;
+    for (_, p) in tmux_config_candidates() {
+        let text = match std::fs::metadata(&p).ok().filter(|m| m.len() <= TMUX_CONFIG_MAX_BYTES).and_then(|_| std::fs::read_to_string(&p).ok()) {
+            Some(t) => t,
+            None => continue,
+        };
+        for s in tmux_seen_in(&text, &tmux_short_path(&p.to_string_lossy())) {
+            if s.kind != "set" {
+                continue;
+            }
+            let line = format!("{} line {}: {}", s.label, s.line, s.text);
+            match s.name.as_str() {
+                "pane-border-status" | "pane-border-format" if label_yours.is_none() => label_yours = Some(line),
+                "remain-on-exit" if keep_yours.is_none() => keep_yours = Some(line),
+                _ => {}
+            }
+        }
+    }
+    if version.is_some() && tmux_run(&["list-sessions"], None).await.map_or(false, |o| o.ok) {
+        let live = |name: &'static str| async move { tmux_run(&["show-options", "-gwv", name], None).await.ok().filter(|o| o.ok).map(|o| o.stdout.trim().to_string()).unwrap_or_default() };
+        if label_yours.is_none() && live("pane-border-status").await.as_str() != "off" {
+            label_yours = Some(String::from("your running tmux"));
+        }
+        if keep_yours.is_none() && live("remain-on-exit").await.as_str() != "off" {
+            keep_yours = Some(String::from("your running tmux"));
+        }
+    }
+    BroadcastInfo {
+        installed: version.is_some(),
+        label_supported: vpair.map_or(true, |v| v >= (3, 1)),
+        keep_supported: vpair.map_or(true, |v| v >= (3, 3)),
+        version,
+        label_yours,
+        keep_yours,
+    }
+}
+// ===== broadcast settings: end =====
+
 #[tauri::command]
 fn launch_broadcast(hosts: Vec<host::Host>, network: host::Network, defaults: Defaults, session_name: String) -> Result<(), String> {
     if hosts.is_empty() { return Err(String::from("No hosts selected")); }
@@ -3696,22 +4524,9 @@ fn launch_broadcast(hosts: Vec<host::Host>, network: host::Network, defaults: De
         let target = sh_quote(&format!("{}@{}", host::resolve_username(h, &network, &defaults), h.ip));
         format!("{} -p {}{} -- {}", ssh, host::resolve_port(h, &network, &defaults), ident, target)
     };
-    let _ = run_tmux(&["kill-session", "-t", &session_name]);
-    let out = run_tmux(&["new-session", "-d", "-s", &session_name, "-x", "220", "-y", "50", &pane_cmd(&hosts[0])])
-        .map_err(|e| format!("Failed to run tmux: {}", e))?;
-    if !out.status.success() {
-        return Err(format!("tmux could not create the session: {}", String::from_utf8_lossy(&out.stderr).trim()));
-    }
-    for (i, h) in hosts.iter().enumerate().skip(1) {
-        let out = run_tmux(&["split-window", "-t", &session_name, "-v", &pane_cmd(h)])
-            .map_err(|e| format!("Failed to run tmux: {}", e))?;
-        if !out.status.success() {
-            let _ = run_tmux(&["kill-session", "-t", &session_name]);
-            return Err(format!("tmux has no room for more panes: only {} of {} hosts fit. Select fewer hosts", i, hosts.len()));
-        }
-        let _ = run_tmux(&["select-layout", "-t", &session_name, "tiled"]);
-    }
-    let _ = run_tmux(&["set-window-option", "-t", &session_name, "synchronize-panes", "on"]);
+    // Every pane carries the host it belongs to; the session is built in one place (see broadcast_build)
+    let panes: Vec<(String, String)> = hosts.iter().map(|h| (broadcast_label(h.hostname.as_deref(), &h.ip), pane_cmd(h))).collect();
+    broadcast_build(&run_tmux, &session_name, &panes, &defaults.broadcast, &broadcast_config_texts())?;
     let attach = format!("{} attach-session -t {}", sh_quote(&tmux), sh_quote(&session_name));
     // With several hosts the panes get small, so the terminal opens maximized when it can
     let launched = terminal_command(defaults.terminal.as_deref(), &attach, hosts.len() >= 4)
@@ -3775,6 +4590,9 @@ pub fn run() {
             tmux_reload,
             tmux_backups,
             tmux_read_backup,
+            tmux_options_state,
+            tmux_options_build,
+            broadcast_info,
             run_scp_broadcast,
             run_command,
             health_check,

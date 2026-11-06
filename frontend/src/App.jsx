@@ -1057,12 +1057,26 @@ function SettingsModal({ config, networks, onSave, onClose, showToast }) {
     ai_model: config?.ai?.model || "claude-haiku-4-5",
     check_interval: config?.monitoring?.check_interval_minutes?.toString() ?? "15",
     history_days: config?.monitoring?.history_days?.toString() ?? "90",
+    bc_label: config?.defaults?.broadcast?.label_panes ?? true,
+    bc_keep: config?.defaults?.broadcast?.keep_failed ?? true,
+    bc_sync: config?.defaults?.broadcast?.start_synced ?? true,
   });
 
   const [backupMsg, setBackupMsg] = useState(null);
   const [networksMsg, setNetworksMsg] = useState(null);
   const [showExportNetworks, setShowExportNetworks] = useState(false);
   const [includeKey, setIncludeKey] = useState(false);
+  // What this tmux supports and what the user's own tmux already sets, for the Broadcast section
+  const [bcInfo, setBcInfo] = useState(null);
+  useEffect(() => {
+    invoke("broadcast_info").then(setBcInfo).catch(() => {});
+  }, []);
+  const bcNote = (supported, yours, need) => {
+    if (!bcInfo) return null;
+    if (!supported) return `Needs tmux ${need} or newer (yours is ${bcInfo.version}), so it is not applied.`;
+    if (yours) return `Your own tmux already sets this (${yours}), so Merendero leaves it alone.`;
+    return null;
+  };
 
   function handleChange(e) { setForm({ ...form, [e.target.name]: e.target.value }); }
 
@@ -1140,6 +1154,7 @@ function SettingsModal({ config, networks, onSave, onClose, showToast }) {
         dns_server: form.dns_server || null,
         terminal: form.terminal || null,
         identity_file: form.identity_file || null,
+        broadcast: { label_panes: !!form.bc_label, keep_failed: !!form.bc_keep, start_synced: !!form.bc_sync },
       },
       ai: (form.ai_api_key || form.ai_provider === "ollama" || form.ai_provider === "custom") ? {
         provider: form.ai_provider || null,
@@ -1166,6 +1181,16 @@ function SettingsModal({ config, networks, onSave, onClose, showToast }) {
         <div className="form-group"><label>DNS server (for reverse lookup)</label><input name="dns_server" value={form.dns_server} onChange={handleChange} placeholder="10.0.0.1" /></div>
         <div className="form-group"><label>Terminal emulator</label><TerminalSelect value={form.terminal} onChange={handleChange} /></div>
         <div className="form-group"><label>Default identity file (SSH key)</label><KeyFileField name="identity_file" value={form.identity_file} onChange={handleChange} showToast={showToast} /></div>
+
+        <div className="settings-section">Broadcast (tmux)</div>
+        <label className="backup-key-option"><input type="checkbox" checked={form.bc_label} onChange={e => setForm({ ...form, bc_label: e.target.checked })} /> Label each pane with its host</label>
+        <div className="settings-hint">Shows the host name and address on the border of each pane, so you know which host is which.</div>
+        {bcNote(bcInfo && bcInfo.label_supported, bcInfo && bcInfo.label_yours, "3.1") && <div className="key-hint">{bcNote(bcInfo.label_supported, bcInfo.label_yours, "3.1")}</div>}
+        <label className="backup-key-option"><input type="checkbox" checked={form.bc_keep} onChange={e => setForm({ ...form, bc_keep: e.target.checked })} /> Keep a pane open when its ssh fails</label>
+        <div className="settings-hint">The pane stays, with what ssh printed and its exit status, instead of disappearing and rearranging the others. Close it with your tmux key for kill-pane.</div>
+        {bcNote(bcInfo && bcInfo.keep_supported, bcInfo && bcInfo.keep_yours, "3.3") && <div className="key-hint">{bcNote(bcInfo.keep_supported, bcInfo.keep_yours, "3.3")}</div>}
+        <label className="backup-key-option"><input type="checkbox" checked={form.bc_sync} onChange={e => setForm({ ...form, bc_sync: e.target.checked })} /> Start with the panes synchronized</label>
+        <div className="settings-hint">What you type goes to every pane. You can switch it off and on inside tmux whenever you want.</div>
 
         <div className="settings-section">Monitoring</div>
         <div className="form-group"><label>Check hosts automatically every (minutes, 0 = off)</label><input name="check_interval" value={form.check_interval} onChange={handleChange} placeholder="15" type="number" min="0" max="1440" /></div>
@@ -1846,6 +1871,18 @@ function TmuxModal({ onClose, showToast }) {
   const [configAsk, setConfigAsk] = useState(null);
   const [configOk, setConfigOk] = useState(false);
 
+  // Options tab: what the user chose, and the text the file would have with it (nothing is written until Apply)
+  const [optView, setOptView] = useState(null);
+  const [optSel, setOptSel] = useState({});
+  const [optBase, setOptBase] = useState("");
+  const [optBuild, setOptBuild] = useState(null);
+  const [optError, setOptError] = useState("");
+  const [optBusy, setOptBusy] = useState(false);
+  const [optConfirm, setOptConfirm] = useState("");
+  const [optReload, setOptReload] = useState(null);
+  const [optShowYours, setOptShowYours] = useState(false);
+  const buildSeq = useRef(0);
+
   const [target, setTarget] = useState(null);
   const [file, setFile] = useState(null);
   const [text, setText] = useState("");
@@ -1861,6 +1898,8 @@ function TmuxModal({ onClose, showToast }) {
   const crlf = !!file && file.text.includes(TMUX_CRLF);
   const toDisk = (s) => (crlf ? s.split("\n").join(TMUX_CRLF) : s);
   const dirty = !!file && toDisk(text) !== file.text;
+  const selectionOf = (sel) => Object.keys(sel).filter(id => sel[id].on).map(id => ({ id, value: sel[id].value || null }));
+  const optDirty = !!optView && JSON.stringify(selectionOf(optSel)) !== optBase;
 
   useEffect(() => {
     invoke("tmux_info").then(i => {
@@ -1906,6 +1945,70 @@ function TmuxModal({ onClose, showToast }) {
     setSource("config");
   }
 
+  async function loadOptions() {
+    setOptBusy(true);
+    setOptError("");
+    setOptConfirm("");
+    setOptReload(null);
+    try {
+      const v = await invoke("tmux_options_state");
+      const sel = {};
+      v.options.forEach(o => { sel[o.id] = { on: o.enabled, value: o.values.length ? o.value : "" }; });
+      setOptView(v);
+      setOptSel(sel);
+      setOptBase(JSON.stringify(selectionOf(sel)));
+      setOptBuild(await invoke("tmux_options_build", { selection: selectionOf(sel) }));
+    } catch (e) {
+      setOptError(String(e));
+    } finally {
+      setOptBusy(false);
+    }
+  }
+
+  // Each change asks the backend for the text the file would have: the block that will be written is always on screen.
+  async function changeOption(id, patch) {
+    const next = { ...optSel, [id]: { ...optSel[id], ...patch } };
+    setOptSel(next);
+    setOptConfirm("");
+    const seq = ++buildSeq.current;
+    try {
+      const b = await invoke("tmux_options_build", { selection: selectionOf(next) });
+      if (seq === buildSeq.current) { setOptBuild(b); setOptError(""); }
+    } catch (e) {
+      if (seq === buildSeq.current) setOptError(String(e));
+    }
+  }
+
+  function removeBlock() {
+    const next = {};
+    Object.keys(optSel).forEach(id => { next[id] = { ...optSel[id], on: false }; });
+    setOptSel(next);
+    const seq = ++buildSeq.current;
+    invoke("tmux_options_build", { selection: [] })
+      .then(b => { if (seq === buildSeq.current) { setOptBuild(b); setOptError(""); } })
+      .catch(e => setOptError(String(e)));
+  }
+
+  async function applyOptions(thenReload) {
+    if (!optBuild) return;
+    if (optBuild.block_modified && optConfirm !== "modified") { setOptConfirm("modified"); return; }
+    setOptBusy(true);
+    setOptError("");
+    setOptConfirm("");
+    try {
+      const res = await invoke("tmux_write_config", { target: optView.target, text: optBuild.text, original: optBuild.original, force: false });
+      showToast(res.changed ? (res.backup ? `Options applied. Backup: ${tmuxBackupLabel(res.backup)}` : "Options applied") : "Nothing to change in the file");
+      setFile(null);
+      await loadOptions();
+      if (thenReload) setOptReload(await invoke("tmux_reload", { target: optView.target }));
+    } catch (e) {
+      const msg = String(e);
+      setOptError(msg.startsWith("changed on disk") ? "The file changed on disk since you opened this tab. Nothing was written: press Reset to start from the new file." : msg);
+    } finally {
+      setOptBusy(false);
+    }
+  }
+
   async function loadFile(t) {
     setBusy("load");
     setFileError("");
@@ -1928,6 +2031,10 @@ function TmuxModal({ onClose, showToast }) {
   useEffect(() => {
     if (tab === "file" && target && info && info.installed && (!file || file.file.id !== target)) loadFile(target);
   }, [tab, target, info]);
+
+  useEffect(() => {
+    if (tab === "options" && !optView && info && info.installed) loadOptions();
+  }, [tab, info]);
 
   function chooseTarget(t) {
     if (t === target) return;
@@ -1995,7 +2102,7 @@ function TmuxModal({ onClose, showToast }) {
   }
 
   function closeModal() {
-    if (dirty) { setConfirm("close"); return; }
+    if (dirty || optDirty) { setConfirm("close"); return; }
     onClose();
   }
 
@@ -2011,6 +2118,37 @@ function TmuxModal({ onClose, showToast }) {
   const longestKey = keys ? Math.max(6, ...keys.keys.concat(keys.removed).map(k => k.key.length)) : 6;
   const keyCol = Math.min(260, Math.max(100, longestKey * 8 + 12));
 
+  // What can be added is shown first; what is already the user's (or needs a newer tmux) is kept apart.
+  const optFree = optView ? optView.options.filter(o => o.available && !o.all_yours && !o.blocked) : [];
+  const optHeld = optView ? optView.options.filter(o => !o.available || o.all_yours || o.blocked) : [];
+  const optYoursCount = optView ? optView.options.filter(o => o.available && o.all_yours).length : 0;
+  const optBlockedCount = optView ? optView.options.filter(o => o.available && o.blocked).length : 0;
+  const optNewerCount = optView ? optView.options.filter(o => !o.available).length : 0;
+  const optGroups = Array.from(new Set(optFree.map(o => o.group)));
+  const renderOpt = (o) => {
+    const sel = optSel[o.id] || { on: false, value: "" };
+    const locked = !o.available || o.all_yours || o.blocked || optView.read_only || optView.block.broken;
+    return (
+      <div key={o.id} className={`tmux-opt ${o.all_yours ? "yours" : ""} ${o.blocked ? "blocked" : ""} ${!o.available ? "off" : ""}`}>
+        <label className="tmux-opt-head">
+          <input type="checkbox" checked={sel.on || o.all_yours} disabled={locked} title={o.all_yours ? "Already set in your tmux.conf" : o.blocked ? "Not offered: its key is already used in your tmux.conf" : ""} onChange={e => changeOption(o.id, { on: e.target.checked })} />
+          <span className="tmux-opt-title">{o.title}</span>
+          {o.values.length > 0 && !o.all_yours && !o.blocked && (
+            <select className="tmux-opt-select" value={sel.value} disabled={locked} onChange={e => changeOption(o.id, { value: e.target.value })}>
+              {o.values.map(([v, label]) => <option key={v} value={v} disabled={(o.taken || []).includes(v)}>{label}{(o.taken || []).includes(v) ? " (in use)" : ""}</option>)}
+            </select>
+          )}
+        </label>
+        <div className="tmux-opt-desc">{o.description}</div>
+        {o.available && !o.all_yours && !o.blocked && o.key_note && <div className="tmux-opt-note yours">{o.key_note}</div>}
+        {!o.available && <div className="tmux-opt-note">Needs tmux {o.needs} or newer</div>}
+        {o.available && o.all_yours && <div className="tmux-opt-note yours">Already set by you, so it is left alone: {o.yours.join(" · ")}</div>}
+        {o.available && o.blocked && <div className="tmux-opt-note blocked">Not offered: its key is already used by you for something else, so it would do nothing: {o.conflicts.join(" · ")}</div>}
+        {o.available && !o.all_yours && !o.blocked && o.yours.length > 0 && <div className="tmux-opt-note yours">Part of it is already yours and is not written: {o.yours.join(" · ")}</div>}
+      </div>
+    );
+  };
+
   const files = info ? info.files : [];
   const bothExist = files.length === 2 && files.every(f => f.exists);
 
@@ -2025,6 +2163,7 @@ function TmuxModal({ onClose, showToast }) {
           <>
             <div className="scp-direction tmux-tabs">
               <button className={`scp-dir-btn ${tab === "keys" ? "active" : ""}`} onClick={() => setTab("keys")}>Keys</button>
+              <button className={`scp-dir-btn ${tab === "options" ? "active" : ""}`} onClick={() => setTab("options")}>Options{optDirty ? " •" : ""}</button>
               <button className={`scp-dir-btn ${tab === "file" ? "active" : ""}`} onClick={() => setTab("file")}>Config file{dirty ? " •" : ""}</button>
             </div>
 
@@ -2099,6 +2238,64 @@ function TmuxModal({ onClose, showToast }) {
                       {shown.length === 0 && removedShown.length === 0 && <div className="tmux-note-line">No key matches.</div>}
                     </div>
                   </>
+                )}
+              </div>
+            )}
+
+            {tab === "options" && (
+              <div className="tmux-body">
+                <div className="scp-hint tmux-promise">Merendero writes your choices in a block at the TOP of your tmux.conf. tmux applies a file in order, so everything of yours that comes after the block always wins, and what you already set yourself is never repeated.</div>
+                {optView && (
+                  <div className="tmux-fileinfo">
+                    {optView.path}{optView.other_path ? ` · tmux also reads ${optView.other_path} afterwards: what that file sets wins too` : ""}
+                  </div>
+                )}
+                {optView && optView.read_only && <div className="scp-result error">{optView.read_only_reason}</div>}
+                {optView && optView.block.broken && <div className="scp-result error">The Merendero block of your file is incomplete or repeated, so nothing is touched. Fix or remove it in Config file.</div>}
+                {optView && !optView.block.broken && optView.block.present && optView.block.modified && <div className="tmux-note-line warn">You edited the Merendero block by hand. Applying rewrites it from the choices below (the previous text goes to the backup).</div>}
+                {optView && !optView.block.broken && optView.block.present && !optView.block.at_top && <div className="tmux-note-line warn">The block is not at the top: {optView.block.lines_before} of your own lines come before it and it overrides them. Applying moves it to the top.</div>}
+                {optError && <div className="scp-result error">{optError}</div>}
+                {optView && (
+                  <div className="tmux-opt-summary">
+                    <b>{optFree.length}</b> of {optView.options.length} options can be added to your tmux.conf
+                    {optYoursCount > 0 && ` · ${optYoursCount} already set by you (left alone)`}
+                    {optBlockedCount > 0 && ` · ${optBlockedCount} blocked by keys you already use`}
+                    {optNewerCount > 0 && ` · ${optNewerCount} need a newer tmux`}
+                  </div>
+                )}
+                {optView && optFree.length === 0 && <div className="tmux-note-line">Everything this tab offers is already in your tmux.conf, needs a key you already use for something else, or needs a newer tmux, so there is nothing to add here. Config file lets you edit the file yourself.</div>}
+                {optView && optFree.length > 0 && (
+                  <div className="tmux-options">
+                    {optGroups.map(g => (
+                      <div key={g} className="tmux-group">
+                        <div className="tmux-group-title">{g}</div>
+                        {optFree.filter(o => o.group === g).map(renderOpt)}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {optView && optHeld.length > 0 && (
+                  <div className={`tmux-held ${optFree.length === 0 ? "solo" : ""}`}>
+                    {optFree.length > 0 && <button className="tmux-link" onClick={() => setOptShowYours(v => !v)}>{optShowYours ? "Hide" : "Show"} the {optHeld.length} options that are already yours, use your keys or need a newer tmux</button>}
+                    {(optShowYours || optFree.length === 0) && <div className="tmux-options tmux-options-held">{optHeld.map(renderOpt)}</div>}
+                  </div>
+                )}
+                {optBuild && (
+                  <div className="tmux-preview">
+                    <div className="tmux-group-title">{optBuild.block ? "Block that will be written at the top" : optView && optView.block.present ? "The block will be removed" : "Nothing to write"}</div>
+                    {optBuild.block && <pre>{optBuild.block}</pre>}
+                  </div>
+                )}
+                {optReload && (
+                  <div className={`scp-result ${optReload.applied ? "success" : "error"}`}>
+                    {optReload.applied ? "✓ tmux applied the file." : optReload.running ? "tmux reported errors (the lines before the error were applied):" : ""} {optReload.output}
+                  </div>
+                )}
+                {optConfirm === "modified" && (
+                  <div className="scp-result error tmux-confirm">The block has text you edited by hand, and applying will replace it (the old text goes to the backup).
+                    <button className="btn-primary" onClick={() => applyOptions(false)}>Yes, replace it</button>
+                    <button className="btn-cancel" onClick={() => setOptConfirm("")}>Cancel</button>
+                  </div>
                 )}
               </div>
             )}
@@ -2197,6 +2394,14 @@ function TmuxModal({ onClose, showToast }) {
         )}
 
         <div className="modal-actions">
+          {tab === "options" && optView && (
+            <>
+              <button className="btn-cancel" disabled={optBusy || !optView.block.present || optView.block.broken || optView.read_only} onClick={removeBlock}>Remove block</button>
+              <button className="btn-cancel" disabled={optBusy || !optDirty} onClick={loadOptions}>Reset</button>
+              <button className="btn-primary" disabled={optBusy || !optDirty || !optBuild || optBuild.unchanged || optView.read_only || optView.block.broken || dirty} title={dirty ? "Save or discard your edits in Config file first" : ""} onClick={() => applyOptions(false)}>Apply</button>
+              <button className="btn-primary" disabled={optBusy || !optDirty || !optBuild || optBuild.unchanged || optView.read_only || optView.block.broken || dirty} title={dirty ? "Save or discard your edits in Config file first" : ""} onClick={() => applyOptions(true)}>Apply & reload</button>
+            </>
+          )}
           {tab === "file" && file && (
             <>
               <button className="btn-cancel" disabled={!!busy} onClick={() => setShowBackups(s => !s)}>Backups ({backups.length})</button>
