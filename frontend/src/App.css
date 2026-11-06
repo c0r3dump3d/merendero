@@ -1342,7 +1342,7 @@ html, body, #root {
 
 .host-table-header,
 .host-row {
-  grid-template-columns: 32px 24px 110px 1fr 90px 155px 175px;
+  grid-template-columns: 32px 24px 124px 1fr 90px 155px 175px;
 }
 
 .btn-ai-analyze {
