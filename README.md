@@ -47,9 +47,10 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 
 - **SSH** — one click, with a per-host, per-network or global key (picked with a Browse button) and an optional command to run on connect (for example `sudo su -`)
 - **Your terminal** — Merendero detects the terminals installed on your system and lets you choose one in Settings, or leave it on Automatic. If you have several and haven't chosen, it asks once
-- **Broadcast SSH** — open synchronized tmux panes on the selected hosts, after a pre-flight check that skips hosts that don't answer. tmux broadcast is fire-and-forget: use Run cmd when you need to know what happened on each host. It opens in the terminal you chose, uses each host's SSH key, and starts maximized from 4 hosts up in the terminals that can do it
+- **Broadcast SSH** — open synchronized tmux panes on the selected hosts, after a pre-flight check that skips hosts that don't answer. tmux broadcast is fire-and-forget: use Run cmd when you need to know what happened on each host. It opens in the terminal you chose, uses each host's SSH key, and starts maximized from 4 hosts up in the terminals that can do it. Each pane is labelled with its host, and a pane whose ssh fails stays open with its error; you can change both in Settings, and neither overrides what your own tmux already sets
 - **Run cmd** — run one command on many hosts in parallel, with a result for each host and an execution receipt
-- **SCP** — upload or download files for one host, or send a file to many at once. There is a local file picker, and a remote file browser for single-host transfers
+- **SCP** — upload or download files for one host, or send a file to many hosts or fetch one from many at once (each host gets its own subfolder). There is a local file picker, and a remote file browser for single-host transfers, where you also choose the destination folder and name. A progress bar shows each transfer, and you can cancel it, one host at a time or the whole batch
+- **tmux** — the `tmux` button in the header opens a window with three tabs. **Keys** shows the key bindings, with the ones you added, replaced or removed marked against tmux's defaults. **Config file** edits your `tmux.conf`, with a syntax check before saving, a backup before every change and a reload when you ask. **Options** is a guided list of useful options (mouse, history, escape time, vi keys, clipboard, a key to toggle synchronize-panes…), written as one marked block at the top of your file so the lines you wrote always win; what you already set is detected and left alone
 
 **Profiles**
 
@@ -83,7 +84,7 @@ The hosts in these screenshots are made up, except in the two Run cmd ones, whic
 ### Prerequisites
 
 - Linux. Arch Linux is the only distribution it has been tested on
-- `ssh` and `scp` in your PATH (Merendero also looks in `~/.local/bin`, `~/.cargo/bin` and the Nix, Guix and snap directories), and `tmux` for broadcast. Profiles use `StrictHostKeyChecking=accept-new`, which needs OpenSSH 7.6 or later
+- `ssh` and `scp` in your PATH (Merendero also looks in `~/.local/bin`, `~/.cargo/bin` and the Nix, Guix and snap directories), and `tmux` for broadcast and for the tmux window (tested with 3.4 and 3.8; some options need 3.1 to 3.3, and Merendero tells you which). Profiles use `StrictHostKeyChecking=accept-new`, which needs OpenSSH 7.6 or later
 - A terminal emulator. Merendero knows how to start `terminator`, `alacritty`, `kitty`, `foot`, `gnome-terminal`, `mate-terminal`, `xfce4-terminal`, `tilix`, `konsole`, `qterminal`, `xterm`, `lxterminal`, `urxvt` and `sakura`, finds which of them are installed and lets you choose in Settings. On Automatic it prefers `terminator`, then your desktop's own. Broadcast opens maximized (from 4 hosts) in `terminator`, `alacritty`, `kitty`, `gnome-terminal`, `mate-terminal`, `xfce4-terminal`, `tilix` and `xterm`; in the others it uses the terminal's normal size. Any other terminal, by name or full path, is started as `<terminal> -e "<command>"`; one that expects the command as separate arguments may not work
 
 ### From release
@@ -168,13 +169,14 @@ If the SSH button reports that it could not launch the terminal, choose an insta
 
 Merendero keeps its data in `~/.config/merendero/`:
 
-- `config.toml` — global defaults (username, port, DNS server, terminal, SSH key), the monitoring settings and the optional AI settings
+- `config.toml` — global defaults (username, port, DNS server, terminal, SSH key), the Broadcast settings, the monitoring settings and the optional AI settings
 - `networks.toml` — your networks and hosts, with tags, notes and the latest health result of each host
 - `history.toml` — when you last connected to each host
 - `audit.jsonl` — what you ran from Merendero, one JSON object per line. Commands are stored as typed, so don't put passwords in them
 - `health_history.jsonl` — the health check history, kept for 90 days by default
 - `profiles.toml` — the profiles you created or cloned (the built-in ones are part of Merendero and aren't stored here)
 - `profile_history.jsonl` — the results of profile runs, kept for 90 days by default. It holds what the commands printed on your hosts, so it is written readable only by you
+- `tmux-backups/` — the copies of your `tmux.conf` that Merendero keeps before each change made from its tmux window (the last 20)
 
 You normally don't edit these by hand: the defaults, the monitoring settings and the AI settings live in the Settings window (⚙), and networks and hosts are managed from the main window.
 
@@ -189,6 +191,11 @@ port = 22
 dns_server = "10.0.0.1"               # optional, for reverse lookups; the system's DNS if unset
 terminal = "auto"                     # "auto", the name of a terminal such as alacritty or kitty, or a full path
 identity_file = "~/.ssh/id_ed25519"   # optional default SSH key
+
+[defaults.broadcast]                  # optional; all three are on by default
+label_panes = true                    # the host's name on each pane's border
+keep_failed = true                    # a pane whose ssh fails stays open, with the error (tmux 3.3 or later)
+start_synced = true                   # the panes start synchronized
 
 [monitoring]                          # optional
 check_interval_minutes = 15           # automatic availability check; 0 turns it off

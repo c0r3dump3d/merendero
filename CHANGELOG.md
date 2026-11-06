@@ -4,6 +4,32 @@ All notable changes to Merendero are documented here.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-06
+
+### Added
+- **tmux window** (the `tmux` button in the header), with three tabs:
+  - **Keys** shows the key bindings, with the ones you added, replaced or removed marked against tmux's defaults. It can also show them as your own `tmux.conf` defines them; it asks first, because that loads the file and runs what it runs at startup (plugins, for example)
+  - **Config file** edits your `tmux.conf` with a syntax check before saving (it executes nothing), a backup before every change (the last 20 are kept in `tmux-backups/`), a refusal when the file changed on disk in the meantime, and a reload only when you ask
+  - **Options** offers 14 guided options (mouse, history, escape time, window numbering, vi keys, clipboard, a key to toggle synchronize-panes, a key to reload the file…) written as one marked block at the top of your file, so the lines you wrote always win. What you already set is detected and shown with a tick, and a key you use for something else is never taken
+- **Broadcast settings** in Settings: label each pane with its host, keep a pane open when its ssh fails (tmux 3.3 or later) and start synchronized. All are on by default, and none is applied when your own tmux already sets that option
+- SCP: choose the destination folder and name for a single host. A progress bar with an estimate of the time left and a Cancel button; the window no longer freezes during a transfer
+- SCP Broadcast: progress for each host, with a ✕ to cancel one host or Cancel all. Downloads from many hosts go into a folder you choose, one subfolder per host
+
+### Changed
+- The host toolbar is always visible: neutral and disabled while nothing is selected, with a fixed height, so the list doesn't jump when you select a host
+- The IP column of the host table is wider, so a three-digit address no longer touches the host name
+- The connection history keeps the most recent connection of each host (up to 1000 hosts) instead of the last 50 entries, which made the Last connection column lose dates with many hosts. An old `history.toml` loads as before and is compacted the next time it is saved
+- The DNS library, hickory-resolver, is updated from 0.24 to 0.26
+
+### Fixed
+- **Last connection** was not updated after a Broadcast. Every host of a Broadcast now gets its entry, with the user and port its pane really uses, and the column updates as soon as the Broadcast is launched
+- A download from several hosts with SCP Broadcast wrote every file to the same name, so only the last host's survived
+- A Broadcast whose first pane (or all of them) failed at once made the whole session vanish with a misleading "no room for more panes" error. The panes that failed now stay, with the error
+
+### Security
+- hickory-resolver 0.26 fixes RUSTSEC-2026-0119, a denial of service in hickory-proto
+- The ssh calls that still had no output limit (listing a remote folder, the health check and the size of a remote file) now cut it at 4 MiB, 1 MiB and 4 KiB, so a host can't exhaust this machine's memory with a huge answer. The remote folder listing also separates the host from the options with `--`
+
 ## [0.1.8] - 2026-11-01
 
 ### Added
