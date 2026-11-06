@@ -1027,6 +1027,20 @@ html, body, #root {
 .scp-progress-text { font-size: 0.72rem; color: var(--text2); margin-top: 4px; font-variant-numeric: tabular-nums; }
 .scp-indeterminate { width: 30%; animation: scp-slide 1.2s ease-in-out infinite; }
 @keyframes scp-slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+.scp-batch-counts { margin: 0; }
+.scp-hostrows { display: flex; flex-direction: column; gap: 6px; max-height: 280px; overflow-y: auto; padding-right: 2px; }
+.scp-hostrow { display: grid; grid-template-columns: 170px 1fr 190px 22px; gap: 10px; align-items: center; min-height: 22px; font-size: 0.75rem; }
+.scp-hostrow-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.scp-hostrow-text { color: var(--text2); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.scp-hostrow.waiting .scp-hostrow-text, .scp-hostrow.cancelled .scp-hostrow-text { color: var(--text3); }
+.scp-hostrow.done .scp-hostrow-text { color: var(--green); }
+.scp-hostrow.failed .scp-hostrow-text { color: var(--red); }
+.hb-progress-bar.scp-fill-done { background: var(--green); }
+.hb-progress-bar.scp-fill-failed { background: var(--red); }
+.scp-hostrow-stop { background: transparent; border: 1px solid var(--border); color: var(--text2); border-radius: 4px; cursor: pointer; font-size: 0.7rem; padding: 0; height: 20px; }
+.scp-hostrow-stop:hover { border-color: var(--red); color: var(--red); }
+.cmd-status-dot.cancelled { background: var(--text3); }
+.scp-results .cmd-result { flex-shrink: 0; }
 
 .cmd-output {
   max-height: 120px;

@@ -821,6 +821,30 @@ fn cancel_scp_job(job: &str) -> bool {
     }
 }
 
+/// Registers a transfer before it starts, so it can be cancelled while it still waits for its turn, and
+/// returns its cancel handle. Registering the same job twice gives the same handle.
+fn register_scp_job(job: &str) -> std::sync::Arc<tokio::sync::Notify> {
+    scp_jobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(job.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
+        .clone()
+}
+
+/// Cancels every transfer whose job id starts with `prefix` (a whole batch). Returns how many there were.
+fn cancel_scp_prefix(prefix: &str) -> usize {
+    let jobs = scp_jobs().lock().unwrap_or_else(|e| e.into_inner());
+    let mut n = 0;
+    for (job, cancel) in jobs.iter() {
+        if job.starts_with(prefix) {
+            cancel.notify_one();
+            n += 1;
+        }
+    }
+    n
+}
+
 struct ScpJobGuard(String);
 
 impl Drop for ScpJobGuard {
@@ -1010,10 +1034,15 @@ where
 {
     use std::process::Stdio;
     let upload = direction == "upload";
-    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
-    scp_jobs().lock().unwrap_or_else(|e| e.into_inner()).insert(job.clone(), cancel.clone());
+    let cancel = register_scp_job(&job);
     let _guard = ScpJobGuard(job.clone());
     let emit = std::sync::Arc::new(emit);
+
+    // Cancelled before it started (a queued transfer of a batch): touch no host at all.
+    if tokio::time::timeout(std::time::Duration::ZERO, cancel.notified()).await.is_ok() {
+        emit(ScpProgress { job: job.clone(), done: 0, total: 0, speed: 0.0, phase: "cancelled" });
+        return Err(String::from("Transfer cancelled before it started."));
+    }
 
     // Where the data goes (download) or comes from (upload), and the total if it can be known.
     let local = std::path::Path::new(&local_path);
@@ -1123,23 +1152,29 @@ fn host_folder_name(hostname: Option<&str>, ip: &str) -> String {
 }
 
 /// Upload: the same local file to every host. Download: the same remote path from every host, each one
-/// into its OWN folder inside `local_path` (they used to overwrite each other in one local path).
-async fn run_scp_broadcast_inner(
+/// into its OWN folder inside `local_path`. Every host is one transfer of run_scp_core with the job id
+/// "<batch>-<position of the host>", so it reports its own progress and can be cancelled alone or with the
+/// whole batch (cancel_scp_prefix), also while it is still queued.
+async fn run_scp_broadcast_inner<F>(
     hosts: Vec<host::Host>,
     network: host::Network,
     defaults: host::Defaults,
     local_path: String,
     remote_path: String,
     direction: String,
-) -> Vec<serde_json::Value> {
-    use tokio::process::Command;
-
+    batch: String,
+    emit: F,
+) -> Vec<serde_json::Value>
+where
+    F: Fn(ScpProgress) + Clone + Send + Sync + 'static,
+{
     let upload = direction == "upload";
     let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(SCP_BROADCAST_PARALLEL));
     let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut tasks = vec![];
+    let mut registered = vec![];
 
-    for host in hosts {
+    for (index, host) in hosts.into_iter().enumerate() {
         let username = host::resolve_username(&host, &network, &defaults);
         let port = host::resolve_port(&host, &network, &defaults);
         let identity_file = host.identity_file.clone()
@@ -1164,51 +1199,42 @@ async fn run_scp_broadcast_inner(
             }
             Some(std::path::Path::new(&local_path).join(folder))
         };
+
+        // Registered now, not when its turn comes: a cancel reaches the hosts that are still queued.
+        let job = format!("{}-{}", batch, index);
+        register_scp_job(&job);
+        registered.push(ScpJobGuard(job.clone()));
+
         let limit = limit.clone();
+        let emit = emit.clone();
         let (ip_t, hostname_t) = (ip.clone(), hostname.clone());
 
         let task = tokio::spawn(async move {
             let _turn = limit.acquire_owned().await.ok();
-            let fail = |msg: String| serde_json::json!({
-                "ip": ip, "hostname": hostname, "success": false, "message": msg, "saved_to": serde_json::Value::Null,
+            let result = |success: bool, cancelled: bool, message: String, saved_to: Option<String>| serde_json::json!({
+                "ip": ip, "hostname": hostname, "success": success, "cancelled": cancelled, "message": message, "saved_to": saved_to,
             });
             let target = match &host_dir {
                 Some(d) => {
                     if let Err(e) = std::fs::create_dir_all(d) {
-                        return fail(format!("Cannot create {}: {}", d.display(), e));
+                        return result(false, false, format!("Cannot create {}: {}", d.display(), e), None);
                     }
                     d.to_string_lossy().to_string()
                 }
                 None => local,
             };
-            let args = scp_args(&ip, &username, port, &identity_file, &target, &remote, &dir);
-            let output = Command::new(program("scp"))
-                .env("PATH", user_path())
-                .args(&args)
-                .output()
-                .await;
-            match output {
-                Ok(out) if out.status.success() => serde_json::json!({
-                    "ip": ip,
-                    "hostname": hostname,
-                    "success": true,
-                    "message": match &host_dir {
-                        Some(d) => format!("Saved in {}", d.display()),
-                        None => String::from_utf8_lossy(&out.stdout).to_string(),
-                    },
-                    "saved_to": host_dir.as_ref().map(|d| d.to_string_lossy().to_string()),
-                }),
-                Ok(out) => {
+            let outcome = run_scp_core(ip.clone(), username, port, identity_file, target, remote, dir, job, emit).await;
+            match outcome {
+                Ok(stdout) => match &host_dir {
+                    Some(d) => result(true, false, format!("Saved in {}", d.display()), Some(d.to_string_lossy().to_string())),
+                    None => result(true, false, stdout, None),
+                },
+                Err(message) => {
                     if let Some(d) = &host_dir {
                         let _ = std::fs::remove_dir(d); // only removes it if it is empty
                     }
-                    fail(String::from_utf8_lossy(&out.stderr).to_string())
-                }
-                Err(e) => {
-                    if let Some(d) = &host_dir {
-                        let _ = std::fs::remove_dir(d);
-                    }
-                    fail(format!("Failed: {}", e))
+                    let cancelled = message.starts_with("Transfer cancelled");
+                    result(false, cancelled, message, None)
                 }
             }
         });
@@ -1220,10 +1246,11 @@ async fn run_scp_broadcast_inner(
         match task.await {
             Ok(r) => results.push(r),
             Err(e) => results.push(serde_json::json!({
-                "ip": ip, "hostname": hostname, "success": false, "message": format!("Internal error: {}", e), "saved_to": serde_json::Value::Null,
+                "ip": ip, "hostname": hostname, "success": false, "cancelled": false, "message": format!("Internal error: {}", e), "saved_to": serde_json::Value::Null,
             })),
         }
     }
+    drop(registered);
     results
 }
 // ===== scp broadcast: end =====
@@ -2072,12 +2099,14 @@ async fn run_command(
 
 #[tauri::command]
 async fn run_scp_broadcast(
+    window: tauri::Window,
     hosts: Vec<host::Host>,
     network: host::Network,
     defaults: host::Defaults,
     local_path: String,
     remote_path: String,
     direction: String,
+    batch: String,
 ) -> Vec<serde_json::Value> {
     let net_name = network.name.clone();
     let transfer = serde_json::json!({ "direction": direction, "local": local_path, "remote": remote_path });
@@ -2086,13 +2115,23 @@ async fn run_scp_broadcast(
         .map(|h| serde_json::json!({ "ip": h.ip, "hostname": h.hostname }))
         .collect();
     audit_write("scp_broadcast", &net_name, targets, serde_json::json!({ "phase": "start", "transfer": transfer }));
-    let results = run_scp_broadcast_inner(hosts, network, defaults, local_path, remote_path, direction).await;
+    let w = window.clone();
+    let results = run_scp_broadcast_inner(hosts, network, defaults, local_path, remote_path, direction, batch, move |p| {
+        let _ = w.emit("scp-progress", p);
+    }).await;
     let outcome: Vec<serde_json::Value> = results
         .iter()
-        .map(|r| serde_json::json!({ "ip": r["ip"], "success": r["success"], "saved_to": r["saved_to"] }))
+        .map(|r| serde_json::json!({ "ip": r["ip"], "success": r["success"], "cancelled": r["cancelled"], "saved_to": r["saved_to"] }))
         .collect();
     audit_write("scp_broadcast", &net_name, outcome, serde_json::json!({ "phase": "end", "transfer": transfer }));
     results
+}
+
+/// Stops every transfer of a batch started by run_scp_broadcast, also the ones still waiting their turn.
+/// Returns how many it reached.
+#[tauri::command]
+fn cancel_scp_batch(batch: String) -> usize {
+    cancel_scp_prefix(&format!("{}-", batch))
 }
 
 #[tauri::command]
@@ -2957,6 +2996,7 @@ pub fn run() {
             list_remote_dir,
             run_scp,
             cancel_scp,
+            cancel_scp_batch,
             run_scp_broadcast,
             run_command,
             health_check,

@@ -1596,14 +1596,43 @@ function RunCommandModal({ hosts, network, config, onClose }) {
   );
 }
 
+// Short status text of one host row in the batch progress list.
+function scpRowText(p) {
+  if (!p) return "Waiting…";
+  if (p.phase === "done") return `✓ ${fmtBytes(p.done)}`;
+  if (p.phase === "failed") return "✗ failed";
+  if (p.phase === "cancelled") return "⊘ cancelled";
+  const speed = p.speed > 0 ? ` · ${fmtBytes(p.speed)}/s` : "";
+  if (p.total > 0) {
+    const pct = Math.min(100, Math.floor((p.done * 100) / p.total));
+    const eta = p.speed > 0 && p.done < p.total ? ` · ${fmtEta((p.total - p.done) / p.speed)}` : "";
+    return `${pct}%${speed}${eta}`;
+  }
+  return p.done > 0 ? `${fmtBytes(p.done)}${speed}` : "Starting…";
+}
+
 function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
   const [direction, setDirection] = useState("upload");
   const [localPath, setLocalPath] = useState("");
   const [remotePath, setRemotePath] = useState("");
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState([]);
+  const [progress, setProgress] = useState({});
+  const batchRef = useRef("");
 
   const upload = direction === "upload";
+
+  // Each host of the running batch reports its own progress as "scp-progress" events whose job id is
+  // "<batch>-<position of the host>"; only the ones of this batch are used.
+  useEffect(() => {
+    const unlisten = listen("scp-progress", (e) => {
+      const p = e.payload;
+      if (p && batchRef.current && typeof p.job === "string" && p.job.startsWith(batchRef.current + "-")) {
+        setProgress(prev => ({ ...prev, [p.job]: p }));
+      }
+    });
+    return () => { unlisten.then(f => f()); };
+  }, []);
 
   // The local path means something different in each direction (a file to send, a folder to receive in),
   // so it is not carried over when the direction changes.
@@ -1629,8 +1658,11 @@ function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
       showToast("Both paths are required");
       return;
     }
+    const batch = `scpb-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    batchRef.current = batch;
     setRunning(true);
     setResults([]);
+    setProgress({});
     try {
       const res = await invoke("run_scp_broadcast", {
         hosts,
@@ -1639,6 +1671,7 @@ function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
         localPath,
         remotePath,
         direction,
+        batch,
       });
       setResults(res);
     } catch(e) {
@@ -1648,7 +1681,22 @@ function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
     }
   }
 
+  function cancelAll() {
+    invoke("cancel_scp_batch", { batch: batchRef.current }).catch(() => {});
+  }
+
+  function cancelHost(index) {
+    invoke("cancel_scp", { job: `${batchRef.current}-${index}` }).catch(() => {});
+  }
+
   const okCount = results.filter(r => r.success).length;
+  const cancelledCount = results.filter(r => r.cancelled).length;
+
+  const counts = { done: 0, running: 0, waiting: 0, failed: 0, cancelled: 0 };
+  hosts.forEach((h, i) => {
+    const p = progress[`${batchRef.current}-${i}`];
+    counts[!p ? "waiting" : p.phase === "transferring" ? "running" : p.phase] += 1;
+  });
 
   const localField = (
     <div className="form-group">
@@ -1686,21 +1734,54 @@ function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
           {upload ? <>{localField}{remoteField}</> : <>{remoteField}{localField}</>}
         </fieldset>
 
+        {running && (
+          <>
+            <div className="scp-hint scp-batch-counts">
+              {counts.done} done · {counts.running} running · {counts.waiting} waiting
+              {counts.failed > 0 && ` · ${counts.failed} failed`}
+              {counts.cancelled > 0 && ` · ${counts.cancelled} cancelled`}
+            </div>
+            <div className="scp-hostrows">
+              {hosts.map((h, i) => {
+                const p = progress[`${batchRef.current}-${i}`];
+                const state = !p ? "waiting" : p.phase === "transferring" ? "running" : p.phase;
+                const determinate = state === "running" && p.total > 0;
+                const fill = state === "done" ? 100 : determinate ? Math.min(100, (p.done * 100) / p.total) : 0;
+                return (
+                  <div key={i} className={`scp-hostrow ${state}`}>
+                    <span className="scp-hostrow-name" title={`${h.hostname || ""} ${h.ip}`.trim()}>{h.hostname || h.ip}</span>
+                    <div className="hb-progress">
+                      <div
+                        className={`hb-progress-bar${state === "running" && !determinate ? " scp-indeterminate" : ""}${state === "done" ? " scp-fill-done" : ""}${state === "failed" ? " scp-fill-failed" : ""}`}
+                        style={state === "running" && !determinate ? undefined : { width: (state === "failed" ? 100 : fill) + "%" }}
+                      />
+                    </div>
+                    <span className="scp-hostrow-text">{scpRowText(p)}</span>
+                    {(state === "waiting" || state === "running")
+                      ? <button className="scp-hostrow-stop" title="Cancel this host" onClick={() => cancelHost(i)}>✕</button>
+                      : <span />}
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
         {results.length > 0 && (
           <>
-            <div className="scp-hint">{okCount} of {results.length} hosts OK</div>
-            <div className="cmd-results">
+            <div className="scp-hint">{okCount} of {results.length} hosts OK{cancelledCount > 0 && ` · ${cancelledCount} cancelled`}</div>
+            <div className="cmd-results scp-results">
               {results.map((r, i) => (
-                <div key={i} className={`cmd-result ${r.success ? "success" : "error"}`}>
+                <div key={i} className={`cmd-result ${r.success ? "success" : r.cancelled ? "cancelled" : "error"}`}>
                   <div className="cmd-result-header">
-                    <span className={`cmd-status-dot ${r.success ? "up" : "down"}`} />
+                    <span className={`cmd-status-dot ${r.success ? "up" : r.cancelled ? "cancelled" : "down"}`} />
                     <span className="cmd-result-host">{r.hostname || r.ip}</span>
                     <span className="cmd-result-ip">{r.ip}</span>
-                    <span style={{marginLeft:"auto", fontSize:"0.72rem", color: r.success ? "var(--green)" : "var(--red)"}}>
-                      {r.success ? "✓ OK" : "✗ Failed"}
+                    <span style={{marginLeft:"auto", fontSize:"0.72rem", color: r.success ? "var(--green)" : r.cancelled ? "var(--text3)" : "var(--red)"}}>
+                      {r.success ? "✓ OK" : r.cancelled ? "⊘ Cancelled" : "✗ Failed"}
                     </span>
                   </div>
-                  {r.message && <pre className="cmd-output">{r.message}</pre>}
+                  {r.message && !r.cancelled && <pre className="cmd-output">{r.message}</pre>}
                 </div>
               ))}
             </div>
@@ -1708,7 +1789,8 @@ function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
         )}
 
         <div className="modal-actions">
-          <button className="btn-cancel" onClick={onClose}>Close</button>
+          <button className="btn-cancel" onClick={onClose} disabled={running}>Close</button>
+          {running && <button className="btn-cancel" onClick={cancelAll}>Cancel all</button>}
           <button className="btn-primary" onClick={handleRun} disabled={running}>
             {running ? "Transferring..." : upload ? "↑ Upload to all" : "↓ Download from all"}
           </button>
