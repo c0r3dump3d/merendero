@@ -7,9 +7,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts, NameServerConfig, Protocol};
-use hickory_resolver::error::ResolveErrorKind;
+use hickory_resolver::{Resolver, TokioResolver};
+use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::{DnsError, NetError};
+use hickory_resolver::proto::rr::RData;
 use tauri::Emitter;
 use serde::Serialize;
 use crate::host::{Host, Network, Defaults};
@@ -156,28 +158,30 @@ fn names_event(total: usize, current: usize, latest: Option<&(String, String)>) 
     }
 }
 
-fn build_resolver(dns_server: Option<&str>) -> Option<TokioAsyncResolver> {
+fn build_resolver(dns_server: Option<&str>) -> Option<TokioResolver> {
     let mut opts = ResolverOpts::default();
     opts.timeout = Duration::from_secs(NAME_WAIT_SECS);
     opts.attempts = 1;
+    // The defaults of hickory 0.26 differ from the 0.24 ones this scanner was written against. Keep the old
+    // behavior: no EDNS0 (an old DNS server may answer FORMERR to it, which would count as a silent server)
+    // and no hosts file (0.24 never used it for reverse lookups: the names come from the DNS server).
+    opts.edns0 = false;
+    opts.use_hosts_file = ResolveHosts::Never;
     let config = match dns_server {
         Some(server) => {
             let server_addr: SocketAddr = format!("{}:53", server).parse().ok()?;
-            let mut config = ResolverConfig::new();
-            config.add_name_server(NameServerConfig {
-                socket_addr: server_addr,
-                protocol: Protocol::Udp,
-                tls_dns_name: None,
-                trust_negative_responses: false,
-                bind_addr: None,
-            });
-            config
+            let mut name_server = NameServerConfig::udp(server_addr.ip());
+            name_server.trust_negative_responses = false;
+            ResolverConfig::from_name_servers(vec![name_server])
         }
         // No DNS server configured: use the system resolver (/etc/resolv.conf).
         // Never fall back to a public resolver, which would receive the internal IPs being scanned.
         None => hickory_resolver::system_conf::read_system_conf().ok()?.0,
     };
-    Some(TokioAsyncResolver::tokio(config, opts))
+    Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(opts)
+        .build()
+        .ok()
 }
 
 /// Looks up the names of the hosts found. One resolver for the whole scan, a few lookups at a time, a short
@@ -226,12 +230,19 @@ where
                 Ok(lookup) => {
                     silent.store(0, Ordering::Relaxed);
                     lookup
+                        .answers()
                         .iter()
-                        .next()
-                        .map(|n| (ip, n.to_string().trim_end_matches('.').to_string()))
+                        .find_map(|r| match &r.data {
+                            RData::PTR(ptr) => Some(ptr.0.to_string()),
+                            _ => None,
+                        })
+                        .map(|n| (ip, n.trim_end_matches('.').to_string()))
                 }
                 Err(e) => {
-                    if matches!(e.kind(), ResolveErrorKind::NoRecordsFound { .. }) {
+                    // A missing record, or an error code (SERVFAIL, REFUSED...), is an ANSWER: the server is
+                    // alive. Only silence (timeouts, network errors) counts towards giving up. In 0.26 the error
+                    // codes are a different error from "no records", and they used to count as answers.
+                    if matches!(e, NetError::Dns(DnsError::NoRecordsFound(_) | DnsError::ResponseCode(_))) {
                         silent.store(0, Ordering::Relaxed);
                     } else if silent.fetch_add(1, Ordering::Relaxed) + 1 >= NAME_GIVE_UP_AFTER {
                         gave_up.store(true, Ordering::Relaxed);
