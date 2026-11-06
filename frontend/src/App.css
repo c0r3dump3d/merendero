@@ -990,6 +990,43 @@ html, body, #root {
   flex-shrink: 0;
 }
 .btn-select-file:hover { border-color: var(--accent2); background: rgba(88,166,255,0.08); }
+.remote-path-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--accent2);
+  font-family: monospace;
+  font-size: 0.8rem;
+}
+.remote-path-bar .btn-cancel { margin-left: 8px; }
+.remote-entry.pickable { cursor: pointer; }
+.remote-dest { margin-top: 8px; }
+.remote-name-row { display: flex; align-items: center; gap: 8px; }
+.remote-name-row label { font-size: 0.78rem; color: var(--text2); white-space: nowrap; }
+.remote-name-row input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 0.8rem;
+  outline: none;
+  transition: border-color 0.1s;
+}
+.remote-name-row input:focus { border-color: var(--accent2); }
+.scp-hint { font-size: 0.72rem; color: var(--text3); margin: 4px 0 6px; }
+.scp-hint code { font-family: monospace; color: var(--text2); }
+.remote-warn { color: var(--yellow); }
+.scp-fieldset { border: none; margin: 0; padding: 0; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+.scp-progress { margin: 10px 0 6px; }
+.scp-progress-text { font-size: 0.72rem; color: var(--text2); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.scp-indeterminate { width: 30%; animation: scp-slide 1.2s ease-in-out infinite; }
+@keyframes scp-slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
 
 .cmd-output {
   max-height: 120px;

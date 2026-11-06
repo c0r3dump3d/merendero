@@ -1684,8 +1684,27 @@ function ScpBroadcastModal({ hosts, network, config, onClose, showToast }) {
   );
 }
 
-function RemoteBrowserModal({ host, network, config, onSelect, onClose }) {
-  const [currentPath, setCurrentPath] = useState("/");
+function pathBase(p) {
+  const parts = (p || "").split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
+function pathDir(p) {
+  const parts = (p || "").split("/").filter(Boolean);
+  parts.pop();
+  return "/" + parts.join("/");
+}
+
+function pathJoin(dir, name) {
+  return dir.endsWith("/") ? dir + name : dir + "/" + name;
+}
+
+// mode "file": pick an existing file (or the folder you are in).
+// mode "destination": pick the folder and the name to save under, which may not exist yet.
+function RemoteBrowserModal({ host, network, config, onSelect, onClose, mode = "file", defaultName = "", initialPath = "/" }) {
+  const [currentPath, setCurrentPath] = useState(initialPath);
+  const [goTo, setGoTo] = useState(initialPath);
+  const [name, setName] = useState(defaultName);
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -1693,8 +1712,9 @@ function RemoteBrowserModal({ host, network, config, onSelect, onClose }) {
   const username = host.username || network.username || config?.defaults?.username || "root";
   const port = host.port || network.port || config?.defaults?.port || 22;
   const identityFile = host.identity_file || network.identity_file || config?.defaults?.identity_file || null;
+  const destination = mode === "destination";
 
-  useEffect(() => { loadDir(currentPath); }, [currentPath]);
+  useEffect(() => { loadDir(currentPath); setGoTo(currentPath); }, [currentPath]);
 
   async function loadDir(path) {
     setLoading(true);
@@ -1711,34 +1731,53 @@ function RemoteBrowserModal({ host, network, config, onSelect, onClose }) {
     }
   }
 
-  function navigate(name) {
-    if (name === "..") {
+  function navigate(target) {
+    if (target === "..") {
       const parts = currentPath.split("/").filter(Boolean);
       parts.pop();
       setCurrentPath("/" + (parts.length ? parts.join("/") : ""));
     } else {
-      setCurrentPath(currentPath.endsWith("/") ? currentPath + name : currentPath + "/" + name);
+      setCurrentPath(currentPath.endsWith("/") ? currentPath + target : currentPath + "/" + target);
     }
   }
+
+  function goToTyped() {
+    const p = goTo.trim() || "/";
+    setCurrentPath(p.startsWith("/") ? p : "/" + p);
+  }
+
+  const cleanName = name.trim();
+  const badName = cleanName.includes("/") || cleanName === "." || cleanName === "..";
+  const destPath = cleanName ? pathJoin(currentPath, cleanName) : currentPath;
+  const existingFile = destination && cleanName !== "" && entries.some(e => !e.is_dir && e.name === cleanName);
+  const existingDir = destination && cleanName !== "" && entries.some(e => e.is_dir && e.name === cleanName);
 
   return (
     <div className="modal-overlay">
       <div className="modal modal-wide">
         <h3>📁 Remote browser — {host.hostname || host.ip}</h3>
+        {destination && <div className="scp-hint">Choose the destination folder. Type a file name to save under a new name, or leave it empty to keep the source name.</div>}
         <div className="remote-path-bar">
-          <span className="remote-path">{currentPath}</span>
+          <input
+            className="remote-path-input"
+            value={goTo}
+            onChange={e => setGoTo(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") goToTyped(); }}
+            title="Type a folder and press Enter"
+          />
           <button className="btn-cancel" onClick={() => navigate("..")}>↑ Up</button>
         </div>
         {error && <div className="scp-result error">{error}</div>}
         <div className="remote-entries">
           {loading && <div className="remote-loading">Loading...</div>}
           {!loading && entries.map((e, i) => (
-            <div key={i} className={`remote-entry ${e.is_dir ? "dir" : "file"}`}
-              onClick={() => e.is_dir ? navigate(e.name) : null}>
+            <div key={i} className={`remote-entry ${e.is_dir ? "dir" : "file"}${destination && !e.is_dir ? " pickable" : ""}`}
+              title={destination && !e.is_dir ? "Click to use this name (it will be overwritten)" : undefined}
+              onClick={() => e.is_dir ? navigate(e.name) : (destination ? setName(e.name) : null)}>
               <span className="remote-entry-icon">{e.is_dir ? "📁" : "📄"}</span>
               <span className="remote-entry-name">{e.name}</span>
               <span className="remote-entry-size">{e.is_dir ? "" : e.size}</span>
-              {!e.is_dir && (
+              {!e.is_dir && !destination && (
                 <button className="btn-select-file" onClick={() => {
                   const fullPath = currentPath.endsWith("/")
                     ? currentPath + e.name
@@ -1750,15 +1789,58 @@ function RemoteBrowserModal({ host, network, config, onSelect, onClose }) {
             </div>
           ))}
         </div>
+        {destination && (
+          <div className="remote-dest">
+            <div className="remote-name-row">
+              <label>File name</label>
+              <input value={name} onChange={e => setName(e.target.value)} placeholder="keep the source name" />
+            </div>
+            <div className="scp-hint">
+              {badName
+                ? <span className="remote-warn">The name cannot contain a slash, nor be . or ..</span>
+                : cleanName
+                  ? <span>Will be saved as <code>{destPath}</code>{existingFile && <span className="remote-warn"> — it already exists and will be overwritten</span>}{existingDir && <span className="remote-warn"> — that is a folder: the file will go inside it</span>}</span>
+                  : <span>Will be copied into <code>{currentPath}</code> keeping its name</span>}
+            </div>
+          </div>
+        )}
         <div className="modal-actions">
           <button className="btn-cancel" onClick={onClose}>Cancel</button>
-          <button className="btn-primary" onClick={() => { onSelect(currentPath); onClose(); }}>
-            Use this directory
-          </button>
+          {destination
+            ? <button className="btn-primary" disabled={badName} onClick={() => { onSelect(destPath); onClose(); }}>Use this destination</button>
+            : <button className="btn-primary" onClick={() => { onSelect(currentPath); onClose(); }}>Use this directory</button>}
         </div>
       </div>
     </div>
   );
+}
+
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  if (v < 1024) return `${Math.round(v)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let x = v / 1024, i = 0;
+  while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
+  return `${x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2)} ${units[i]}`;
+}
+
+function fmtEta(secs) {
+  if (!isFinite(secs) || secs < 0) return "";
+  const s = Math.round(secs);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  const pad = n => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${pad(m)}:${pad(r)}`;
+}
+
+function scpProgressText(p) {
+  if (!p) return "Starting…";
+  const speed = p.speed > 0 ? ` · ${fmtBytes(p.speed)}/s` : "";
+  if (p.total > 0) {
+    const pct = Math.min(100, Math.floor((p.done * 100) / p.total));
+    const eta = p.speed > 0 && p.done < p.total ? ` · ${fmtEta((p.total - p.done) / p.speed)} left` : "";
+    return `${fmtBytes(p.done)} of ${fmtBytes(p.total)} (${pct}%)${speed}${eta}`;
+  }
+  return `${fmtBytes(p.done)} transferred${speed}`;
 }
 
 function ScpModal({ host, network, config, onClose, showToast }) {
@@ -1768,10 +1850,25 @@ function ScpModal({ host, network, config, onClose, showToast }) {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState(null);
   const [showRemoteBrowser, setShowRemoteBrowser] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const jobRef = useRef("");
+  const lastRef = useRef(null);
 
   const username = host.username || network.username || config?.defaults?.username || "root";
   const port = host.port || network.port || config?.defaults?.port || 22;
   const identityFile = host.identity_file || network.identity_file || config?.defaults?.identity_file || null;
+
+  // The backend reports the progress of the running transfer as "scp-progress" events; only the ones of
+  // this transfer (its job id) are used.
+  useEffect(() => {
+    const unlisten = listen("scp-progress", (e) => {
+      if (e.payload && e.payload.job === jobRef.current) {
+        lastRef.current = e.payload;
+        setProgress(e.payload);
+      }
+    });
+    return () => { unlisten.then(f => f()); };
+  }, []);
 
   async function browseLocal() {
     if (direction === "upload") {
@@ -1783,13 +1880,27 @@ function ScpModal({ host, network, config, onClose, showToast }) {
     }
   }
 
+  // Download: pick only a folder; the file keeps the name it has on the host.
+  async function chooseLocalFolder() {
+    const selected = await open({ directory: true, multiple: false, title: "Select destination folder" });
+    if (!selected) return;
+    const remote = remotePath.trim();
+    const base = pathBase(remote);
+    setLocalPath(base && !remote.endsWith("/") ? pathJoin(selected, base) : selected);
+  }
+
   async function handleRun() {
     if (!localPath.trim() || !remotePath.trim()) {
       showToast("Both paths are required");
       return;
     }
+    const job = `scp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    jobRef.current = job;
+    lastRef.current = null;
+    const started = Date.now();
     setRunning(true);
     setResult(null);
+    setProgress(null);
     try {
       const out = await invoke("run_scp", {
         ip: host.ip,
@@ -1799,8 +1910,12 @@ function ScpModal({ host, network, config, onClose, showToast }) {
         localPath,
         remotePath,
         direction,
+        job,
       });
-      setResult({ success: true, message: out || "Transfer completed successfully" });
+      const p = lastRef.current;
+      const secs = Math.max((Date.now() - started) / 1000, 0.001);
+      const summary = p && p.done > 0 ? ` — ${fmtBytes(p.done)} in ${fmtDuration(secs)} (${fmtBytes(p.done / secs)}/s)` : "";
+      setResult({ success: true, message: (out || "Transfer completed successfully") + summary });
     } catch(e) {
       setResult({ success: false, message: e });
     } finally {
@@ -1808,54 +1923,94 @@ function ScpModal({ host, network, config, onClose, showToast }) {
     }
   }
 
+  function cancelTransfer() {
+    invoke("cancel_scp", { job: jobRef.current }).catch(() => {});
+  }
+
+  const upload = direction === "upload";
+  // The browser opens in the folder of the remote path that is already written, if there is one.
+  const startDir = remotePath.startsWith("/") ? (remotePath.endsWith("/") ? remotePath : pathDir(remotePath)) : "/";
+  const determinate = progress && progress.total > 0;
+
+  const localField = (
+    <div className="form-group">
+      <label>{upload ? "Local file (source)" : "Local destination"}</label>
+      <div className="form-row">
+        <input
+          value={localPath}
+          onChange={e => setLocalPath(e.target.value)}
+          placeholder={upload ? "/home/user/script.sh" : "/home/user/Downloads/"}
+        />
+        {upload
+          ? <button className="btn-browse" onClick={browseLocal}>Browse</button>
+          : <>
+              <button className="btn-browse" onClick={chooseLocalFolder} title="Choose a folder: the file keeps its name">Folder…</button>
+              <button className="btn-browse" onClick={browseLocal} title="Choose a folder and type a new name">Save as…</button>
+            </>}
+      </div>
+      {!upload && <div className="scp-hint">A folder keeps the file's name. Use Save as to give it another one.</div>}
+    </div>
+  );
+
+  const remoteField = (
+    <div className="form-group">
+      <label>{upload ? "Remote destination" : "Remote file (source)"} ({username}@{host.ip})</label>
+      <div className="form-row">
+        <input
+          value={remotePath}
+          onChange={e => setRemotePath(e.target.value)}
+          placeholder={upload ? "/tmp/" : "/var/log/syslog"}
+        />
+        <button className="btn-browse" onClick={() => setShowRemoteBrowser(true)}>Browse</button>
+      </div>
+      {upload && <div className="scp-hint">A folder keeps the file's name. Browse lets you pick the folder and type a name that does not exist yet.</div>}
+    </div>
+  );
+
   return (
     <div className="modal-overlay">
       <div className="modal">
         <h3>📁 SCP — {host.hostname || host.ip}</h3>
 
-        <div className="scp-direction">
-          <button
-            className={`scp-dir-btn ${direction === "upload" ? "active" : ""}`}
-            onClick={() => setDirection("upload")}
-          >↑ Upload (local → remote)</button>
-          <button
-            className={`scp-dir-btn ${direction === "download" ? "active" : ""}`}
-            onClick={() => setDirection("download")}
-          >↓ Download (remote → local)</button>
-        </div>
-
-        <div className="form-group">
-          <label>Local path</label>
-          <div className="form-row">
-            <input
-              value={localPath}
-              onChange={e => setLocalPath(e.target.value)}
-              placeholder={direction === "upload" ? "/home/user/script.sh" : "/tmp/downloaded_file"}
-            />
-            <button className="btn-browse" onClick={browseLocal}>Browse</button>
+        <fieldset className="scp-fieldset" disabled={running}>
+          <div className="scp-direction">
+            <button
+              className={`scp-dir-btn ${direction === "upload" ? "active" : ""}`}
+              onClick={() => setDirection("upload")}
+            >↑ Upload (local → remote)</button>
+            <button
+              className={`scp-dir-btn ${direction === "download" ? "active" : ""}`}
+              onClick={() => setDirection("download")}
+            >↓ Download (remote → local)</button>
           </div>
-        </div>
+
+          {upload ? <>{localField}{remoteField}</> : <>{remoteField}{localField}</>}
+        </fieldset>
 
         {showRemoteBrowser && (
           <RemoteBrowserModal
             host={host}
             network={network}
             config={config}
+            mode={upload ? "destination" : "file"}
+            defaultName={upload ? pathBase(localPath) : ""}
+            initialPath={startDir}
             onSelect={setRemotePath}
             onClose={() => setShowRemoteBrowser(false)}
           />
         )}
-        <div className="form-group">
-          <label>Remote path ({username}@{host.ip})</label>
-          <div className="form-row">
-            <input
-              value={remotePath}
-              onChange={e => setRemotePath(e.target.value)}
-              placeholder={direction === "upload" ? "/tmp/script.sh" : "/var/log/syslog"}
-            />
-            <button className="btn-browse" onClick={() => setShowRemoteBrowser(true)}>Browse</button>
+
+        {running && (
+          <div className="scp-progress">
+            <div className="hb-progress">
+              <div
+                className={`hb-progress-bar${determinate ? "" : " scp-indeterminate"}`}
+                style={determinate ? { width: Math.min(100, (progress.done * 100) / progress.total) + "%" } : undefined}
+              />
+            </div>
+            <div className="scp-progress-text">{scpProgressText(progress)}</div>
           </div>
-        </div>
+        )}
 
         {result && (
           <div className={`scp-result ${result.success ? "success" : "error"}`}>
@@ -1864,9 +2019,10 @@ function ScpModal({ host, network, config, onClose, showToast }) {
         )}
 
         <div className="modal-actions">
-          <button className="btn-cancel" onClick={onClose}>Close</button>
+          <button className="btn-cancel" onClick={onClose} disabled={running}>Close</button>
+          {running && <button className="btn-cancel" onClick={cancelTransfer}>Cancel transfer</button>}
           <button className="btn-primary" onClick={handleRun} disabled={running}>
-            {running ? "Transferring..." : direction === "upload" ? "↑ Upload" : "↓ Download"}
+            {running ? "Transferring..." : upload ? "↑ Upload" : "↓ Download"}
           </button>
         </div>
       </div>
@@ -2750,7 +2906,7 @@ function App() {
       });
     } catch (e) { ok = false; detail = String(e); showToast("Broadcast failed: " + e); }
     finally { setBroadcasting(false); }
-    if (ok) setSelectedHosts(new Set());
+    if (ok) { setSelectedHosts(new Set()); loadHistory(); }
     invoke("audit_event", { action: "broadcast", network: network.name, hosts: targets.map(h => h.ip), detail, success: ok }).catch(() => {});
   }
 

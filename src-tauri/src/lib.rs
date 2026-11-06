@@ -790,51 +790,304 @@ async fn list_remote_dir(
     Ok(entries)
 }
 
-fn run_scp_inner(
+// ===== scp progress: begin =====
+/// Progress of an SCP transfer, sent to the window as the "scp-progress" event. `total` is 0 when the size
+/// is not known; `speed` is bytes per second over the last few seconds.
+#[derive(Clone, serde::Serialize)]
+struct ScpProgress {
+    job: String,
+    done: u64,
+    total: u64,
+    speed: f64,
+    phase: &'static str,
+}
+
+type ScpJobs = std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Notify>>>;
+static SCP_JOBS: std::sync::OnceLock<ScpJobs> = std::sync::OnceLock::new();
+
+fn scp_jobs() -> &'static ScpJobs {
+    SCP_JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Asks the transfer `job` to stop. False if there is no such transfer in progress.
+fn cancel_scp_job(job: &str) -> bool {
+    let jobs = scp_jobs().lock().unwrap_or_else(|e| e.into_inner());
+    match jobs.get(job) {
+        Some(n) => {
+            n.notify_one();
+            true
+        }
+        None => false,
+    }
+}
+
+struct ScpJobGuard(String);
+
+impl Drop for ScpJobGuard {
+    fn drop(&mut self) {
+        scp_jobs().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+    }
+}
+
+fn scp_args(
+    ip: &str,
+    username: &str,
+    port: u16,
+    identity_file: &Option<String>,
+    local_path: &str,
+    remote_path: &str,
+    direction: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-P".to_string(), port.to_string(),
+        "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(), "ConnectTimeout=5".to_string(),
+    ];
+    if let Some(f) = identity_file {
+        args.push("-i".to_string());
+        args.push(f.clone());
+    }
+    let remote = format!("{}@{}:{}", username, ip, remote_path);
+    // '--' before the destination: without it, a username/ip starting with '-' (e.g. from an imported
+    // backup) could be read by ssh/scp as an OPTION instead of the destination.
+    args.push(String::from("--"));
+    if direction == "upload" {
+        args.push(local_path.to_string());
+        args.push(remote);
+    } else {
+        args.push(remote);
+        args.push(local_path.to_string());
+    }
+    args
+}
+
+/// Where the process `pid` is in the file `path` it has open (Linux: /proc/<pid>/fdinfo). For an upload
+/// this is how much of the local file scp has read so far.
+fn proc_read_pos(pid: u32, path: &std::path::Path) -> Option<u64> {
+    for entry in std::fs::read_dir(format!("/proc/{}/fd", pid)).ok()? {
+        let entry = entry.ok()?;
+        if std::fs::read_link(entry.path()).ok().as_deref() != Some(path) {
+            continue;
+        }
+        let info = std::fs::read_to_string(format!("/proc/{}/fdinfo/{}", pid, entry.file_name().to_string_lossy())).ok()?;
+        for line in info.lines() {
+            if let Some(v) = line.strip_prefix("pos:") {
+                return v.trim().parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// The path under which a process will have `dest` open, even when the file does not exist yet.
+fn proc_fd_path(dest: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::fs::canonicalize(dest) {
+        return Some(p);
+    }
+    let name = dest.file_name()?;
+    let parent = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    Some(std::fs::canonicalize(parent).ok()?.join(name))
+}
+
+/// Size of a remote file, asked ONCE with a short ssh `stat` (never polled: every login leaves a trace on
+/// the host). None when it cannot be known; the progress bar is then indeterminate.
+async fn remote_file_size(
+    ip: &str,
+    username: &str,
+    port: u16,
+    identity_file: &Option<String>,
+    remote_path: &str,
+) -> Option<u64> {
+    use std::process::Stdio;
+    let mut args = vec![
+        "-p".to_string(), port.to_string(),
+        "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(), "ConnectTimeout=5".to_string(),
+        "-o".to_string(), "BatchMode=yes".to_string(),
+        "-o".to_string(), "LogLevel=ERROR".to_string(),
+    ];
+    if let Some(f) = identity_file {
+        args.push("-i".to_string());
+        args.push(f.clone());
+    }
+    args.push(String::from("--"));
+    args.push(format!("{}@{}", username, ip));
+    // The path goes through the remote shell: quoted, like in list_remote_dir. A leading ~/ is expanded
+    // by the shell here (scp expands it too).
+    let quoted = match remote_path.strip_prefix("~/") {
+        Some(rest) => format!(r#""$HOME"/{}"#, sh_quote(rest)),
+        None => sh_quote(remote_path),
+    };
+    args.push(format!("stat -c %s -- {} 2>/dev/null", quoted));
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(program("ssh"))
+            .env("PATH", user_path())
+            .args(&args)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+}
+
+/// Reads up to `cap` bytes and then keeps draining, so the child never blocks on a full pipe.
+async fn read_capped_drain<R: tokio::io::AsyncRead + Unpin>(mut r: R, cap: u64) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let _ = (&mut r).take(cap).read_to_end(&mut buf).await;
+    let _ = tokio::io::copy(&mut r, &mut tokio::io::sink()).await;
+    buf
+}
+
+/// Every 400 ms: how much has been transferred, and the speed over the last 3 seconds. Both directions
+/// read the position of the local file scp has open (upload: the one it reads; download: the one it
+/// writes). The size of the destination cannot be used: scp overwrites an existing file IN PLACE without
+/// truncating it, so its size is the old one until the new data passes it. Only when the destination did
+/// not exist before the transfer is its size a valid fallback.
+async fn scp_poll<F>(
+    pid: u32,
+    local_file: std::path::PathBuf,
+    size_is_progress: bool,
+    total: u64,
+    job: String,
+    emit: std::sync::Arc<F>,
+    stop: std::sync::Arc<tokio::sync::Notify>,
+) -> u64
+where
+    F: Fn(ScpProgress) + Send + Sync + 'static,
+{
+    let mut done: u64 = 0;
+    let mut samples: std::collections::VecDeque<(std::time::Instant, u64)> = std::collections::VecDeque::new();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(400)) => {}
+            _ = stop.notified() => break,
+        }
+        let now_done = proc_fd_path(&local_file)
+            .and_then(|p| proc_read_pos(pid, &p))
+            .or_else(|| if size_is_progress { std::fs::metadata(&local_file).ok().map(|m| m.len()) } else { None });
+        if let Some(d) = now_done {
+            done = if total > 0 { d.min(total) } else { d };
+        }
+        let now = std::time::Instant::now();
+        samples.push_back((now, done));
+        while samples.len() > 2 && now.duration_since(samples[0].0).as_secs_f64() > 3.0 {
+            samples.pop_front();
+        }
+        let (t0, d0) = samples[0];
+        let dt = now.duration_since(t0).as_secs_f64();
+        let speed = if dt > 0.0 { done.saturating_sub(d0) as f64 / dt } else { 0.0 };
+        emit(ScpProgress { job: job.clone(), done, total, speed, phase: "transferring" });
+    }
+    done
+}
+
+/// Runs one scp transfer without blocking anything, reporting its progress through `emit`, and stoppable
+/// with cancel_scp_job(job).
+async fn run_scp_core<F>(
     ip: String,
     username: String,
     port: u16,
     identity_file: Option<String>,
     local_path: String,
     remote_path: String,
-    direction: String, // "upload" | "download"
-) -> Result<String, String> {
-    let identity_arg = identity_file
-        .map(|f| vec!["-i".to_string(), f])
-        .unwrap_or_default();
+    direction: String,
+    job: String,
+    emit: F,
+) -> Result<String, String>
+where
+    F: Fn(ScpProgress) + Send + Sync + 'static,
+{
+    use std::process::Stdio;
+    let upload = direction == "upload";
+    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+    scp_jobs().lock().unwrap_or_else(|e| e.into_inner()).insert(job.clone(), cancel.clone());
+    let _guard = ScpJobGuard(job.clone());
+    let emit = std::sync::Arc::new(emit);
 
-    let mut args = vec![
-        "-P".to_string(), port.to_string(),
-        "-o".to_string(), "StrictHostKeyChecking=no".to_string(),
-        "-o".to_string(), "ConnectTimeout=5".to_string(),
-    ];
-    args.extend(identity_arg);
-
-    let remote = format!("{}@{}:{}", username, ip, remote_path);
-
-    // '--' before the destination: without it, a username/ip starting with '-' (e.g. from an imported
-    // backup) could be read by ssh/scp as an OPTION instead of the destination.
-    args.push(String::from("--"));
-    if direction == "upload" {
-        args.push(local_path);
-        args.push(remote);
+    // Where the data goes (download) or comes from (upload), and the total if it can be known.
+    let local = std::path::Path::new(&local_path);
+    let remote_name = remote_path.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_string();
+    let dest = if !upload && local.is_dir() { local.join(&remote_name) } else { local.to_path_buf() };
+    let existed_before = dest.exists();
+    let total = if upload {
+        std::fs::metadata(local).map(|m| m.len()).unwrap_or(0)
     } else {
-        args.push(remote);
-        args.push(local_path);
-    }
+        remote_file_size(&ip, &username, port, &identity_file, &remote_path).await.unwrap_or(0)
+    };
+    emit(ScpProgress { job: job.clone(), done: 0, total, speed: 0.0, phase: "transferring" });
 
-    let output = std::process::Command::new(program("scp"))
+    let args = scp_args(&ip, &username, port, &identity_file, &local_path, &remote_path, &direction);
+    let mut child = tokio::process::Command::new(program("scp"))
         .env("PATH", user_path())
         .args(&args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|e| format!("Failed to run scp: {}", e))?;
+    let pid = child.id().unwrap_or(0);
+    let t_out = child.stdout.take().map(|r| tokio::spawn(read_capped_drain(r, 1 << 20)));
+    let t_err = child.stderr.take().map(|r| tokio::spawn(read_capped_drain(r, 256 << 10)));
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let poller = tokio::spawn(scp_poll(
+        pid, if upload { local.to_path_buf() } else { dest.clone() }, !upload && !existed_before, total, job.clone(), emit.clone(), stop.clone(),
+    ));
+
+    let mut cancelled = false;
+    let status = tokio::select! {
+        s = child.wait() => s.ok(),
+        _ = cancel.notified() => {
+            cancelled = true;
+            let _ = child.start_kill();
+            child.wait().await.ok()
+        }
+    };
+    stop.notify_one();
+    let last = poller.await.unwrap_or(0);
+    let out = match t_out { Some(t) => t.await.unwrap_or_default(), None => Vec::new() };
+    let err = match t_err { Some(t) => t.await.unwrap_or_default(), None => Vec::new() };
+
+    let ok = !cancelled && status.map_or(false, |s| s.success());
+    let final_size = if upload {
+        std::fs::metadata(local).map(|m| m.len()).unwrap_or(last)
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).to_string())
+        std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(last)
+    };
+    emit(ScpProgress {
+        job: job.clone(),
+        done: if ok { final_size } else { last },
+        total: if ok && total == 0 { final_size } else { total },
+        speed: 0.0,
+        phase: if cancelled { "cancelled" } else if ok { "done" } else { "failed" },
+    });
+    if cancelled {
+        return Err(String::from("Transfer cancelled. A partially transferred file may be left at the destination."));
+    }
+    if ok {
+        Ok(String::from_utf8_lossy(&out).to_string())
+    } else {
+        let e = String::from_utf8_lossy(&err).to_string();
+        if e.trim().is_empty() {
+            Err(format!("scp failed ({})", status.map(|s| s.to_string()).unwrap_or_else(|| String::from("no exit status"))))
+        } else {
+            Err(e)
+        }
     }
 }
+// ===== scp progress: end =====
 
 async fn run_scp_broadcast_inner(
     hosts: Vec<host::Host>,
@@ -1780,7 +2033,8 @@ async fn run_scp_broadcast(
 }
 
 #[tauri::command]
-fn run_scp(
+async fn run_scp(
+    window: tauri::Window,
     ip: String,
     username: String,
     port: u16,
@@ -1788,13 +2042,23 @@ fn run_scp(
     local_path: String,
     remote_path: String,
     direction: String,
+    job: String,
 ) -> Result<String, String> {
     let target = vec![serde_json::json!({ "ip": ip })];
     let transfer = serde_json::json!({ "direction": direction, "local": local_path, "remote": remote_path, "remote_user": username });
     audit_write("scp", "", target.clone(), serde_json::json!({ "phase": "start", "transfer": transfer }));
-    let result = run_scp_inner(ip, username, port, identity_file, local_path, remote_path, direction);
+    let w = window.clone();
+    let result = run_scp_core(ip, username, port, identity_file, local_path, remote_path, direction, job, move |p| {
+        let _ = w.emit("scp-progress", p);
+    }).await;
     audit_write("scp", "", target, serde_json::json!({ "phase": "end", "success": result.is_ok(), "transfer": transfer }));
     result
+}
+
+/// Stops a transfer started by run_scp. False if it already finished.
+#[tauri::command]
+fn cancel_scp(job: String) -> bool {
+    cancel_scp_job(&job)
 }
 
 #[tauri::command]
@@ -2582,6 +2846,24 @@ fn launch_broadcast(hosts: Vec<host::Host>, network: host::Network, defaults: De
         .and_then(|mut c| c.spawn().map(|_| ()).map_err(|e| format!("Failed to launch terminal: {}", e)));
     if launched.is_err() {
         let _ = run_tmux(&["kill-session", "-t", &session_name]);
+    } else {
+        // "Last connection" of every host of the broadcast, recorded like a normal SSH connection is: when
+        // the terminal is launched, not when each host answers.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string();
+        let records: Vec<host::ConnectionRecord> = hosts.iter().map(|h| host::ConnectionRecord {
+            ip: h.ip.clone(),
+            hostname: h.hostname.clone(),
+            username: host::resolve_username(h, &network, &defaults),
+            port: host::resolve_port(h, &network, &defaults),
+            network_name: network.name.clone(),
+            connected_at: now.clone(),
+        }).collect();
+        let path = get_config_dir().join("history.toml");
+        let _ = host::record_connections(path.to_str().unwrap(), records);
     }
     launched
 }
@@ -2611,6 +2893,7 @@ pub fn run() {
             check_hosts,
             list_remote_dir,
             run_scp,
+            cancel_scp,
             run_scp_broadcast,
             run_command,
             health_check,
